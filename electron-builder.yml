@@ -14,6 +14,8 @@ asarUnpack:
   - resources/**
 mac:
   entitlementsInherit: build/entitlements.mac.plist
+  extendInfo:
+    NSMicrophoneUsageDescription: Dictate your question with local Whisper.
   notarize: false
 dmg:
   artifactName: ${name}-${version}.${ext}

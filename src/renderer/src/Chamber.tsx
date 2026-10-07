@@ -1,712 +1,908 @@
-import { useEffect, useRef, useState } from 'react'
-import { CLI_META, HUMAN } from '@shared/types'
+import Whiteboard from './Whiteboard'
+import DecisionBoard from './DecisionBoard'
+import { ACTIVITY_LABELS } from '@shared/activity'
+import ActivityStatus from './ActivityStatus'
+import { memberModel } from '@shared/models'
+import Brand from './Brand'
+import { useEffect, useRef, useState, type CSSProperties } from 'react'
+import { HUMAN, type PersonaId } from '@shared/types'
 import { PERSONAS } from '@shared/personas'
-import { lastTurnOf, latestVotes, type State, type TurnState } from './state'
+import { lastTurnOf, latestVotes, type State } from './state'
 import Markdown from './Markdown'
+import AgentAvatar, { type Presence } from './AgentAvatar'
+import { PROVIDERS } from './avatarTheme'
+import { AgentUsage, UsageMeter } from './Usage'
 
-type Props = { state: State; onHome: () => void; onConsortium: () => void }
-
-const VW = 1000
-const VH = 610
-const CX = 500
-const CY = 335
-const TABLE_R = 150
-const SEAT_R = 232
-
-// Seats fan across the far side of the table; the human sits at the bottom.
-function seatGeometry(n: number): { x: number; y: number; cos: number; sin: number }[] {
-  const step = 240 / (n + 1)
-  return Array.from({ length: n }, (_, i) => {
-    const t = ((150 + step * (i + 1)) * Math.PI) / 180
-    return {
-      x: CX + SEAT_R * Math.cos(t),
-      y: CY + SEAT_R * Math.sin(t),
-      cos: Math.cos(t),
-      sin: Math.sin(t)
-    }
-  })
+type Props = {
+  state: State
+  onHome: () => void
+  onConsortium: () => void
+  onResume: () => void
 }
-
-function useFit(ratio: number): [React.RefObject<HTMLDivElement | null>, { w: number; h: number }] {
-  const ref = useRef<HTMLDivElement | null>(null)
-  const [box, setBox] = useState({ w: 0, h: 0 })
-  useEffect(() => {
-    const el = ref.current
-    if (!el) return undefined
-    const ro = new ResizeObserver(([e]) => {
-      const { width, height } = e.contentRect
-      const w = Math.min(width, height * ratio)
-      setBox({ w, h: w / ratio })
-    })
-    ro.observe(el)
-    return () => ro.disconnect()
-  }, [ratio])
-  return [ref, box]
+type IconName =
+  | 'board'
+  | 'back'
+  | 'send'
+  | 'chat'
+  | 'file'
+  | 'folder'
+  | 'check'
+  | 'end'
+  | 'grid'
+  | 'focus'
+  | 'people'
+  | 'close'
+  | 'expand'
+  | 'pause'
+  | 'play'
+function Icon({ name, size = 18 }: { name: IconName; size?: number }): React.JSX.Element {
+  const paths: Record<IconName, string> = {
+    board: 'M3 4h18v14H3ZM8 22l4-4 4 4M7 8h4m-4 4h7',
+    back: 'M15 18l-6-6 6-6',
+    send: 'M12 19V5m-6 6 6-6 6 6',
+    chat: 'M5 5h14v11H9l-4 4V5Z M9 9h6m-6 3h4',
+    file: 'M6 3h8l4 4v14H6V3Z M14 3v5h4M9 12h6m-6 4h6',
+    folder: 'M3 7V5h6l2 2h10v12H3V7Z',
+    check: 'm5 12 4 4L19 6',
+    end: 'M3 14c4-5 14-5 18 0l-3 4-4-2v-3h-4v3l-4 2-3-4Z',
+    grid: 'M3 3h7v7H3ZM14 3h7v7h-7ZM3 14h7v7H3ZM14 14h7v7h-7Z',
+    focus: 'M3 3h18v12H3ZM3 18h4v3H3ZM10 18h4v3h-4ZM17 18h4v3h-4Z',
+    people:
+      'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8M20 21v-2a4 4 0 0 0-3-3.87M16 3a4 4 0 0 1 0 8',
+    close: 'm6 6 12 12M6 18 18 6',
+    expand: 'M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5',
+    pause: 'M9 5v14M15 5v14',
+    play: 'M7 4v16l13-8Z'
+  }
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.65"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d={paths[name]} />
+    </svg>
+  )
 }
-
-const plain = (t: string): string =>
-  t
+const PORTRAITS: Record<PersonaId, { color: string; role: string }> = {
+  strategist: { color: '#df9b7d', role: 'The big picture' },
+  engineer: { color: '#91bdac', role: 'Making it work' },
+  researcher: { color: '#b2a0df', role: 'Following the evidence' },
+  designer: { color: '#dbc187', role: 'How it feels' },
+  skeptic: { color: '#a4b9d9', role: 'Asking the hard questions' },
+  customer: { color: '#dfa1ad', role: 'The human perspective' }
+}
+const STAGES = ['Explore', 'Debate', 'Converge', 'Decide']
+const plain = (text: string): string =>
+  text
     .replace(/```[\s\S]*$/, '')
     .replace(/[#*>`_]/g, '')
     .trim()
-const tail = (t: string, n = 150): string => {
-  const c = plain(t)
-  return c.length > n ? '…' + c.slice(-n) : c
-}
 
-// Some models think silently for a while before their first word (gemini emits no thinking events).
-const thinking = (t: TurnState, now: number): string =>
-  `Thinking${t.startedAt ? ` · ${Math.max(0, Math.round((now - t.startedAt) / 1000))}s` : ''}`
-
-function bubble(
-  t: TurnState | undefined,
-  now: number
-): { text: string; kind: 'wait' | 'live' | 'pos' | 'err' } {
-  if (!t) return { text: 'Waiting to speak', kind: 'wait' }
-  if (t.status === 'error')
-    return { text: (t.error ?? 'No response').replace(/\s+/g, ' ').slice(0, 140), kind: 'err' }
-  if (t.status === 'running')
-    return t.text.trim()
-      ? { text: tail(t.text), kind: 'live' }
-      : { text: thinking(t, now), kind: 'wait' }
-  if (t.vote) return { text: t.vote.position, kind: 'pos' }
-  return { text: plain(t.text).slice(0, 160), kind: 'pos' }
-}
-
-const STAGES = ['Explore', 'Debate', 'Converge', 'Decide']
-const stageIndex = (s: State['stage']): number =>
-  s === 'open' ? 0 : s === 'debate' ? 1 : s === 'converge' ? 2 : 3
-
-export default function Chamber({ state: s, onHome, onConsortium }: Props): React.JSX.Element {
+export default function Chamber({
+  state: s,
+  onHome,
+  onConsortium,
+  onResume
+}: Props): React.JSX.Element {
   const brief = s.brief!
   const members = brief.members
-  const n = members.length
-  const [filter, setFilter] = useState<string | null>(null)
+  const [view, setView] = useState<'gallery' | 'speaker' | 'whiteboard'>('gallery')
+  const [panel, setPanel] = useState<'conversation' | 'decision' | null>('decision')
+  const [pinned, setPinned] = useState<string | null>(null)
   const [thought, setThought] = useState('')
-  const [toast, setToast] = useState<string | null>(null)
+  const [hostMode, setHostMode] = useState('thought')
+  const [notice, setNotice] = useState<string | null>(null)
+  const [sending, setSending] = useState(false)
+  const [stopping, setStopping] = useState(false)
+  const [pauseRequested, setPaused] = useState(false)
   const [stick, setStick] = useState(true)
-  const [now, setNow] = useState(() => Date.now())
-  const ticking = !!s.speaking
-  useEffect(() => {
-    if (!ticking) return undefined
-    const t = setInterval(() => setNow(Date.now()), 1000)
-    return () => clearInterval(t)
-  }, [ticking])
   const feedRef = useRef<HTMLDivElement | null>(null)
-  const [fitRef, box] = useFit(VW / VH)
-
-  const running =
-    s.stage === 'open' || s.stage === 'debate' || s.stage === 'converge' || s.stage === 'decide'
-  const decided = s.stage === 'done'
+  const inputRef = useRef<HTMLTextAreaElement | null>(null)
+  const running = ['open', 'debate', 'converge', 'decide'].includes(s.stage)
+  const chairWriting = s.chair.status === 'running'
+  const canInterject = running && !chairWriting && !s.concluding
   const votes = latestVotes(s.turns)
-  const agree = members.filter((m) => votes[m.id] && votes[m.id]!.disagreements.length === 0).length
-  const pastOpenings = s.turn > n
-  const fraction = decided && s.converged ? 1 : pastOpenings || decided ? agree / n : 0
-  const geo = seatGeometry(n)
-  const color = (id: string): string =>
-    id === HUMAN ? 'var(--color-gold)' : CLI_META[members.find((m) => m.id === id)!.cli].color
-  const chairLabel = s.labels[brief.chairId]
   const memberTurns = s.turns.filter((t) => t.speaker !== HUMAN).length
+  const phase =
+    s.stage === 'open'
+      ? 0
+      : s.stage === 'debate'
+        ? 1
+        : s.stage === 'converge'
+          ? 2
+          : s.stage === 'decide' || s.stage === 'done'
+            ? 3
+            : s.turn <= members.length
+              ? 0
+              : s.turn > brief.maxTurns - members.length
+                ? 3
+                : s.turn > brief.maxTurns * 0.6
+                  ? 2
+                  : 1
+  const activeId =
+    s.speaking ?? s.turns.filter((t) => t.speaker !== HUMAN).at(-1)?.speaker ?? members[0]?.id
+  const focusId = pinned ?? activeId
+  const liveTurn = lastTurnOf(s.turns, activeId)
+  const paused = running && pauseRequested
+  const status =
+    s.stage === 'done'
+      ? 'Session complete'
+      : s.stage === 'failed'
+        ? 'Session failed'
+        : s.stage === 'stopped'
+          ? 'Session ended'
+          : chairWriting
+            ? 'Writing the decision'
+            : s.concluding
+              ? 'Concluding after this response'
+              : paused
+                ? s.speaking
+                  ? `Pausing after ${s.labels[s.speaking]?.replace(/^The /, '')} finishes`
+                  : 'Paused'
+                : 'Live discussion'
+  const regularTurns = s.turns.filter(
+    (turn) =>
+      turn.speaker !== HUMAN &&
+      !s.hostMessages.some(
+        (message) =>
+          message.kind === 'ask' && message.status === 'delivered' && message.turn === turn.n
+      )
+  ).length
+  const nextMember =
+    !s.concluding && s.activity && s.activity.turn > 0 && s.activity.turn < brief.maxTurns
+      ? (members.find(
+          (m) =>
+            m.id ===
+            s.hostMessages.find((message) => message.status === 'queued' && message.kind === 'ask')
+              ?.targetId
+        ) ?? members[regularTurns % members.length])
+      : undefined
+  const activeName = s.labels[activeId]?.replace(/^The /, '')
+  const caption = !running
+    ? s.consortium
+      ? 'Your decision is ready, with the rationale, next steps, and dissent preserved.'
+      : 'The meeting has ended. Every perspective is preserved in the transcript.'
+    : chairWriting
+      ? 'Bringing the perspectives together into your decision document…'
+      : liveTurn?.text
+        ? plain(liveTurn.text).slice(-190)
+        : running
+          ? 'A few different minds. One better decision. Let’s hear the opening perspectives.'
+          : 'The conversation has ended. Every perspective is preserved in the transcript.'
 
-  const chords: { a: number; b: number; on: string }[] = []
-  const seen = new Set<string>()
-  members.forEach((a, i) => {
-    for (const d of votes[a.id]?.disagreements ?? []) {
-      const j = members.findIndex((x) => s.labels[x.id] === d.with)
-      if (j < 0 || j === i) continue
-      const key = [i, j].sort().join(':')
-      if (seen.has(key)) continue
-      seen.add(key)
-      chords.push({ a: i, b: j, on: d.on })
-    }
-  })
-  const circ = 2 * Math.PI * TABLE_R
-  const scale = box.w / VW
-
-  // the floor follows the conversation unless you scrolled up to read
   useEffect(() => {
     const el = feedRef.current
     if (el && stick) el.scrollTop = el.scrollHeight
-  }, [s.turns, s.chair.text, stick])
+  }, [s.turns, s.chair.text, stick, panel])
 
-  const interject = (e: React.FormEvent): void => {
-    e.preventDefault()
-    const t = thought.trim()
-    if (!t) return
-    void window.api!.interject(t)
-    setToast(
-      s.chair.status === 'running' ? 'Handed to the chair' : 'Heard — lands on the next turn'
-    )
-    setThought('')
-    setTimeout(() => setToast(null), 2200)
+  const askAgent = (id: string): void => {
+    setHostMode(id)
+    setPanel('conversation')
+    requestAnimationFrame(() => inputRef.current?.focus())
   }
-
-  const feed = filter ? s.turns.filter((t) => t.speaker === filter || t.speaker === HUMAN) : s.turns
+  const viewSource = (n: number): void => {
+    setPanel('conversation')
+    setStick(false)
+    requestAnimationFrame(() => {
+      const el = document.getElementById(`turn-${n}`)
+      el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      el?.animate([{ backgroundColor: '#c5b8ee26' }, { backgroundColor: 'transparent' }], {
+        duration: 2000
+      })
+    })
+  }
+  // opened from a citation on the decision page; Chamber remounts each time, so once is enough
+  useEffect(() => {
+    if (s.focus) viewSource(s.focus)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  const answer = (question: string): void => {
+    setHostMode('thought')
+    setThought(`On “${question}”: `)
+    setPanel('conversation')
+    requestAnimationFrame(() => inputRef.current?.focus())
+  }
+  const discussVisual = (text: string): void => {
+    setHostMode('thought')
+    setThought(text)
+    setNotice('Add your question or send this to the room. It joins the next turn.')
+    setPanel('conversation')
+    requestAnimationFrame(() => inputRef.current?.focus())
+  }
+  const questions = s.whiteboard?.questions.length ?? 0
+  const refreshBoard = async (): Promise<void> => {
+    try {
+      await window.api!.refreshBoard()
+    } catch {
+      setNotice('Could not refresh the whiteboard.')
+      setPanel('conversation')
+    }
+  }
+  const conclude = async (): Promise<void> => {
+    try {
+      await window.api!.conclude()
+      setPaused(false)
+      setNotice(null)
+    } catch {
+      setNotice('Could not conclude the meeting. Try again.')
+      setPanel('conversation')
+    }
+  }
+  const addContext = (): void => {
+    setPanel('conversation')
+    requestAnimationFrame(() => inputRef.current?.focus())
+  }
+  const interject = async (e: React.FormEvent): Promise<void> => {
+    e.preventDefault()
+    if (!thought.trim() || !canInterject || sending) return
+    setSending(true)
+    try {
+      await window.api!.host({
+        id: crypto.randomUUID(),
+        kind: hostMode === 'thought' ? 'thought' : hostMode === 'focus' ? 'focus' : 'ask',
+        targetId: members.some((m) => m.id === hostMode) ? hostMode : undefined,
+        text: thought.trim()
+      })
+      setThought('')
+      setNotice(null)
+      setStick(true)
+    } catch {
+      setNotice('Could not send. Please try again.')
+    } finally {
+      setSending(false)
+    }
+  }
+  const togglePause = async (): Promise<void> => {
+    try {
+      await window.api!.pause(!paused)
+      setPaused(!paused)
+    } catch {
+      setNotice('Could not pause. Please try again.')
+    }
+  }
+  const stop = async (): Promise<void> => {
+    setStopping(true)
+    try {
+      await window.api!.stop()
+    } catch {
+      setNotice('Could not end the session. Please try again.')
+      setPanel('conversation')
+    } finally {
+      setStopping(false)
+    }
+  }
+  const togglePanel = (next: 'conversation' | 'decision'): void =>
+    setPanel(panel === next ? null : next)
 
   return (
-    <div className="h-full grid grid-cols-[232px_minmax(0,1fr)_300px]">
-      {/* seats */}
-      <aside className="border-r border-line flex flex-col min-h-0">
-        <div className="drag h-12 shrink-0 flex items-center pl-20 text-[11px] uppercase tracking-[0.18em] text-ink-3">
-          Chamber
+    <div className={`meeting-room ${panel ? 'with-panel' : ''}`}>
+      <header className="meeting-titlebar drag">
+        <Brand />
+        <span className="titlebar-slash">/</span>
+        <span className="titlebar-room">The meeting room</span>
+        <div className={`meeting-status ${running ? 'live' : ''}`} role="status">
+          <i />
+          {status}
         </div>
-        <button
-          className="no-drag text-left px-5 py-1 text-[12px] text-ink-3 hover:text-ink"
-          onClick={onHome}
-        >
-          ← All sessions
-        </button>
-        <div className="px-5 pt-3 pb-4">
-          <div className="text-[10px] uppercase tracking-[0.16em] text-gold-2">Current session</div>
-          <div className="font-display text-[15px] leading-snug mt-1 line-clamp-3">
-            {brief.task}
-          </div>
-          <div className="text-[11px] text-ink-3 mt-1.5 font-mono">
-            {n} seats ·{' '}
-            {s.chair.status === 'running'
-              ? 'deciding'
-              : decided
-                ? 'decided'
-                : `turn ${s.turn} of ${brief.maxTurns}`}
-          </div>
-        </div>
-        <div className="flex-1 overflow-y-auto px-2 pb-2">
-          {members.map((m) => {
-            const last = lastTurnOf(s.turns, m.id)
-            const v = votes[m.id]
-            const speaking = s.speaking === m.id
-            const spoke = s.turns.filter((t) => t.speaker === m.id && t.status === 'done').length
-            return (
-              <button
-                key={m.id}
-                onClick={() => setFilter(filter === m.id ? null : m.id)}
-                className={`w-full text-left rounded-lg px-3 py-2.5 flex gap-3 hover:bg-surface transition ${filter === m.id ? 'bg-surface' : ''}`}
-              >
-                <span className="relative mt-1 w-2.5 h-2.5 shrink-0">
-                  <span
-                    className="absolute inset-0 rounded-full"
-                    style={{ background: CLI_META[m.cli].color }}
-                  />
-                  {speaking && (
-                    <span
-                      className="absolute inset-0 rounded-full pulse"
-                      style={{ background: CLI_META[m.cli].color }}
-                    />
-                  )}
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="flex items-baseline gap-2">
-                    <span className="font-display text-[14px] truncate">{s.labels[m.id]}</span>
-                    {m.id === brief.chairId && (
-                      <span className="text-[9px] uppercase tracking-[0.14em] text-gold-2">
-                        chair
-                      </span>
-                    )}
-                  </span>
-                  <span className="block font-mono text-[10.5px] text-ink-3 truncate">
-                    {CLI_META[m.cli].name}
-                    {m.model ? ` · ${m.model}` : ''}
-                  </span>
-                  <span className="block mt-1.5 h-px bg-line relative">
-                    <span
-                      className="absolute inset-y-0 left-0 bg-gold transition-all duration-700"
-                      style={{ width: `${(v?.confidence ?? 0) * 100}%` }}
-                    />
-                  </span>
-                  <span className="block text-[10.5px] text-ink-3 mt-1">
-                    {speaking ? (
-                      'speaking'
-                    ) : last?.status === 'error' ? (
-                      <span className="text-red">no response</span>
-                    ) : v ? (
-                      `confidence ${Math.round(v.confidence * 100)}% · ${spoke} turn${spoke === 1 ? '' : 's'}`
-                    ) : (
-                      'waiting'
-                    )}
-                  </span>
-                </span>
-              </button>
-            )
-          })}
-        </div>
-        <div
-          className="px-5 py-3 border-t border-line text-[11px] text-ink-3 truncate"
-          title={brief.projectPath}
-        >
-          {brief.projectPath
-            ? `Read-only · ${brief.projectPath.split('/').pop()}`
-            : 'No project attached'}
-        </div>
-      </aside>
-
-      {/* the table and the floor */}
-      <main className="relative flex flex-col min-w-0 min-h-0">
-        <header className="drag h-12 shrink-0 flex items-center justify-center gap-6 text-[12px]">
-          {STAGES.map((label, i) => {
-            const idx = stageIndex(s.stage)
-            return (
-              <span key={label} className="flex items-center gap-6">
-                <span className={i === idx ? 'text-ink' : i < idx ? 'text-ink-2' : 'text-ink-3'}>
-                  {label}
-                  {i === idx && running && <span className="cursor" />}
-                </span>
-                {i < 3 && <span className="w-8 h-px bg-line" />}
+      </header>
+      <main className={`meeting-main ${view === 'whiteboard' ? 'has-whiteboard' : ''}`}>
+        <div className="meeting-heading">
+          <div className="meeting-question">
+            <div className="meeting-eyebrow">A MEETING OF MINDS</div>
+            <h1>{brief.task}</h1>
+            <div className="meeting-context">
+              <span>
+                <Icon name="people" size={13} />
+                {members.length} AI members + you
               </span>
-            )
-          })}
-        </header>
-        <h1 className="font-display font-light text-[21px] leading-tight text-center px-14 line-clamp-2">
-          {brief.task}
-        </h1>
-
-        <div
-          ref={fitRef}
-          className="basis-[44%] shrink-0 min-h-[220px] flex items-center justify-center px-6 py-1"
-        >
-          <div className="relative" style={{ width: box.w, height: box.h }}>
-            <svg
-              viewBox={`0 0 ${VW} ${VH}`}
-              className="absolute inset-0 w-full h-full overflow-visible"
+              {brief.projectPath && (
+                <span title={brief.projectPath}>
+                  <Icon name="folder" size={13} />
+                  {brief.projectPath.split('/').pop()}
+                  <small>Read-only</small>
+                </span>
+              )}
+            </div>
+          </div>
+          <div className="view-switch" aria-label="Meeting layout">
+            <button
+              onClick={() => {
+                setView('gallery')
+                setPinned(null)
+              }}
+              aria-pressed={view === 'gallery'}
+              title="Gallery view"
+              aria-label="Gallery view"
             >
-              <circle
-                cx={CX}
-                cy={CY}
-                r={SEAT_R}
-                fill="none"
-                stroke="var(--color-line)"
-                strokeWidth="1"
-                strokeDasharray="2 7"
-                opacity="0.6"
-              />
-              <circle
-                cx={CX}
-                cy={CY}
-                r={TABLE_R}
-                fill="var(--color-surface)"
-                stroke="var(--color-line-2)"
-                strokeWidth="1"
-              />
-              <circle
-                cx={CX}
-                cy={CY}
-                r={TABLE_R - 14}
-                fill="none"
-                stroke="var(--color-line)"
-                strokeWidth="1"
-              />
-              <circle
-                className="ring"
-                cx={CX}
-                cy={CY}
-                r={TABLE_R}
-                fill="none"
-                stroke="var(--color-gold)"
-                strokeWidth="4"
-                strokeLinecap="round"
-                strokeDasharray={circ}
-                strokeDashoffset={circ * (1 - fraction)}
-                transform={`rotate(-90 ${CX} ${CY})`}
-              />
-              {chords.map((c) => (
-                <path
-                  key={`${c.a}-${c.b}`}
-                  d={`M ${geo[c.a].x} ${geo[c.a].y} Q ${CX} ${CY} ${geo[c.b].x} ${geo[c.b].y}`}
-                  fill="none"
-                  stroke="var(--color-red)"
-                  strokeWidth="1.5"
-                  strokeDasharray="6 5"
-                  opacity="0.8"
-                >
-                  <title>{c.on}</title>
-                </path>
-              ))}
-              <text
-                x={CX}
-                y={CY - 4}
-                textAnchor="middle"
-                fontSize="32"
-                fontFamily="var(--font-display)"
-                fontWeight="300"
-                fill={decided && s.converged ? 'var(--color-gold)' : 'var(--color-ink)'}
+              <Icon name="grid" size={15} />
+            </button>
+            <button
+              onClick={() => setView('speaker')}
+              aria-pressed={view === 'speaker'}
+              title="Speaker view"
+              aria-label="Speaker view"
+            >
+              <Icon name="focus" size={17} />
+            </button>
+            <button
+              onClick={() => {
+                setView('whiteboard')
+                setPanel(null)
+              }}
+              aria-pressed={view === 'whiteboard'}
+              title="Whiteboard view"
+              aria-label="Whiteboard view"
+            >
+              <Icon name="board" size={17} />
+            </button>
+          </div>
+        </div>
+        <div className="meeting-progress">
+          <ol aria-label="Discussion progress">
+            {STAGES.map((label, i) => (
+              <li
+                key={label}
+                className={phase === i ? 'current' : phase > i ? 'complete' : ''}
+                aria-current={phase === i ? 'step' : undefined}
               >
-                {decided && s.converged ? 'C' : `${agree}/${n}`}
-              </text>
-              <text
-                x={CX}
-                y={CY + 18}
-                textAnchor="middle"
-                fontSize="10"
-                fill="var(--color-ink-3)"
-                letterSpacing="2"
+                <span>{phase > i ? <Icon name="check" size={10} /> : i + 1}</span>
+                {label}
+                {i < 3 && <b>›</b>}
+              </li>
+            ))}
+          </ol>
+          <span className="meeting-turn">
+            <UsageMeter s={s} />
+            Turn {memberTurns}
+            <span> / {brief.maxTurns}</span>
+          </span>
+        </div>
+        {/* Focus layout: the whiteboard takes the stage, the agents stay present in a compact strip. */}
+        <section
+          className={`participant-grid ${view === 'speaker' ? 'speaker-layout' : view === 'whiteboard' ? 'focus-layout' : members.length > 3 ? 'many-participants' : ''}`}
+          aria-label="Meeting participants"
+        >
+          {members.map((m) => {
+            const portrait = PORTRAITS[m.persona]
+            const speaking = s.speaking === m.id && running
+            const last = lastTurnOf(s.turns, m.id)
+            const vote = votes[m.id]
+            const failed = last?.status === 'error'
+            const presence: Presence = failed
+              ? 'failed'
+              : speaking
+                ? s.activity?.kind === 'responding'
+                  ? 'responding'
+                  : 'reading'
+                : running
+                  ? 'listening'
+                  : 'idle'
+            const featured = view === 'speaker' && focusId === m.id
+            const stateText = speaking
+              ? s.activity
+                ? ACTIVITY_LABELS[s.activity.kind]
+                : chairWriting
+                  ? 'Writing'
+                  : 'Preparing'
+              : failed
+                ? 'Response failed'
+                : running
+                  ? 'Listening'
+                  : s.stage === 'done'
+                    ? 'Finished'
+                    : last?.status === 'running'
+                      ? 'Interrupted'
+                      : 'Stopped'
+            return (
+              <article
+                key={m.id}
+                className={`participant-tile ${speaking ? 'is-speaking' : ''} ${featured ? 'is-featured' : ''} ${view !== 'gallery' && !featured ? 'is-compact' : ''}`}
+                data-presence={presence}
+                style={{ '--seat-color': PROVIDERS[m.cli].color } as CSSProperties}
+                aria-label={`${s.labels[m.id]}, ${stateText}`}
               >
-                {decided
-                  ? s.converged
-                    ? 'CONSENSUS'
-                    : 'DISSENT RECORDED'
-                  : pastOpenings
-                    ? 'AGREE'
-                    : 'OPENING'}
-              </text>
-              {members.map((m, i) => {
-                const g = geo[i]
-                const last = lastTurnOf(s.turns, m.id)
-                const speaking = s.speaking === m.id
-                const c = CLI_META[m.cli].color
-                return (
-                  <g
-                    key={m.id}
-                    onClick={() => setFilter(filter === m.id ? null : m.id)}
-                    className="cursor-pointer"
-                  >
-                    {speaking && (
-                      <circle
-                        className="pulse"
-                        cx={g.x}
-                        cy={g.y}
-                        r={28}
-                        fill="none"
-                        stroke={c}
-                        strokeWidth="1.5"
-                      />
-                    )}
-                    <circle
-                      cx={g.x}
-                      cy={g.y}
-                      r={26}
-                      fill={c}
-                      fillOpacity={filter && filter !== m.id ? 0.06 : 0.16}
-                      stroke={c}
-                      strokeWidth={last?.status === 'error' ? 0 : 1.5}
-                    />
-                    {last?.status === 'error' && (
-                      <circle
-                        cx={g.x}
-                        cy={g.y}
-                        r={26}
-                        fill="none"
-                        stroke="var(--color-red)"
-                        strokeWidth="1.5"
-                        strokeDasharray="3 3"
-                      />
-                    )}
-                    <text
-                      x={g.x}
-                      y={g.y + 8}
-                      textAnchor="middle"
-                      fontSize="22"
-                      fontFamily="var(--font-display)"
-                      fill={c}
+                <div className="portrait-scene">
+                  <AgentAvatar
+                    cli={m.cli}
+                    persona={m.persona}
+                    model={memberModel(m) ?? (running ? 'CONNECTING' : 'NOT RECORDED')}
+                    presence={presence}
+                  />
+                </div>
+                <div className="tile-shade" />
+                <div className="tile-top">
+                  <span className="persona-lens">
+                    {portrait.role}
+                    <small>3D · Drag to rotate</small>
+                  </span>
+                  {speaking ? (
+                    <span className="tile-speaking">
+                      <span
+                        className={
+                          s.activity?.kind === 'responding' ? 'voice-bars' : 'working-dots'
+                        }
+                      >
+                        <i />
+                        <i />
+                        <i />
+                        <i />
+                      </span>
+                      {stateText}
+                    </span>
+                  ) : (
+                    <span className={`tile-state ${failed ? 'has-error' : ''}`}>
+                      <i className="presence-dot" />
+                      {stateText}
+                    </span>
+                  )}
+                </div>
+                {featured && vote && <div className="featured-position">“{vote.position}”</div>}
+                <div className="tile-bottom">
+                  <div>
+                    <div className="tile-name">
+                      {s.labels[m.id].replace(/^The /, '')}
+                      {m.id === brief.chairId && <span>CHAIR</span>}
+                    </div>
+                    <div className="tile-model" title={memberModel(m)}>
+                      {memberModel(m) ?? (running ? 'Resolving model…' : 'Model not recorded')}
+                    </div>
+                    <AgentUsage s={s} id={m.id} />
+                  </div>
+                  {canInterject && (
+                    <button
+                      className="tile-ask"
+                      onClick={() => askAgent(m.id)}
+                      aria-label={`Ask ${s.labels[m.id]}`}
                     >
-                      {PERSONAS[m.persona].monogram}
-                    </text>
-                    {m.id === brief.chairId && (
-                      <circle cx={g.x + 20} cy={g.y - 20} r={4} fill="var(--color-gold)" />
-                    )}
-                    <text
-                      x={g.x}
-                      y={g.y + 44}
-                      textAnchor="middle"
-                      fontSize="11"
-                      fill="var(--color-ink-2)"
-                      fontFamily="var(--font-sans)"
-                    >
-                      {s.labels[m.id]}
-                    </text>
-                  </g>
-                )
-              })}
-              <rect
-                x={CX - 28}
-                y={CY + TABLE_R + 16}
-                width="56"
-                height="22"
-                rx="11"
-                fill="var(--color-surface)"
-                stroke="var(--color-line-2)"
-              />
-              <text
-                x={CX}
-                y={CY + TABLE_R + 31}
-                textAnchor="middle"
-                fontSize="10"
-                fill="var(--color-ink-3)"
-                fontFamily="var(--font-sans)"
-                letterSpacing="1.5"
-              >
-                YOU
-              </text>
-            </svg>
-            {scale > 0 &&
-              members.map((m, i) => {
-                const g = geo[i]
-                const b = bubble(lastTurnOf(s.turns, m.id), now)
-                const bx = CX + (SEAT_R + 40) * g.cos
-                const by = CY + (SEAT_R + 40) * g.sin
-                return (
+                      Ask ↗
+                    </button>
+                  )}
                   <button
-                    key={m.id}
-                    onClick={() => setFilter(filter === m.id ? null : m.id)}
-                    className={`absolute text-left rounded-xl border px-2.5 py-1.5 w-[190px] bg-surface/90 backdrop-blur-sm transition-colors hover:border-gold-2 ${b.kind === 'err' ? 'border-red/60' : 'border-line-2'}`}
-                    style={{
-                      left: bx * scale,
-                      top: by * scale,
-                      transform: `translate(calc(-50% + ${g.cos * 42}%), calc(-50% + ${g.sin * 48}%))`
+                    className="tile-focus-icon"
+                    aria-label={`Focus on ${s.labels[m.id]}`}
+                    onClick={() => {
+                      setPinned(m.id)
+                      setView('speaker')
                     }}
                   >
-                    <span
-                      className={`block font-voice text-[12px] leading-snug line-clamp-3 ${b.kind === 'err' ? 'text-red' : b.kind === 'wait' ? 'text-ink-3' : 'text-ink'} ${b.kind === 'live' || b.kind === 'wait' ? 'cursor' : ''}`}
-                    >
-                      {b.text}
-                    </span>
+                    <Icon name="expand" size={14} />
                   </button>
-                )
-              })}
-          </div>
-        </div>
-
-        {/* the floor */}
-        <div
-          ref={feedRef}
-          onScroll={(e) =>
-            setStick(
-              e.currentTarget.scrollHeight -
-                e.currentTarget.scrollTop -
-                e.currentTarget.clientHeight <
-                80
-            )
-          }
-          className="flex-1 min-h-0 overflow-y-auto px-8 border-t border-line"
-        >
-          {filter && (
-            <div className="sticky top-0 bg-canvas py-2 text-[11px] text-ink-3 flex gap-3">
-              <span>Only {s.labels[filter]} and you</span>
-              <button className="text-gold" onClick={() => setFilter(null)}>
-                show everyone
-              </button>
-            </div>
-          )}
-          {feed.length === 0 && (
-            <div className="py-6 text-[13px] text-ink-3 font-voice">
-              The table is quiet. Openings come first.
-            </div>
-          )}
-          {feed.map((t, i) => {
-            const c = color(t.speaker)
-            const human = t.speaker === HUMAN
-            return (
-              <div
-                key={`${t.speaker}-${t.n}-${i}`}
-                className="flex gap-3 py-3 border-b border-line/60"
-              >
-                <span
-                  className="w-7 h-7 rounded-full flex items-center justify-center font-display text-[13px] shrink-0 mt-0.5"
-                  style={{ background: `${c}22`, color: c }}
-                >
-                  {human
-                    ? 'Y'
-                    : PERSONAS[members.find((m) => m.id === t.speaker)!.persona].monogram}
-                </span>
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-baseline gap-2 text-[11px] text-ink-3">
-                    <span className="font-display text-[13px]" style={{ color: c }}>
-                      {human ? 'You' : t.label}
-                    </span>
-                    {!human && <span className="font-mono">turn {t.n}</span>}
-                    {t.vote && <span>· {Math.round(t.vote.confidence * 100)}% sure</span>}
-                    {t.status === 'running' && <span className="text-gold">speaking</span>}
-                  </div>
-                  {t.status === 'error' ? (
-                    <p className="text-red text-[13px] mt-1">{t.error}</p>
-                  ) : t.status === 'running' ? (
-                    <p className="font-voice text-[14.5px] leading-relaxed whitespace-pre-wrap mt-1 cursor">
-                      {plain(t.text) || <span className="text-ink-3">{thinking(t, now)}</span>}
-                    </p>
-                  ) : (
-                    <Markdown text={t.text} className="compact mt-1" />
-                  )}
-                  {t.vote && t.vote.disagreements.length > 0 && (
-                    <div className="text-[11px] text-red/90 mt-1">
-                      {t.vote.disagreements
-                        .map((d) => `✗ ${d.with}${d.on ? ` — ${d.on}` : ''}`)
-                        .join(' · ')}
-                    </div>
-                  )}
                 </div>
-              </div>
+              </article>
             )
           })}
-          {s.chair.status !== 'idle' && !filter && (
-            <div className="flex gap-3 py-3">
-              <span className="w-7 h-7 rounded-full flex items-center justify-center font-display text-[13px] shrink-0 mt-0.5 bg-gold/15 text-gold">
-                C
-              </span>
-              <div className="min-w-0 flex-1">
-                <div className="text-[11px] text-ink-3">
-                  <span className="font-display text-[13px] text-gold">{chairLabel}, as chair</span>{' '}
-                  {s.chair.status === 'running'
-                    ? 'is writing the consortium'
-                    : 'wrote the consortium'}
+          <div className={`participant-tile human-tile ${view !== 'gallery' ? 'is-compact' : ''}`}>
+            <div className="human-orbit orbit-one" />
+            <div className="human-orbit orbit-two" />
+            <div className="human-tile-top">
+              <span>Every good discussion needs you.</span>
+              <span className="human-badge">YOUR SEAT</span>
+            </div>
+            <div className="human-center">
+              <div className="human-avatar">
+                Y<span />
+              </div>
+              <h2>A little human perspective.</h2>
+              <p>
+                Add context. Challenge a thought.
+                <br />
+                Help the room see something new.
+              </p>
+              <button onClick={addContext} disabled={!canInterject}>
+                <Icon name="chat" size={13} />
+                Add your perspective
+              </button>
+            </div>
+            <div className="tile-bottom">
+              <div>
+                <div className="tile-name">
+                  You<span>HOST</span>
                 </div>
-                {s.chair.status === 'running' && (
-                  <p className="font-voice text-[14.5px] leading-relaxed whitespace-pre-wrap mt-1 cursor">
-                    {plain(s.chair.text).slice(-600)}
+                <div className="tile-model">Part of the conversation</div>
+              </div>
+              <span className="human-presence" />
+            </div>
+          </div>
+        </section>
+        {view === 'whiteboard' && (
+          <Whiteboard
+            state={s}
+            onSource={viewSource}
+            onRefresh={() => void refreshBoard()}
+            onDiscuss={discussVisual}
+          />
+        )}
+        {view !== 'whiteboard' && (
+          <div className="live-caption">
+            <div className={`caption-indicator ${s.speaking ? 'active' : ''}`}>
+              <span />
+              <span />
+              <span />
+            </div>
+            <div>
+              <strong>
+                {s.speaking
+                  ? `${activeName}${chairWriting ? ' · chair' : ' has the floor'}`
+                  : running
+                    ? 'Around the table'
+                    : 'Meeting recap'}
+              </strong>
+              {s.activity && running ? (
+                <ActivityStatus
+                  activity={s.activity}
+                  next={nextMember ? s.labels[nextMember.id]?.replace(/^The /, '') : undefined}
+                />
+              ) : (
+                <p>{caption}</p>
+              )}
+            </div>
+            {pinned && view === 'speaker' && (
+              <button onClick={() => setPinned(null)}>Follow speaker</button>
+            )}
+          </div>
+        )}
+      </main>
+      {panel && (
+        <aside className="meeting-panel" aria-label="Meeting side panel">
+          <div className="panel-tabs" role="tablist" aria-label="Meeting details">
+            <button
+              role="tab"
+              aria-selected={panel === 'conversation'}
+              onClick={() => setPanel('conversation')}
+            >
+              <Icon name="chat" size={15} />
+              Conversation<span>{s.turns.length}</span>
+            </button>
+            <button
+              role="tab"
+              aria-selected={panel === 'decision'}
+              onClick={() => setPanel('decision')}
+            >
+              <Icon name="file" size={15} />
+              Decision
+              {questions > 0 && <span title="Needs your input">{questions}</span>}
+            </button>
+            <button
+              className="panel-close"
+              onClick={() => setPanel(null)}
+              aria-label="Close side panel"
+            >
+              <Icon name="close" size={15} />
+            </button>
+          </div>
+          {panel === 'conversation' ? (
+            <>
+              <div className="panel-intro">
+                <h2>The conversation</h2>
+                <p>Different perspectives. All in one place.</p>
+              </div>
+              <div
+                className="meeting-transcript"
+                ref={feedRef}
+                role="region"
+                aria-label="Discussion transcript"
+                tabIndex={0}
+                onScroll={(e) =>
+                  setStick(
+                    e.currentTarget.scrollHeight -
+                      e.currentTarget.scrollTop -
+                      e.currentTarget.clientHeight <
+                      65
+                  )
+                }
+              >
+                <div className="transcript-marker">
+                  <span />
+                  {s.turns.length ? 'The meeting has started' : 'Taking our seats'}
+                  <span />
+                </div>
+                {s.turns.map((t, i) => {
+                  const member = members.find((m) => m.id === t.speaker)
+                  const human = t.speaker === HUMAN
+                  const portrait = member ? PORTRAITS[member.persona] : undefined
+                  const active = running && t.status === 'running'
+                  return (
+                    <article
+                      id={human ? undefined : `turn-${t.n}`}
+                      className={`meeting-message ${human ? 'from-human' : ''}`}
+                      key={`${t.speaker}-${t.n}-${i}`}
+                      style={{ '--seat-color': portrait?.color ?? '#b8bfd2' } as CSSProperties}
+                    >
+                      <div
+                        className="message-avatar"
+                        style={{ color: member ? PROVIDERS[member.cli].color : undefined }}
+                      >
+                        {human ? 'Y' : member ? PERSONAS[member.persona].monogram : '?'}
+                      </div>
+                      <div className="message-body">
+                        <div className="message-meta">
+                          <h3>{human ? 'You' : t.label.replace(/^The /, '')}</h3>
+                          <span>
+                            {active
+                              ? s.activity
+                                ? ACTIVITY_LABELS[s.activity.kind]
+                                : 'Preparing'
+                              : human
+                                ? 'Host'
+                                : `Turn ${t.n}`}
+                          </span>
+                        </div>
+                        {t.status === 'error' ? (
+                          <p className="meeting-error">{t.error}</p>
+                        ) : t.status === 'running' ? (
+                          <>
+                            {plain(t.text) ? (
+                              <p
+                                className={`message-stream ${active && s.activity?.kind === 'responding' ? 'cursor' : ''}`}
+                              >
+                                {plain(t.text)}
+                              </p>
+                            ) : active ? (
+                              <div className="response-placeholder">
+                                <span />
+                                <span />
+                                <span />
+                                <p>The response will appear here.</p>
+                              </div>
+                            ) : (
+                              <p className="message-stream">Response interrupted.</p>
+                            )}
+                          </>
+                        ) : (
+                          <Markdown text={t.text} className="compact" />
+                        )}
+                        {t.vote && (
+                          <div className="message-vote">
+                            <span>{Math.round(t.vote.confidence * 100)}% confidence</span>
+                            {t.vote.disagreements.length > 0 && (
+                              <span className="objection-chip">
+                                {t.vote.disagreements.length} objection
+                                {t.vote.disagreements.length > 1 ? 's' : ''}
+                              </span>
+                            )}
+                          </div>
+                        )}
+                        {!!t.vote?.disagreements.length && (
+                          <details className="message-objections">
+                            <summary>View objections</summary>
+                            {t.vote.disagreements.map((d, j) => (
+                              <p key={j}>
+                                <strong>{d.with}</strong>
+                                {d.on ? ` · ${d.on}` : ''}
+                              </p>
+                            ))}
+                          </details>
+                        )}
+                      </div>
+                    </article>
+                  )
+                })}
+                {chairWriting && (
+                  <div className="meeting-system-message">
+                    <Icon name="file" />
+                    <p>
+                      The chair is writing the final decision
+                      <span className="cursor" />
+                    </p>
+                  </div>
+                )}
+                {s.consortium && (
+                  <button className="decision-ready" onClick={onConsortium}>
+                    <Icon name="file" />
+                    <span>
+                      Your decision is ready<small>Rationale, next steps, and dissent</small>
+                    </span>
+                    <span>↗</span>
+                  </button>
+                )}
+                {s.stage === 'failed' && (
+                  <p className="meeting-error" role="alert">
+                    {s.error ?? 'The session failed.'}
                   </p>
                 )}
               </div>
-            </div>
-          )}
-        </div>
-
-        <footer className="px-8 pb-4 pt-3 flex items-center gap-4 border-t border-line">
-          <div className="w-28 shrink-0" title={`${memberTurns} of ${brief.maxTurns} turns`}>
-            <div className="text-[10px] font-mono text-ink-3 mb-1">
-              turn {memberTurns}/{brief.maxTurns}
-            </div>
-            <div className="h-px bg-line relative">
-              <div
-                className="absolute inset-y-0 left-0 bg-gold-2 transition-all duration-500"
-                style={{ width: `${Math.min(100, (memberTurns / brief.maxTurns) * 100)}%` }}
-              />
-            </div>
-          </div>
-          <form onSubmit={interject} className="flex-1 relative">
-            <input
-              value={thought}
-              onChange={(e) => setThought(e.target.value)}
-              disabled={!running}
-              placeholder={
-                running
-                  ? 'Say something to the table…'
-                  : s.stage === 'done'
-                    ? 'The consortium has decided'
-                    : 'The table is closed'
-              }
-              className="w-full h-10 rounded-full bg-surface border border-line-2 focus:border-gold outline-none px-4 text-[13px] font-voice placeholder:text-ink-3 disabled:opacity-60"
-            />
-            {toast && <span className="absolute -top-6 left-4 text-[11px] text-gold">{toast}</span>}
-          </form>
-          {running ? (
-            <button
-              onClick={() => void window.api!.stop()}
-              className="text-[12px] text-ink-3 hover:text-red"
-            >
-              Stop
-            </button>
-          ) : s.stage === 'done' ? (
-            <button
-              onClick={onConsortium}
-              className="bg-gold text-canvas text-[13px] font-medium px-4 h-9 rounded-full hover:brightness-110"
-            >
-              Read the consortium
-            </button>
-          ) : (
-            <button onClick={onHome} className="text-[12px] text-ink-2 hover:text-ink">
-              {s.stage === 'failed' ? `Failed: ${s.error ?? 'unknown'} · ` : 'Stopped · '}Convene
-              again
-            </button>
-          )}
-        </footer>
-      </main>
-
-      {/* taking shape */}
-      <aside className="border-l border-line flex flex-col min-h-0">
-        <div className="drag h-12 shrink-0" />
-        <div className="px-5 pb-5 overflow-y-auto">
-          <div className="font-display text-[20px]">Taking shape</div>
-          <div className="text-[12px] text-ink-3 mt-0.5">
-            The clerk&apos;s notes, kept between turns
-          </div>
-
-          <div className="mt-6 flex items-baseline justify-between">
-            <span className="text-[11px] uppercase tracking-[0.18em] text-ink-3">Agreement</span>
-            <span className="font-display text-[26px] text-gold leading-none">
-              {agree}
-              <span className="text-ink-3 text-[15px]"> / {n}</span>
-            </span>
-          </div>
-          <div className="mt-2 flex gap-1.5">
-            {members.map((m) => {
-              const ok = votes[m.id] && votes[m.id]!.disagreements.length === 0
-              return (
-                <span
-                  key={m.id}
-                  className="w-3 h-3 rounded-full border"
-                  style={{
-                    borderColor: CLI_META[m.cli].color,
-                    background: ok ? CLI_META[m.cli].color : 'transparent'
-                  }}
-                  title={s.labels[m.id]}
-                />
-              )
-            })}
-          </div>
-
-          {s.shape ? (
-            <>
-              <ol className="mt-7 space-y-4">
-                {s.shape.converging.map((c, i) => (
-                  <li key={i} className="flex gap-3">
-                    <span className="font-display text-[15px] text-ink-3 w-4 shrink-0">
-                      {i + 1}
-                    </span>
-                    <div>
-                      <div className="font-voice text-[14px] leading-snug">{c.point}</div>
-                      <div className="flex gap-1 mt-1.5">
-                        {members.map((m) => (
-                          <span
-                            key={m.id}
-                            className="w-2 h-2 rounded-full"
-                            style={{
-                              background: c.supporters.includes(s.labels[m.id])
-                                ? CLI_META[m.cli].color
-                                : 'var(--color-line-2)'
-                            }}
-                          />
-                        ))}
+              <div className="meeting-compose-wrap">
+                {!stick && (
+                  <button className="latest-button" onClick={() => setStick(true)}>
+                    ↓ Back to live
+                  </button>
+                )}
+                {s.hostMessages.length > 0 && (
+                  <div className="host-queue" aria-label="Host messages">
+                    {s.hostMessages.slice(-3).map((message) => (
+                      <div key={message.id}>
+                        <p>
+                          {message.kind === 'focus'
+                            ? 'Focus: '
+                            : message.kind === 'ask'
+                              ? `${s.labels[message.targetId!]?.replace(/^The /, '')}: `
+                              : ''}
+                          {message.text}
+                        </p>
+                        <span className={message.status}>
+                          {message.status === 'queued'
+                            ? 'Queued · next turn'
+                            : `Delivered to ${message.deliveredTo?.replace(/^The /, '')}`}
+                        </span>
                       </div>
-                    </div>
-                  </li>
-                ))}
-              </ol>
-              {s.shape.open.length > 0 && (
-                <div className="mt-7">
-                  <div className="text-[11px] uppercase tracking-[0.18em] text-ink-3">
-                    Still open
-                  </div>
-                  <ul className="mt-2 space-y-2.5">
-                    {s.shape.open.map((o, i) => (
-                      <li key={i} className="flex gap-2.5">
-                        <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-red shrink-0" />
-                        <div>
-                          <div className="font-voice text-[14px] leading-snug">{o.point}</div>
-                          <div className="text-[11px] text-ink-3 mt-0.5">{o.sides}</div>
-                        </div>
-                      </li>
                     ))}
-                  </ul>
-                </div>
-              )}
-              {s.shape.open.length === 0 && s.shape.converging.length > 0 && (
-                <div className="mt-6 text-[12px] text-gold">Nothing left open.</div>
-              )}
+                  </div>
+                )}
+                <label className="host-mode">
+                  Direct the room
+                  <select
+                    aria-label="Message destination"
+                    value={hostMode}
+                    onChange={(e) => setHostMode(e.target.value)}
+                    disabled={!canInterject}
+                  >
+                    <option value="thought">Everyone · add a thought</option>
+                    <option value="focus">Focus the discussion</option>
+                    {members.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        Ask {s.labels[m.id].replace(/^The /, '')} next
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <form className="meeting-composer" onSubmit={(e) => void interject(e)}>
+                  <textarea
+                    rows={3}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                        e.preventDefault()
+                        e.currentTarget.form?.requestSubmit()
+                      }
+                    }}
+                    ref={inputRef}
+                    value={thought}
+                    onChange={(e) => {
+                      setThought(e.target.value)
+                      setNotice(null)
+                    }}
+                    maxLength={4000}
+                    disabled={!canInterject || sending}
+                    placeholder={
+                      canInterject
+                        ? hostMode === 'focus'
+                          ? 'What should the room focus on?'
+                          : hostMode === 'thought'
+                            ? 'Say something to the room…'
+                            : 'Your question for this agent…'
+                        : chairWriting
+                          ? 'The chair is writing…'
+                          : 'This session has ended'
+                    }
+                    aria-label="Message to the discussion"
+                  />
+                  <button
+                    type="submit"
+                    aria-label="Send message"
+                    disabled={!thought.trim() || !canInterject || sending}
+                  >
+                    <Icon name="send" size={16} />
+                  </button>
+                </form>
+                <p role="status">
+                  {notice ??
+                    (canInterject
+                      ? 'Your message joins the next turn.'
+                      : 'Every perspective stays in the transcript.')}
+                </p>
+              </div>
             </>
           ) : (
-            <div className="mt-8 text-[13px] text-ink-3 font-voice">
-              {running ? (
-                <span className="cursor">Listening to the table</span>
-              ) : (
-                'No notes for this session.'
-              )}
-            </div>
+            <DecisionBoard
+              state={s}
+              onSource={viewSource}
+              onAnswer={answer}
+              onConsortium={onConsortium}
+            />
           )}
-          {s.chair.status === 'running' && (
-            <div className="mt-8 border-t border-line pt-4 text-[12px] text-ink-2">
-              <span className="text-gold">{chairLabel}</span> is writing the consortium
-              <span className="cursor" />
-            </div>
+        </aside>
+      )}
+      <footer className="meeting-controls">
+        <div className="meeting-footer-context">
+          <span className={`footer-live-dot ${running ? 'live' : ''}`} />
+          <div>
+            <strong>{running ? 'In the room' : 'Meeting ended'}</strong>
+            <span>{members.length + 1} participants</span>
+          </div>
+        </div>
+        <div className="meeting-tool-group">
+          <button
+            className={`meeting-tool ${paused ? 'tool-active' : ''}`}
+            aria-pressed={paused}
+            onClick={() => void togglePause()}
+            disabled={!running || chairWriting}
+          >
+            <span className="tool-icon">
+              <Icon name={paused ? 'play' : 'pause'} />
+            </span>
+            <span>{paused ? 'Resume' : 'Pause'}</span>
+          </button>
+          <button className="meeting-tool" onClick={addContext} disabled={!canInterject}>
+            <span className="tool-icon">
+              <Icon name="chat" />
+            </span>
+            <span>Add a thought</span>
+          </button>
+          <span className="tools-divider" />
+          <button
+            className={`meeting-tool ${panel === 'conversation' ? 'tool-active' : ''}`}
+            aria-pressed={panel === 'conversation'}
+            onClick={() => togglePanel('conversation')}
+          >
+            <span className="tool-icon">
+              <Icon name="chat" />
+              <b>{s.turns.length}</b>
+            </span>
+            <span>Conversation</span>
+          </button>
+          <button
+            className={`meeting-tool ${panel === 'decision' ? 'tool-active' : ''}`}
+            aria-pressed={panel === 'decision'}
+            onClick={() => togglePanel('decision')}
+          >
+            <span className="tool-icon">
+              <Icon name="file" />
+              {questions > 0 && <b>{questions}</b>}
+            </span>
+            <span>Decision board</span>
+          </button>
+          <button
+            className={`meeting-tool ${view === 'whiteboard' ? 'tool-active' : ''}`}
+            aria-pressed={view === 'whiteboard'}
+            onClick={() => {
+              setView(view === 'whiteboard' ? 'gallery' : 'whiteboard')
+              if (view !== 'whiteboard') setPanel(null)
+            }}
+          >
+            <span className="tool-icon">
+              <Icon name="board" />
+            </span>
+            <span>Whiteboard</span>
+          </button>
+        </div>
+        <div className="meeting-end">
+          {running ? (
+            <>
+              <button
+                className="conclude-button"
+                onClick={() => void conclude()}
+                disabled={s.concluding || chairWriting}
+                title="Finish the current response, then write the decision"
+              >
+                {s.concluding || chairWriting ? 'Concluding…' : 'Conclude now'}
+              </button>
+              <button onClick={() => void stop()} disabled={stopping}>
+                <Icon name="end" size={17} />
+                {stopping ? 'Ending…' : 'End session'}
+              </button>
+            </>
+          ) : (
+            <>
+              {!s.consortium && (
+                <button className="return-sessions" onClick={onResume}>
+                  <Icon name="play" size={16} />
+                  Resume meeting
+                </button>
+              )}
+              <button className="return-sessions" onClick={onHome}>
+                <Icon name="back" size={16} />
+                All sessions
+              </button>
+            </>
           )}
         </div>
-      </aside>
+      </footer>
     </div>
   )
 }

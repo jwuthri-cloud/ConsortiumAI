@@ -4,6 +4,10 @@ import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import type { Brief, Cli, DebateEvent } from '../shared/types'
 import * as debate from './debate'
+import { transcribe } from './whisper'
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { basename } from 'node:path'
 import { detectBins, checkCli, killAll, listModels } from './cli'
 
 let win: BrowserWindow | null = null
@@ -15,7 +19,7 @@ function createWindow(): void {
     minWidth: 1000,
     minHeight: 680,
     show: false,
-    backgroundColor: '#0A0D14',
+    backgroundColor: '#111216',
     titleBarStyle: 'hiddenInset',
     trafficLightPosition: { x: 16, y: 18 },
     autoHideMenuBar: true,
@@ -47,6 +51,7 @@ function createWindow(): void {
 
 app.whenReady().then(() => {
   electronApp.setAppUserModelId('ai.consortium')
+  if (process.platform === 'darwin') app.dock?.setIcon(icon)
   app.on('browser-window-created', (_, window) => optimizer.watchWindowShortcuts(window))
   debate.configure(app.getPath('userData'))
 
@@ -55,11 +60,26 @@ app.whenReady().then(() => {
   }
   ipcMain.handle('debate:start', (_, brief: Brief, id: string) => debate.runDebate(brief, send, id))
   ipcMain.handle('debate:stop', () => debate.stop())
+  ipcMain.handle('debate:resume', (_, id: string) => debate.resume(id, send))
+  ipcMain.handle('debate:pause', (_, on: boolean) => debate.pause(on))
+  ipcMain.handle('debate:host', (_, input) => debate.host(input))
+  ipcMain.handle('debate:conclude', () => debate.conclude())
+  ipcMain.handle('debate:refreshBoard', () => debate.refreshBoard())
   ipcMain.handle('debate:interject', (_, text: string) => debate.interject(text))
   ipcMain.handle('dialog:pickFolder', async () => {
     const r = await dialog.showOpenDialog({ properties: ['openDirectory'] })
     return r.canceled ? null : r.filePaths[0]
   })
+  ipcMain.handle('dialog:pickFiles', async () => {
+    const r = await dialog.showOpenDialog({ properties: ['openFile', 'multiSelections'] })
+    return r.canceled ? [] : r.filePaths
+  })
+  ipcMain.handle('file:save', (_, name: string, data: ArrayBuffer) => {
+    const p = join(mkdtempSync(join(tmpdir(), 'consortium-')), basename(name))
+    writeFileSync(p, Buffer.from(data))
+    return p
+  })
+  ipcMain.handle('stt:transcribe', (_, path: string) => transcribe(path))
   ipcMain.handle('shell:reveal', (_, path: string) => shell.showItemInFolder(path))
   ipcMain.handle('cli:detect', () => detectBins())
   ipcMain.handle('cli:check', (_, cli: Cli) => checkCli(cli))

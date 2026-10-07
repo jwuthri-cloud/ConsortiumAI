@@ -7,15 +7,6 @@ import Consortium from './Consortium'
 export default function App(): React.JSX.Element {
   const [s, dispatch] = useReducer(reducer, initial)
   useEffect(() => window.api!.onEvent(dispatch), [])
-  // the moment: the rim closes in the chamber, then the document rises
-  useEffect(() => {
-    if (s.stage === 'done' && s.screen === 'chamber' && s.consortium && !s.revealed) {
-      const t = setTimeout(() => dispatch({ type: 'show-consortium' }), 1800)
-      return () => clearTimeout(t)
-    }
-    return undefined
-  }, [s.stage, s.screen, s.consortium, s.revealed])
-
   if (s.screen === 'convene')
     return (
       <Convene
@@ -25,6 +16,11 @@ export default function App(): React.JSX.Element {
           void window.api!.start(brief, sessionId)
         }}
         onOpen={(session) => dispatch({ type: 'open', session })}
+        onContinue={(session) => {
+          dispatch({ type: 'open', session })
+          dispatch({ type: 'resume' })
+          void window.api!.resume(session.id)
+        }}
       />
     )
   if (s.screen === 'consortium' && s.consortium && s.brief)
@@ -32,7 +28,7 @@ export default function App(): React.JSX.Element {
       <Consortium
         state={s}
         onHome={() => dispatch({ type: 'home' })}
-        onChamber={() => dispatch({ type: 'show-chamber' })}
+        onChamber={(turn) => dispatch({ type: 'show-chamber', turn })}
       />
     )
   return (
@@ -40,6 +36,10 @@ export default function App(): React.JSX.Element {
       state={s}
       onHome={() => dispatch({ type: 'home' })}
       onConsortium={() => dispatch({ type: 'show-consortium' })}
+      onResume={() => {
+        dispatch({ type: 'resume' })
+        void window.api!.resume(s.sessionId!)
+      }}
     />
   )
 }

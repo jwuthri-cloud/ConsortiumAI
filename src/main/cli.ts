@@ -1,9 +1,14 @@
-import { spawn, execSync, execFileSync, type ChildProcess } from 'node:child_process'
+import { streamActivity } from './activity'
+import { promisify } from 'node:util'
+import { streamModel, codexSessionModel, codexThreadUsage } from './modelMetadata'
+import { minus, priced, readUsage, type Usage } from '../shared/usage'
+import { modelName } from '../shared/models'
+import { spawn, execSync, execFile, execFileSync, type ChildProcess } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { tmpdir, homedir } from 'node:os'
 import { mkdirSync, accessSync, readdirSync, readFileSync, constants } from 'node:fs'
 import { join } from 'node:path'
-import type { Cli } from '../shared/types'
+import type { ActivityKind, Cli } from '../shared/types'
 
 // Think-only runs (no project attached) get an empty directory, so a CLI that still has read tools finds nothing to read.
 function emptyDir(): string {
@@ -12,13 +17,25 @@ function emptyDir(): string {
   return d
 }
 
-export type RunArgs = { prompt: string; model?: string; cwd?: string; resume?: string }
-export type RunResult = { text: string; sessionId?: string; costUsd?: number }
+export type RunArgs = {
+  prompt: string
+  model?: string
+  cwd?: string
+  dirs?: string[] // extra read-only folders (attachments); codex's read-only sandbox and grok read them by absolute path
+  resume?: string
+}
+export type RunResult = {
+  text: string
+  sessionId?: string
+  costUsd?: number
+  model?: string
+  usage?: Usage // this run only, priced
+}
 
 type Ev =
   | { type: 'session'; sessionId: string }
   | { type: 'delta'; text: string }
-  | { type: 'done'; text?: string; sessionId?: string; costUsd?: number }
+  | { type: 'done'; text?: string; sessionId?: string; costUsd?: number; usage?: Usage }
   | { type: 'error'; message: string }
   | null
 
@@ -27,7 +44,7 @@ type Ev =
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const ADAPTERS: Record<Cli, { args(a: RunArgs): string[]; parse(l: any): Ev }> = {
   claude: {
-    args: ({ prompt, model, cwd, resume }) => [
+    args: ({ prompt, model, cwd, dirs, resume }) => [
       '-p',
       prompt,
       '--output-format',
@@ -38,6 +55,7 @@ const ADAPTERS: Record<Cli, { args(a: RunArgs): string[]; parse(l: any): Ev }> =
       '',
       '--strict-mcp-config',
       ...(cwd ? ['--tools', 'Read,Glob,Grep', '--max-turns', '25'] : ['--tools', '']),
+      ...(dirs?.length ? ['--add-dir', ...dirs] : []),
       ...(model ? ['--model', model] : []),
       ...(resume ? ['--resume', resume] : [])
     ],
@@ -49,7 +67,7 @@ const ADAPTERS: Record<Cli, { args(a: RunArgs): string[]; parse(l: any): Ev }> =
       if (l.type === 'result')
         return l.is_error
           ? { type: 'error', message: String(l.result || l.subtype || 'claude failed') }
-          : { type: 'done', text: l.result, costUsd: l.total_cost_usd }
+          : { type: 'done', text: l.result, costUsd: l.total_cost_usd, usage: readUsage(l.usage) }
       return null
     }
   },
@@ -80,7 +98,8 @@ const ADAPTERS: Record<Cli, { args(a: RunArgs): string[]; parse(l: any): Ev }> =
       if (l.type === 'thread.started') return { type: 'session', sessionId: l.thread_id }
       if (l.type === 'item.completed' && l.item?.type === 'agent_message')
         return { type: 'delta', text: l.item.text + '\n\n' }
-      if (l.type === 'turn.completed') return { type: 'done' }
+      // a resumed thread reports its running total; runMember subtracts what came before
+      if (l.type === 'turn.completed') return { type: 'done', usage: readUsage(l.usage) }
       if (l.type === 'turn.failed' || l.type === 'error')
         return { type: 'error', message: l.error?.message ?? l.message ?? 'codex failed' }
       return null
@@ -103,14 +122,19 @@ const ADAPTERS: Record<Cli, { args(a: RunArgs): string[]; parse(l: any): Ev }> =
     parse: (l) => {
       if (l.type === 'text') return { type: 'delta', text: String(l.data ?? '') }
       if (l.type === 'end')
-        return { type: 'done', sessionId: l.sessionId, costUsd: l.total_cost_usd }
+        return {
+          type: 'done',
+          sessionId: l.sessionId,
+          costUsd: l.total_cost_usd,
+          usage: readUsage(l.usage) // ponytail: grok's field names unverified
+        }
       if (l.type === 'error') return { type: 'error', message: l.message ?? 'grok failed' }
       return null
     }
   },
   gemini: {
     // --skip-trust: headless runs refuse untrusted folders, and we only ever run in the project or an empty dir
-    args: ({ prompt, model, cwd, resume }) => [
+    args: ({ prompt, model, cwd, dirs, resume }) => [
       '-p',
       prompt,
       '--output-format',
@@ -118,7 +142,7 @@ const ADAPTERS: Record<Cli, { args(a: RunArgs): string[]; parse(l: any): Ev }> =
       '--approval-mode',
       'plan',
       '--skip-trust',
-      ...(cwd ? ['--include-directories', cwd] : []),
+      ...[cwd, ...(dirs ?? [])].filter(Boolean).flatMap((d) => ['--include-directories', d!]),
       ...(model ? ['-m', model] : []),
       ...(resume ? ['--resume', resume] : [])
     ],
@@ -131,7 +155,7 @@ const ADAPTERS: Record<Cli, { args(a: RunArgs): string[]; parse(l: any): Ev }> =
       if (l.type === 'result')
         return l.error || (l.status && l.status !== 'success')
           ? { type: 'error', message: String(l.error?.message ?? l.error ?? l.status) }
-          : { type: 'done', text: l.response }
+          : { type: 'done', text: l.response, usage: readUsage(l.stats) } // ponytail: unverified, gemini isn't signed in here
       if (l.type === 'error')
         return { type: 'error', message: String(l.message ?? JSON.stringify(l)) }
       return null
@@ -335,6 +359,11 @@ function kill(child: ChildProcess): void {
   }
 }
 
+export function killRun(key: string): void {
+  const child = procs.get(key)
+  if (child) kill(child)
+}
+
 export function killAll(): void {
   for (const c of procs.values()) kill(c)
   procs.clear()
@@ -344,9 +373,42 @@ export async function runMember(
   cli: Cli,
   a: RunArgs,
   onDelta: (t: string) => void,
-  key: string
+  key: string,
+  onModel: (model: string) => void = () => {},
+  onActivity: (kind: ActivityKind) => void = () => {}
 ): Promise<RunResult> {
   const bin = detectBins()[cli] ?? cli
+  let model: string | undefined
+  let finished = false
+  let lastActivity: ActivityKind | undefined
+  let activityAt = 0
+  const reportActivity = (kind: ActivityKind | undefined): void => {
+    const now = Date.now()
+    if (kind && (kind !== lastActivity || now - activityAt >= 1000)) {
+      lastActivity = kind
+      activityAt = now
+      onActivity(kind)
+    }
+  }
+  const reportModel = (value: string | undefined): void => {
+    if (!finished && value && value !== model) {
+      model = value
+      onModel(value)
+    }
+  }
+  // Grok exposes the selected default through its own model catalogue.
+  // Start the process immediately; a failed lookup must never prevent a meeting.
+  const defaultLookup =
+    cli === 'grok' && !a.model
+      ? promisify(execFile)(bin, ['models'], {
+          timeout: 8000,
+          env: { ...process.env, NO_COLOR: '1' }
+        })
+          .then(({ stdout }) => modelName(stdout.match(/Default model:\s*(\S+)/)?.[1]))
+          .catch(() => undefined)
+      : Promise.resolve(undefined)
+  // read before the resume appends to the same rollout
+  const before = cli === 'codex' && a.resume ? await codexThreadUsage(a.resume) : undefined
   const child = spawn(bin, ADAPTERS[cli].args(a), {
     // gemini always starts in the empty dir: it auto-loads any .env in its cwd (stale GEMINI_API_KEY → "API key not valid")
     // and sees the project through --include-directories instead
@@ -359,7 +421,24 @@ export async function runMember(
   let text = ''
   let final: string | undefined
   let sessionId: string | undefined
+  let modelLookup: Promise<void> | undefined
+  const lookupModel = (): Promise<void> => {
+    if (cli !== 'codex' || !sessionId) return Promise.resolve()
+    modelLookup ??= codexSessionModel(sessionId)
+      .then(reportModel)
+      .finally(() => {
+        modelLookup = undefined
+      })
+    return modelLookup
+  }
+  const modelTimer = setInterval(() => {
+    if (!model) void lookupModel()
+  }, 1500)
+  void defaultLookup.then((value) => {
+    if (!model) reportModel(value)
+  })
   let costUsd: number | undefined
+  let usage: Usage | undefined
   let errMsg: string | undefined
   let stderr = ''
   child.stderr?.on('data', (d: Buffer) => {
@@ -373,7 +452,10 @@ export async function runMember(
     for await (const line of createInterface({ input: child.stdout! })) {
       let ev: Ev
       try {
-        ev = ADAPTERS[cli].parse(JSON.parse(line))
+        const raw = JSON.parse(line)
+        reportModel(streamModel(cli, raw))
+        reportActivity(streamActivity(cli, raw))
+        ev = ADAPTERS[cli].parse(raw)
       } catch {
         continue
       }
@@ -384,7 +466,8 @@ export async function runMember(
         onDelta(ev.text)
       } else if (ev.type === 'done') {
         final = ev.text
-        costUsd = ev.costUsd
+        costUsd = ev.costUsd ?? costUsd
+        usage = ev.usage ?? usage
         if (ev.sessionId) sessionId = ev.sessionId
       } else errMsg = ev.message
     }
@@ -400,18 +483,25 @@ export async function runMember(
     if (out.startsWith('[API Error')) throw new Error(humanError(out)) // gemini reports API failures as prose
     if (!out) throw new Error(humanError(tail) || `${cli} exited with code ${code} and no output`)
     if (code !== 0 && !final) throw new Error(tail || `${cli} exited with code ${code}`)
-    return { text: out, sessionId, costUsd }
+    await lookupModel()
+    if (!model) reportModel(await defaultLookup)
+    const spent = usage && priced({ ...minus(usage, before), costUsd }, model)
+    return { text: out, sessionId, costUsd, model, usage: spent }
   } catch (e) {
     if (e instanceof Error && (e as NodeJS.ErrnoException).code === 'ENOENT')
       throw new Error(`${cli} is not installed (or not on PATH)`)
     throw e
   } finally {
+    finished = true
     clearTimeout(timer)
+    clearInterval(modelTimer)
     procs.delete(key)
   }
 }
 
-export async function checkCli(cli: Cli): Promise<{ ok: boolean; message: string }> {
+export async function checkCli(
+  cli: Cli
+): Promise<{ ok: boolean; message: string; model?: string }> {
   const t = setTimeout(() => {
     const c = procs.get(`check:${cli}`)
     if (c) kill(c)
@@ -423,7 +513,7 @@ export async function checkCli(cli: Cli): Promise<{ ok: boolean; message: string
       () => {},
       `check:${cli}`
     )
-    return { ok: true, message: r.text.slice(0, 80) }
+    return { ok: true, message: r.text.slice(0, 80), model: r.model }
   } catch (e) {
     return { ok: false, message: e instanceof Error ? e.message : String(e) }
   } finally {

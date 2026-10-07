@@ -1,4 +1,12 @@
-import type { Brief, Member, Phase, Shape, Turn, Vote } from '../shared/types'
+import {
+  HUMAN,
+  type Brief,
+  type Member,
+  type Phase,
+  type Shape,
+  type Turn,
+  type Vote
+} from '../shared/types'
 import { PERSONAS } from '../shared/personas'
 
 type Labels = Record<string, string>
@@ -10,8 +18,13 @@ function clip(text: string, max: number): string {
   return text.length > max ? text.slice(0, max) + ' …' : text
 }
 
-function said(turns: Turn[], max = 1500): string {
-  return turns.map((t) => `**${t.label}:** ${clip(t.text, max)}`).join('\n\n')
+// tag = prefix member turns with [T<n>] so the chair can cite them
+function said(turns: Turn[], max = 1500, tag = false): string {
+  return turns
+    .map(
+      (t) => `**${tag && t.speaker !== HUMAN ? `[T${t.n}] ` : ''}${t.label}:** ${clip(t.text, max)}`
+    )
+    .join('\n\n')
 }
 
 function notes(shape: Shape | null): string {
@@ -24,12 +37,19 @@ function notes(shape: Shape | null): string {
 }
 
 function projectRule(brief: Brief): string {
-  return brief.projectPath
-    ? `A project is attached at ${brief.projectPath}. Inspect its code read-only when a claim depends on it. Never create, modify or delete anything.`
-    : 'No project is attached. Do not use tools; reason from the question and what you know.'
+  const files = brief.attachments ?? []
+  const rule = brief.projectPath
+    ? `A project is attached at ${brief.projectPath}. Inspect its code read-only when a claim depends on it. Start with a targeted search and read only the relevant files; do not conduct a broad audit unless the question calls for one. Reuse evidence already established in the conversation and name what remains unverified. When a claim rests on a file, name it as \`path/to/file:line\` relative to the project. Never create, modify or delete anything.`
+    : files.length
+      ? 'No project is attached. Use your read-only tools only to read the attached files. Never create, modify or delete anything.'
+      : 'No project is attached. Do not use tools; reason from the question and what you know.'
+  return files.length
+    ? `${rule}\nThe human attached these files as part of the question; read them before you answer:\n${files.map((f) => `- ${f}`).join('\n')}`
+    : rule
 }
 
-export function opening(brief: Brief, m: Member, labels: Labels, earlier: Turn[]): string {
+// Who the member is and what is on the table. Re-sent on later turns when the member has no CLI session to remember it.
+export function intro(brief: Brief, m: Member, labels: Labels): string {
   const all = brief.members.map((x) => labels[x.id]).join(', ')
   return `You are ${labels[m.id]}, one of ${brief.members.length} members at a consortium table advising a human decision-maker. The members are: ${all}.
 Your lens: ${PERSONAS[m.persona].lens}
@@ -39,9 +59,13 @@ ${projectRule(brief)}
 
 ## The question
 ${brief.task}
-${earlier.length ? `\n## Said so far\n${said(earlier)}\n` : ''}
+`
+}
+
+export function opening(brief: Brief, m: Member, labels: Labels, earlier: Turn[]): string {
+  return `${intro(brief, m, labels)}${earlier.length ? `\n## Said so far\n${said(earlier)}\n` : ''}
 ## Your opening — at most 150 words
-Your recommendation and the one or two strongest reasons for it${earlier.length ? '. React to what was said if it matters' : ''}. Speak plainly, first person, no headings, no bullet walls.
+Your recommendation and the one or two strongest reasons for it${earlier.length ? '. React to what was said if it matters' : ''}. Speak plainly, first person, no headings, no bullet walls. Give your conclusion directly; omit tool logs, setup narration, and promises about what you will check.
 
 End with a fenced \`\`\`json block and nothing after it:
 ${VOTE}
@@ -74,6 +98,7 @@ ${said(since) || '(nobody spoke)'}
 
 ## Your turn — at most ${words} words
 ${PHASE_LINE[phase]}
+Reuse previously verified evidence. Use tools only when a new disputed fact needs checking; keep that check targeted. Give the contribution directly, without tool logs or setup narration.
 
 End with a fenced \`\`\`json block and nothing after it:
 ${VOTE}
@@ -131,21 +156,25 @@ export function chair(
     turns = [...transcript.slice(0, n), ...transcript.slice(-keepTail)]
   }
   const memberTurns = transcript.filter((t) => t.speaker !== 'human').length
-  return `You are the chair of a consortium of ${brief.members.length} AI members who discussed the question below over ${memberTurns} turns at the table. Never reveal which AI models were involved; refer to members only by their labels. Do not use tools. Write the final consortium document in markdown with exactly these sections and nothing else:
+  return `You are the chair of a consortium of ${brief.members.length} AI members who discussed the question below over ${memberTurns} turns at the table. Never reveal which AI models were involved; refer to members only by their labels. Do not use tools. Write the final consortium document in markdown with exactly these sections, in this order, and nothing else:
 # Consortium: <short title>
-## Decision
-## Rationale
-## Plan
-## Dissent
-(Every remaining disagreement, attributed by label and stated faithfully — not smoothed over. "None" if the members fully converged.)
-## Open questions for the human
+## Recommendation
+(Two to four sentences: what to do and the single strongest reason. It is copied on its own as the summary, so it must stand alone.)
+## Trade-offs
+(What this choice gains and what it gives up, and the alternatives the table weighed and why they lost.)
+## Next actions
+(A numbered list of concrete steps, in order.)
+## Unresolved questions
+(Every remaining disagreement, attributed by label and stated faithfully — not smoothed over — then the questions only the human can answer. "None" only if nothing is unresolved.)
+
+Back every claim with its source. Cite the turn it came from with the tags in the transcript: [T3], or [T3, T7] for several. When a claim rests on a project file a member named, cite it as \`path/to/file:line\`. Cite only turns and files that appear in the transcript; never invent one.
 
 ## The question
 ${brief.task}
-${brief.projectPath ? `Project: ${brief.projectPath}\n` : ''}${human ? `\n## Message from the human (arrived after the last turn; weigh it in the decision)\n${human}\n` : ''}
+${brief.projectPath ? `Project: ${brief.projectPath}\n` : ''}${brief.attachments?.length ? `Attached files: ${brief.attachments.map((f) => f.split('/').pop()).join(', ')}\n` : ''}${human ? `\n## Message from the human (arrived after the last turn; weigh it in the decision)\n${human}\n` : ''}
 ## Final positions
 ${finals}
 
 ## Transcript
-${said(turns, 1200)}`
+${said(turns, 1200, true)}`
 }

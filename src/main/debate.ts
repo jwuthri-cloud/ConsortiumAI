@@ -1,6 +1,19 @@
+import { visualContext } from '../shared/boardVisuals'
+import { createBoardWriter } from './whiteboard'
+import type { HostInput, HostMessage } from '../shared/whiteboard'
+import { memberModel, modelName } from '../shared/models'
+import { summarize } from '../shared/summary'
+import { addUsage } from '../shared/usage'
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync } from 'node:fs'
-import { join } from 'node:path'
+import {
+  mkdirSync,
+  writeFileSync,
+  readdirSync,
+  readFileSync,
+  existsSync,
+  copyFileSync
+} from 'node:fs'
+import { join, basename, dirname } from 'node:path'
 import {
   CLI_META,
   HUMAN,
@@ -9,20 +22,29 @@ import {
   type Phase,
   type Session,
   type SessionSummary,
-  type Shape,
   type Turn,
   type Vote
 } from '../shared/types'
 import { PERSONAS, makeLabels } from '../shared/personas'
-import { extractVote, extractJson, stripVote } from '../shared/vote'
-import { runMember, killAll } from './cli'
+import { extractVote, stripVote } from '../shared/vote'
+import { runMember, killAll, killRun } from './cli'
 import * as P from './prompts'
+import { sources } from '../shared/cite'
 
 type Send = (e: DebateEvent) => void
 
 let userData = ''
 // ponytail: one debate at a time; a second start stops the first.
-let current: { id: string; cancelled: boolean; interjections: string[] } | null = null
+let current: {
+  id: string
+  cancelled: boolean
+  paused: boolean
+  wake?: () => void
+  concluding: boolean
+  host: (input: HostInput) => void
+  finish: () => void
+  refreshBoard: () => void
+} | null = null
 
 export function configure(dir: string): void {
   userData = dir
@@ -30,13 +52,38 @@ export function configure(dir: string): void {
 }
 
 export function interject(text: string): void {
-  current?.interjections.push(text)
+  host({ id: randomUUID(), kind: 'thought', text })
+}
+
+export function host(input: HostInput): void {
+  if (!current || current.cancelled) throw new Error('There is no active meeting.')
+  current.host(input)
+}
+export function conclude(): void {
+  if (!current || current.cancelled) throw new Error('There is no active meeting.')
+  current.finish()
+}
+export function refreshBoard(): void {
+  if (!current || current.cancelled) throw new Error('There is no active meeting.')
+  current.refreshBoard()
+}
+
+// ponytail: pause lands between turns; the member already speaking finishes first.
+export function pause(on: boolean): void {
+  if (!current) return
+  current.paused = on
+  if (!on) current.wake?.()
 }
 
 export function stop(): void {
   if (!current) return
   current.cancelled = true
+  current.wake?.()
   killAll()
+}
+
+function sessionStatus(s: Session): Session['status'] {
+  return s.status === 'running' && current?.id !== s.id ? 'stopped' : s.status
 }
 
 function save(s: Session): void {
@@ -52,7 +99,7 @@ export function listSessions(): SessionSummary[] {
       try {
         const s = JSON.parse(readFileSync(join(dir, f), 'utf8')) as Session
         if (s.version !== 2) return null
-        return { id: s.id, createdAt: s.createdAt, task: s.brief.task, status: s.status }
+        return summarize({ ...s, status: sessionStatus(s) })
       } catch {
         return null
       }
@@ -65,7 +112,27 @@ export function loadSession(id: string): Session | null {
   const f = join(userData, 'sessions', `${id}.json`)
   if (!existsSync(f)) return null
   const s = JSON.parse(readFileSync(f, 'utf8')) as Session
-  return s.version === 2 ? s : null
+  return s.version === 2 ? { ...s, status: sessionStatus(s) } : null
+}
+
+// Copied into the session's own folder: stable across resumes, and the members can read that folder
+// rather than wherever the human keeps the originals.
+function keepAttachments(id: string, files: string[] = []): string[] {
+  const dir = join(userData, 'attachments', id)
+  return files.filter(existsSync).map((f) => {
+    mkdirSync(dir, { recursive: true })
+    let to = join(dir, basename(f))
+    for (let i = 2; existsSync(to); i++) to = join(dir, `${i}-${basename(f)}`)
+    copyFileSync(f, to)
+    return to
+  })
+}
+
+// Continue an unfinished session from its saved transcript.
+export function resume(id: string, send: Send): void {
+  if (current?.id === id && !current.cancelled) return
+  const s = loadSession(id)
+  if (s && s.status !== 'done') runDebate(s.brief, send, id, s)
 }
 
 function slug(s: string): string {
@@ -102,7 +169,7 @@ function appendix(s: Session, votes: Record<string, Vote | null>): string {
   const panel = brief.members
     .map(
       (m) =>
-        `| ${labels[m.id]} | ${PERSONAS[m.persona].label.replace('The ', '')} | ${CLI_META[m.cli].name} | ${m.model || 'default'}${m.id === brief.chairId ? ' · chair' : ''} |`
+        `| ${labels[m.id]} | ${PERSONAS[m.persona].label.replace('The ', '')} | ${CLI_META[m.cli].name} | ${memberModel(m) || 'Not recorded'}${m.id === brief.chairId ? ' · chair' : ''} |`
     )
     .join('\n')
   const memberTurns = s.turns.filter((t) => t.speaker !== HUMAN)
@@ -124,26 +191,6 @@ ${memberTurns.length} turns · ${s.converged ? 'full consensus' : 'dissent recor
 `
 }
 
-function validShape(x: unknown): Shape | null {
-  const s = x as Shape
-  if (!s || !Array.isArray(s.converging) || !Array.isArray(s.open)) return null
-  return {
-    converging: s.converging
-      .filter((c) => c && typeof c.point === 'string')
-      .map((c) => ({
-        point: c.point,
-        supporters: Array.isArray(c.supporters)
-          ? c.supporters.filter((l) => typeof l === 'string')
-          : []
-      }))
-      .slice(0, 4),
-    open: s.open
-      .filter((o) => o && typeof o.point === 'string')
-      .map((o) => ({ point: o.point, sides: typeof o.sides === 'string' ? o.sides : '' }))
-      .slice(0, 4)
-  }
-}
-
 export function phaseOf(n: number, members: number, budget: number): Phase {
   if (n <= members) return 'open'
   if (n > budget - members) return 'decide'
@@ -152,12 +199,29 @@ export function phaseOf(n: number, members: number, budget: number): Phase {
 }
 
 // The renderer picks the id so it can attribute events that arrive before the invoke resolves.
-export function runDebate(brief: Brief, send: Send, id: string = randomUUID()): string {
+export function runDebate(
+  brief: Brief,
+  send: Send,
+  id: string = randomUUID(),
+  prior?: Session,
+  run: typeof runMember = runMember
+): string {
   stop()
-  const me = { id, cancelled: false, interjections: [] as string[] }
+  if (!prior && brief.attachments?.length)
+    brief = { ...brief, attachments: keepAttachments(id, brief.attachments) }
+  const attachDir = brief.attachments?.length ? dirname(brief.attachments[0]) : undefined
+  const me: NonNullable<typeof current> = {
+    id,
+    cancelled: false,
+    paused: false,
+    concluding: false,
+    host: () => {},
+    finish: () => {},
+    refreshBoard: () => {}
+  }
   current = me
   const labels = makeLabels(brief.members)
-  const session: Session = {
+  const session: Session = prior ?? {
     version: 2,
     id,
     createdAt: new Date().toISOString(),
@@ -168,70 +232,217 @@ export function runDebate(brief: Brief, send: Send, id: string = randomUUID()): 
     converged: false,
     status: 'running'
   }
+  session.status = 'running'
   const members = brief.members
   const N = members.length
   const chairMember = members.find((m) => m.id === brief.chairId) ?? members[0]
-  const cliSessions: Record<string, string | undefined> = {}
+  const cliSessions = (session.cliSessions ??= {})
   const seen: Record<string, number> = {} // how much of the transcript each member has been shown
   const lastError: Record<string, string | undefined> = {}
   const transcript = session.turns
+  transcript.forEach((t, i) => {
+    if (t.speaker !== HUMAN) seen[t.speaker] = i + 1
+  })
+  // a resumed session picks up after its last member turn
+  const first = session.converged
+    ? brief.maxTurns + 1
+    : Math.max(0, ...transcript.filter((t) => t.speaker !== HUMAN).map((t) => t.n)) + 1
   const emit = (e: DebateEvent): void => {
     if (current === me) send(e)
   }
-
-  const drainHuman = (n: number): void => {
-    for (const text of me.interjections.splice(0)) {
-      const t: Turn = { n, speaker: HUMAN, label: 'The Human', text, vote: null }
-      transcript.push(t)
-      emit({ sessionId: id, type: 'human', turn: t })
+  // Every CLI call goes through here, so members, the whiteboard writer and the chair are all counted.
+  const spent = (session.usage ??= {})
+  const runner: typeof runMember = async (...args) => {
+    const r = await run(...args)
+    if (r.usage) {
+      const bucket = args[3].slice(id.length + 1) // `${id}:${member id | 'whiteboard' | 'chair'}`
+      spent[bucket] = addUsage(spent[bucket], r.usage)
+      emit({ sessionId: id, type: 'usage', usage: spent })
     }
+    return r
   }
 
-  let clerkBusy = false
-  const takeNotes = (n: number): void => {
-    if (clerkBusy) return
-    clerkBusy = true
-    const recent = transcript.slice(-2 * N - 2)
-    runMember(
-      chairMember.cli,
-      { prompt: P.clerk(brief, labels, recent, latestVotes(transcript)), model: chairMember.model },
-      () => {},
-      `${id}:clerk:${n}`
+  const hostMessages = (session.hostMessages ??= [])
+  const requestedTurns = new Set(
+    hostMessages
+      .filter(
+        (message) =>
+          message.kind === 'ask' && message.status === 'delivered' && message.turn !== undefined
+      )
+      .map((message) => message.turn)
+  )
+  let rotation = Math.max(0, first - 1 - requestedTurns.size)
+  let chairStarted = false
+  let live: { n: number; label: string; text: string } | undefined
+  const writer = brief.board ?? { cli: chairMember.cli, model: chairMember.model }
+  let writerModel = writer.model ?? (brief.board ? undefined : chairMember.resolvedModel)
+  const board = createBoardWriter({
+    previous: session.whiteboard,
+    generate: async (prompt) =>
+      (
+        await runner(
+          writer.cli,
+          { prompt, model: writer.model },
+          () => {},
+          `${id}:whiteboard`,
+          (model) => (writerModel = model)
+        )
+      ).text,
+    cancel: () => killRun(`${id}:whiteboard`),
+    publish: (whiteboard) => {
+      if (me.cancelled || current !== me) return
+      // parseBoard stamps the default model; record who actually wrote it
+      whiteboard.model = modelName(writerModel) ?? CLI_META[writer.cli].name
+      session.whiteboard = whiteboard
+      session.shape = {
+        converging: whiteboard.agreed.map((note) => ({ point: note.text, supporters: [] })),
+        open: whiteboard.disputed.map((note) => ({ point: note.text, sides: '' }))
+      }
+      emit({ sessionId: id, type: 'shape', turn: whiteboard.throughTurn, shape: session.shape })
+      save(session)
+      emit({ sessionId: id, type: 'whiteboard', board: whiteboard })
+    },
+    status: (status, error) => emit({ sessionId: id, type: 'board-status', status, error })
+  })
+  const updateBoard = (immediate = false): void => {
+    if (transcript.length || live?.text)
+      board.update(
+        {
+          task: brief.task,
+          turns: transcript.map((t) => ({ n: t.n, label: t.label, text: t.text })),
+          live
+        },
+        immediate
+      )
+  }
+  me.refreshBoard = () => updateBoard(true)
+  me.host = (input) => {
+    if (chairStarted || me.concluding) throw new Error('The meeting is already concluding.')
+    if (
+      !input ||
+      !['thought', 'ask', 'focus'].includes(input.kind) ||
+      typeof input.text !== 'string' ||
+      !input.text.trim() ||
+      input.text.length > 4000 ||
+      typeof input.id !== 'string' ||
+      !input.id ||
+      input.id.length > 100
     )
-      .then((r) => {
-        const shape = validShape(extractJson<Shape>(r.text))
-        if (!shape) return
-        session.shape = shape
-        save(session)
-        emit({ sessionId: id, type: 'shape', turn: n, shape })
-      })
-      .catch(() => {
-        /* the notes just stay as they were */
-      })
-      .finally(() => {
-        clerkBusy = false
-      })
+      throw new Error('Write a message of up to 4,000 characters.')
+    if (input.kind === 'ask' && !members.some((m) => m.id === input.targetId))
+      throw new Error('Choose an agent in this meeting.')
+    if (hostMessages.some((m) => m.id === input.id)) return
+    const message: HostMessage = {
+      id: input.id,
+      kind: input.kind,
+      text: input.text.trim(),
+      targetId: input.kind === 'ask' ? input.targetId : undefined,
+      status: 'queued'
+    }
+    hostMessages.push(message)
+    save(session)
+    emit({ sessionId: id, type: 'host-message', message })
+  }
+  me.finish = () => {
+    if (me.concluding || chairStarted) return
+    me.concluding = true
+    me.paused = false
+    me.wake?.()
+    emit({ sessionId: id, type: 'concluding' })
+  }
+  const drainHuman = (n: number, memberId: string, all = false): void => {
+    for (const message of hostMessages.filter(
+      (m) => m.status === 'queued' && (all || m.kind !== 'ask' || m.targetId === memberId)
+    )) {
+      const prefix =
+        message.kind === 'focus'
+          ? 'Focus the discussion on: '
+          : message.kind === 'ask'
+            ? `Question for ${labels[message.targetId!]}: `
+            : ''
+      const t: Turn = {
+        n,
+        speaker: HUMAN,
+        label: 'The Human',
+        text: prefix + message.text,
+        vote: null
+      }
+      transcript.push(t)
+      if (message.kind === 'focus') session.focus = message.text
+      message.status = 'delivered'
+      message.deliveredTo = labels[memberId]
+      message.turn = n
+      emit({ sessionId: id, type: 'human', turn: t })
+      emit({ sessionId: id, type: 'host-message', message: { ...message } })
+    }
+    save(session)
   }
 
+  const hold = async (): Promise<void> => {
+    while (me.paused && !me.cancelled) await new Promise<void>((r) => (me.wake = r))
+    if (me.cancelled) throw new Error('stopped')
+  }
+
+  updateBoard()
   ;(async () => {
     try {
-      for (let n = 1; n <= brief.maxTurns; n++) {
-        const m = members[(n - 1) % N]
-        const phase = phaseOf(n, N, brief.maxTurns)
-        drainHuman(n)
-        const since = transcript.slice(seen[m.id] ?? 0)
+      for (let n = first; n <= brief.maxTurns; n++) {
+        await hold()
+        if (me.concluding) break
+        const asked = hostMessages.find(
+          (message) => message.status === 'queued' && message.kind === 'ask'
+        )
+        const requested = members.find((member) => member.id === asked?.targetId)
+        const m = requested ?? members[rotation++ % N]
+        const phase = transcript.some((t) => t.speaker === m.id)
+          ? phaseOf(n, N, brief.maxTurns)
+          : 'open'
+        drainHuman(n, m.id)
+        live = { n, label: labels[m.id], text: '' }
+        let sampled = 0
+        // no CLI session (resumed, or the CLI never gave one) = no memory: show everything
+        const since = cliSessions[m.id] ? transcript.slice(seen[m.id] ?? 0) : transcript
         seen[m.id] = transcript.length
         emit({ sessionId: id, type: 'turn-start', memberId: m.id, turn: n, phase })
-        const prompt =
+        const basePrompt =
           phase === 'open'
             ? P.opening(brief, m, labels, since)
-            : P.turn(brief, m, labels, since, phase, n, session.shape)
+            : (cliSessions[m.id] ? '' : P.intro(brief, m, labels) + '\n') +
+              P.turn(brief, m, labels, since, phase, n, session.shape)
+        const prompt =
+          basePrompt +
+          visualContext(session.whiteboard) +
+          (session.focus
+            ? `\n\nThe host's current focus: ${session.focus}\nPrioritize this question and keep your contribution relevant to it.`
+            : '')
         try {
-          const r = await runMember(
+          const r = await runner(
             m.cli,
-            { prompt, model: m.model, cwd: brief.projectPath, resume: cliSessions[m.id] },
-            (t) => emit({ sessionId: id, type: 'delta', memberId: m.id, turn: n, text: t }),
-            `${id}:${m.id}`
+            {
+              prompt,
+              model: m.model,
+              // attachments only = the attachments folder is the workspace; with a project it's an extra read dir
+              cwd: brief.projectPath ?? attachDir,
+              dirs: brief.projectPath && attachDir ? [attachDir] : undefined,
+              resume: cliSessions[m.id]
+            },
+            (t) => {
+              emit({ sessionId: id, type: 'delta', memberId: m.id, turn: n, text: t })
+              if (live) {
+                live.text += t
+                if (live.text.length - sampled >= 500) {
+                  sampled = live.text.length
+                  updateBoard()
+                }
+              }
+            },
+            `${id}:${m.id}`,
+            (model) => {
+              m.resolvedModel = model
+              save(session)
+              emit({ sessionId: id, type: 'member-model', memberId: m.id, model })
+            },
+            (kind) => emit({ sessionId: id, type: 'activity', memberId: m.id, turn: n, kind })
           )
           cliSessions[m.id] = r.sessionId ?? cliSessions[m.id]
           const t: Turn = {
@@ -252,6 +463,8 @@ export function runDebate(brief: Brief, send: Send, id: string = randomUUID()): 
           lastError[m.id] = message
           emit({ sessionId: id, type: 'turn-error', memberId: m.id, turn: n, message })
         }
+        live = undefined
+        updateBoard(true)
         save(session)
         if (me.cancelled) throw new Error('stopped')
         if (n % N === 0) {
@@ -259,6 +472,13 @@ export function runDebate(brief: Brief, send: Send, id: string = randomUUID()): 
           const votes = latestVotes(transcript)
           const converged =
             n > N &&
+            !hostMessages.some((message) => message.status === 'queued') &&
+            new Set(
+              transcript
+                .filter((t) => t.speaker !== HUMAN)
+                .slice(-N)
+                .map((t) => t.speaker)
+            ).size === N &&
             members.every(
               (x) => !lastError[x.id] && votes[x.id] && votes[x.id]!.disagreements.length === 0
             )
@@ -266,29 +486,43 @@ export function runDebate(brief: Brief, send: Send, id: string = randomUUID()): 
             session.converged = true
             break
           }
-          takeNotes(n)
         }
       }
+      await hold()
+      chairStarted = true
+      drainHuman(Math.max(0, ...transcript.map((t) => t.n)), chairMember.id, true)
+      updateBoard(true)
       emit({ sessionId: id, type: 'chair-start', memberId: chairMember.id })
       const votes = latestVotes(transcript)
-      const r = await runMember(
+      const r = await runner(
         chairMember.cli,
         {
-          prompt: P.chair(
-            brief,
-            labels,
-            transcript,
-            votes,
-            lastError,
-            me.interjections.splice(0).join('\n\n')
-          ),
+          prompt:
+            P.chair(
+              brief,
+              labels,
+              transcript,
+              votes,
+              lastError,
+              me.concluding
+                ? 'The host asked to conclude now. Base the decision on the discussion so far, preserve uncertainty, and explicitly note any members who have not given a position.'
+                : ''
+            ) + visualContext(session.whiteboard),
           model: chairMember.model
         },
         (t) => emit({ sessionId: id, type: 'delta', memberId: chairMember.id, turn: 0, text: t }),
-        `${id}:chair`
+        `${id}:chair`,
+        (model) => {
+          chairMember.resolvedModel = model
+          save(session)
+          emit({ sessionId: id, type: 'member-model', memberId: chairMember.id, model })
+        },
+        (kind) => emit({ sessionId: id, type: 'activity', memberId: chairMember.id, turn: 0, kind })
       )
       if (me.cancelled) throw new Error('stopped')
-      const markdown = `${r.text.trim()}\n\n${appendix(session, votes)}`
+      const body = r.text.trim()
+      const cited = sources(body, transcript)
+      const markdown = `${body}\n\n${cited ? `${cited}\n\n` : ''}${appendix(session, votes)}`
       const dir = brief.projectPath
         ? join(brief.projectPath, 'consortium')
         : join(userData, 'consortium')
@@ -309,6 +543,8 @@ export function runDebate(brief: Brief, send: Send, id: string = randomUUID()): 
       else
         emit({ sessionId: id, type: 'failed', message: e instanceof Error ? e.message : String(e) })
     } finally {
+      board.dispose()
+      emit({ sessionId: id, type: 'board-status', status: 'idle' })
       if (current === me) current = null
     }
   })()

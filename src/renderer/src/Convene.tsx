@@ -1,4 +1,7 @@
-import { useEffect, useState } from 'react'
+import Brand, { BrandMark } from './Brand'
+import { PROVIDERS } from './avatarTheme'
+import { useEffect, useRef, useState } from 'react'
+import Library from './Library'
 import {
   CLI_META,
   type Brief,
@@ -11,7 +14,11 @@ import {
 import { PERSONAS, PERSONA_IDS } from '@shared/personas'
 
 type Seat = Member & { check?: 'checking' | 'ok' | 'error'; message?: string }
-type Props = { onStart: (brief: Brief) => void; onOpen: (session: Session) => void }
+type Props = {
+  onStart: (brief: Brief) => void
+  onOpen: (session: Session) => void
+  onContinue: (session: Session) => void
+}
 
 const ORDER: Cli[] = ['claude', 'codex', 'gemini', 'grok']
 const DEFAULT_PERSONA: Record<Cli, PersonaId> = {
@@ -20,23 +27,76 @@ const DEFAULT_PERSONA: Record<Cli, PersonaId> = {
   gemini: 'researcher',
   grok: 'skeptic'
 }
-const MODEL_HINT: Record<Cli, string> = {
-  claude: 'default (opus) — or pick',
-  codex: 'default model — or pick',
-  gemini: 'default model — or pick',
-  grok: 'default model — or pick'
-}
 let seatSeq = 0
 
-export default function Convene({ onStart, onOpen }: Props): React.JSX.Element {
+export default function Convene({ onStart, onOpen, onContinue }: Props): React.JSX.Element {
   const [task, setTask] = useState('')
+  const [rerunOf, setRerunOf] = useState<string>()
+  const question = useRef<HTMLTextAreaElement>(null)
   const [projectPath, setProjectPath] = useState<string | undefined>()
   const [seats, setSeats] = useState<Seat[]>([])
   const [chairId, setChairId] = useState('')
   const [turns, setTurns] = useState(30)
+  // null = the board is written by the chair's CLI and model
+  const [writer, setWriter] = useState<{ cli: Cli; model: string } | null>(null)
   const [installed, setInstalled] = useState<Partial<Record<Cli, string>>>({})
   const [sessions, setSessions] = useState<SessionSummary[]>([])
   const [problem, setProblem] = useState<string | null>(null)
+  const [files, setFiles] = useState<string[]>([])
+  const [recorder, setRecorder] = useState<MediaRecorder | null>(null)
+  const [transcribing, setTranscribing] = useState(false)
+  const addFiles = (paths: string[]): void =>
+    setFiles((f) => [...new Set([...f, ...paths.filter(Boolean)])])
+  const ipcError = (e: unknown): string =>
+    (e instanceof Error ? e.message : String(e)).replace(
+      /^Error invoking remote method '[^']+': (Error: )?/,
+      ''
+    )
+  // pasted screenshots have no path on disk: save their bytes first
+  const pasteFiles = async (e: React.ClipboardEvent): Promise<void> => {
+    const pasted = [...e.clipboardData.files]
+    if (!pasted.length) return
+    e.preventDefault()
+    addFiles(
+      await Promise.all(
+        pasted.map(async (f) => window.api!.saveFile(f.name || 'pasted.png', await f.arrayBuffer()))
+      )
+    )
+  }
+  const dictate = async (): Promise<void> => {
+    if (recorder) return recorder.stop()
+    let stream: MediaStream
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    } catch {
+      return setProblem(
+        'No microphone access. Allow it in System Settings → Privacy & Security → Microphone.'
+      )
+    }
+    const rec = new MediaRecorder(stream)
+    const chunks: Blob[] = []
+    rec.ondataavailable = (e) => chunks.push(e.data)
+    rec.onstop = async () => {
+      stream.getTracks().forEach((t) => t.stop())
+      setRecorder(null)
+      setTranscribing(true)
+      try {
+        const path = await window.api!.saveFile(
+          'dictation.webm',
+          await new Blob(chunks).arrayBuffer()
+        )
+        const text = await window.api!.transcribe(path)
+        if (text) setTask((t) => (t.trim() ? `${t.trimEnd()} ${text}` : text))
+      } catch (e) {
+        setProblem(ipcError(e))
+      } finally {
+        setTranscribing(false)
+      }
+    }
+    rec.start()
+    setRecorder(rec)
+    setProblem(null)
+  }
 
   const [models, setModels] = useState<Partial<Record<Cli, string[]>>>({})
 
@@ -56,7 +116,10 @@ export default function Convene({ onStart, onOpen }: Props): React.JSX.Element {
         setSeats(initial)
         setChairId(initial[0]?.id ?? '')
       })
-    void window.api!.listSessions().then(setSessions)
+    void window
+      .api!.listSessions()
+      .then(setSessions)
+      .catch(() => setProblem('Could not load previous sessions.'))
     for (const cli of ORDER)
       void window
         .api!.models(cli)
@@ -79,8 +142,34 @@ export default function Convene({ onStart, onOpen }: Props): React.JSX.Element {
   }
   const check = async (seat: Seat): Promise<void> => {
     patch(seat.id, { check: 'checking', message: undefined })
-    const r = await window.api!.check(seat.cli)
-    patch(seat.id, { check: r.ok ? 'ok' : 'error', message: r.ok ? undefined : r.message })
+    try {
+      const r = await window.api!.check(seat.cli)
+      patch(seat.id, {
+        check: r.ok ? 'ok' : 'error',
+        resolvedModel: r.model,
+        message: r.ok ? undefined : r.message
+      })
+    } catch {
+      patch(seat.id, { check: 'error', message: 'Connection failed. Try again.' })
+    }
+  }
+  // same seats, chair, budget, project and files; the question is pre-selected so typing replaces it
+  const rerun = ({ brief }: Session, title: string): void => {
+    const ids = Object.fromEntries(brief.members.map((m) => [m.id, `seat-${++seatSeq}`]))
+    setSeats(brief.members.map((m) => ({ ...m, id: ids[m.id] })))
+    setChairId(ids[brief.chairId] ?? '')
+    setTurns(brief.maxTurns)
+    setWriter(brief.board ? { cli: brief.board.cli, model: brief.board.model ?? '' } : null)
+    setProjectPath(brief.projectPath)
+    setFiles(brief.attachments ?? [])
+    setTask(brief.task)
+    setRerunOf(title)
+    setProblem(null)
+    requestAnimationFrame(() => {
+      question.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      question.current?.focus({ preventScroll: true })
+      question.current?.select()
+    })
   }
   const start = (): void => {
     if (!task.trim()) return setProblem('Write the question first.')
@@ -90,214 +179,347 @@ export default function Convene({ onStart, onOpen }: Props): React.JSX.Element {
     onStart({
       task: task.trim(),
       projectPath,
-      members: seats.map(({ id, cli, model, persona }) => ({
+      attachments: files.length ? files : undefined,
+      members: seats.map(({ id, cli, model, persona, resolvedModel }) => ({
         id,
         cli,
         model: model?.trim() || undefined,
-        persona
+        persona,
+        resolvedModel: model?.trim() ? undefined : resolvedModel
       })),
       chairId,
-      maxTurns: turns
+      maxTurns: turns,
+      board: writer ? { cli: writer.cli, model: writer.model.trim() || undefined } : undefined
     })
   }
 
   return (
-    <div className="h-full overflow-y-auto">
-      <header className="drag h-12 pl-20 pr-5 flex items-center text-[11px] uppercase tracking-[0.18em] text-ink-3">
-        Consortium
+    <div className="lobby app-page">
+      <header className="app-titlebar drag">
+        <Brand />
+        <span className="titlebar-slash">/</span>
+        <span className="titlebar-room">Your workspace</span>
+        <span className="workspace-status">
+          <i /> Ready when you are
+        </span>
       </header>
-      <div className="max-w-[920px] mx-auto px-10 pb-20 rise">
-        <h1 className="font-display font-light text-[46px] leading-none tracking-tight mt-8">
-          Convene the table.
-        </h1>
-        <p className="text-ink-2 mt-3 max-w-[540px] text-[15px] leading-relaxed">
-          One question. Several minds that disagree on purpose, each on a subscription you already
-          pay for. A decision you can read, with the dissent kept in.
-        </p>
-
-        <textarea
-          value={task}
-          onChange={(e) => setTask(e.target.value)}
-          rows={3}
-          placeholder="Should we let customers export their data?"
-          className="font-voice text-[21px] leading-snug w-full mt-12 py-3 bg-transparent border-0 border-b border-line-2 focus:border-gold outline-none resize-none placeholder:text-ink-3 transition-colors"
-        />
-
-        <div className="mt-5 flex items-center gap-3 text-[13px]">
-          {projectPath ? (
-            <>
-              <span className="font-mono text-ink-2 truncate max-w-[520px]">{projectPath}</span>
-              <span className="text-[10px] uppercase tracking-[0.14em] text-gold border border-gold-2 rounded px-1.5 py-0.5">
-                read-only
-              </span>
-              <button
-                className="text-ink-3 hover:text-ink"
-                onClick={() => setProjectPath(undefined)}
-              >
-                Detach
-              </button>
-            </>
-          ) : (
-            <button
-              className="text-ink-2 hover:text-ink underline underline-offset-4 decoration-line-2"
-              onClick={() => void window.api!.pickFolder().then((p) => p && setProjectPath(p))}
-            >
-              Attach a project folder
-            </button>
-          )}
-          <span className="text-ink-3">
-            {projectPath
-              ? '— members inspect it before they argue'
-              : '— optional; members then argue from the real code'}
-          </span>
+      <main className="lobby-content rise">
+        <div className="lobby-intro">
+          <div>
+            <div className="meeting-eyebrow">BETTER DECISIONS, TOGETHER</div>
+            <h1>Bring your minds together.</h1>
+            <p>One question. Different perspectives. A decision worth making.</p>
+          </div>
+          <div className="lobby-orbit" aria-hidden="true">
+            <BrandMark size={48} />
+            <i />
+            <i />
+            <i />
+          </div>
         </div>
 
-        <section className="mt-12">
-          <div className="flex items-baseline gap-4">
-            <h2 className="text-[11px] uppercase tracking-[0.18em] text-ink-3">Seats</h2>
-            <button
-              className="text-[12px] text-ink-3 hover:text-ink"
-              onClick={() => seats.forEach((s) => void check(s))}
-            >
-              Check all
-            </button>
-            {seats.length < 6 && (
-              <button className="text-[12px] text-ink-3 hover:text-ink" onClick={add}>
-                + Add seat
-              </button>
-            )}
+        <section
+          className="question-card"
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={(e) => {
+            e.preventDefault()
+            addFiles([...e.dataTransfer.files].map((f) => window.api!.pathForFile(f)))
+          }}
+        >
+          <div className="section-heading">
+            <h2>
+              <span className="step-number">01</span> What&apos;s on the agenda?
+            </h2>
+            <span className="rerun-note">
+              {rerunOf ? `Same team as “${rerunOf}”` : 'A new meeting'}
+            </span>
           </div>
-          <div className="mt-3 divide-y divide-line border-y border-line">
-            {seats.map((s) => (
+          <label className="sr-only" htmlFor="meeting-question">
+            Meeting question
+          </label>
+          <textarea
+            ref={question}
+            id="meeting-question"
+            value={task}
+            onChange={(e) => setTask(e.target.value)}
+            onPaste={(e) => void pasteFiles(e)}
+            rows={2}
+            placeholder="What should we figure out together?"
+          />
+          {files.length > 0 && (
+            <div className="attached-files">
+              {files.map((f) => (
+                <span key={f} className="file-chip" title={f}>
+                  {f.split('/').pop()}
+                  <button
+                    aria-label={`Remove ${f.split('/').pop()}`}
+                    onClick={() => setFiles(files.filter((x) => x !== f))}
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          <div className="project-attachment">
+            <span className="folder-symbol" aria-hidden="true">
+              ⌘
+            </span>
+            {projectPath ? (
+              <>
+                <span className="project-name" title={projectPath}>
+                  {projectPath.split('/').pop()}
+                </span>
+                <span className="quiet-pill">Read-only</span>
+                <button className="text-button" onClick={() => setProjectPath(undefined)}>
+                  Detach
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  className="text-button"
+                  onClick={() => void window.api!.pickFolder().then((p) => p && setProjectPath(p))}
+                >
+                  Attach a project
+                </button>
+                <span className="attachment-hint">
+                  Give your agents the code behind the question.
+                </span>
+              </>
+            )}
+            <span className="attachment-actions">
+              <button
+                className="text-button"
+                onClick={() => void window.api!.pickFiles().then(addFiles)}
+                title="Or drop files here, or paste a screenshot"
+              >
+                + Files
+              </button>
+              <button
+                className={`text-button dictate ${recorder ? 'recording' : ''}`}
+                onClick={() => void dictate()}
+                disabled={transcribing}
+                aria-pressed={!!recorder}
+              >
+                {transcribing ? 'Transcribing…' : recorder ? '● Stop' : '🎙 Dictate'}
+              </button>
+            </span>
+          </div>
+        </section>
+
+        <section className="seats-section">
+          <div className="section-heading">
+            <h2>
+              <span className="step-number">02</span> Who&apos;s at the table?{' '}
+              <span className="count-badge">{seats.length}</span>
+            </h2>
+            <div className="section-actions">
+              <button
+                className="text-button"
+                disabled={seats.some((s) => s.check === 'checking')}
+                onClick={() => seats.forEach((s) => void check(s))}
+              >
+                Check connections
+              </button>
+              {seats.length < 6 && (
+                <button className="secondary-button" onClick={add}>
+                  + Add seat
+                </button>
+              )}
+            </div>
+          </div>
+          <div className="setup-seats">
+            {seats.map((s, i) => (
               <div
                 key={s.id}
-                className="grid grid-cols-[20px_168px_150px_1fr_auto_auto_28px] items-center gap-3 py-2.5 text-[13px]"
+                className={`setup-seat ${chairId === s.id ? 'is-chair' : ''}`}
+                style={{ '--seat-color': PROVIDERS[s.cli].color } as React.CSSProperties}
               >
-                <span
-                  className="w-3 h-3 rounded-full"
-                  style={{ background: CLI_META[s.cli].color }}
-                />
-                <select
-                  value={s.persona}
-                  onChange={(e) => patch(s.id, { persona: e.target.value as PersonaId })}
-                  className="bg-transparent text-ink outline-none font-display text-[15px]"
-                >
-                  {PERSONA_IDS.map((p) => (
-                    <option key={p} value={p} className="bg-surface">
-                      {PERSONAS[p].label}
-                    </option>
-                  ))}
-                </select>
-                <select
-                  value={s.cli}
-                  onChange={(e) =>
-                    patch(s.id, {
-                      cli: e.target.value as Cli,
-                      check: undefined,
-                      message: undefined
-                    })
-                  }
-                  className="bg-transparent text-ink-2 outline-none"
-                >
-                  {ORDER.map((c) => (
-                    <option key={c} value={c} className="bg-surface">
-                      {CLI_META[c].name}
-                      {installed[c] ? '' : ' (not installed)'}
-                    </option>
-                  ))}
-                </select>
-                <input
-                  value={s.model ?? ''}
-                  onChange={(e) => patch(s.id, { model: e.target.value })}
-                  placeholder={MODEL_HINT[s.cli]}
-                  list={`models-${s.cli}`}
-                  className="bg-transparent font-mono text-[12px] text-ink-2 outline-none placeholder:text-ink-3 border-b border-transparent focus:border-line-2"
-                />
-                <button
-                  onClick={() => setChairId(s.id)}
-                  className={`text-[10px] uppercase tracking-[0.14em] rounded px-1.5 py-0.5 border ${chairId === s.id ? 'text-gold border-gold-2' : 'text-ink-3 border-transparent hover:border-line-2'}`}
-                >
-                  chair
-                </button>
-                <button
-                  onClick={() => void check(s)}
-                  className="text-[11px] min-w-[72px] text-left"
-                  title={s.message}
-                >
-                  {s.check === 'checking' && <span className="text-ink-3 cursor">checking</span>}
-                  {s.check === 'ok' && <span className="text-gold">ready</span>}
-                  {s.check === 'error' && (
-                    <span className="text-red truncate inline-block max-w-[180px] align-bottom">
-                      {s.message}
-                    </span>
-                  )}
-                  {!s.check && <span className="text-ink-3 hover:text-ink">check</span>}
-                </button>
-                <button
-                  className="text-ink-3 hover:text-red text-right"
-                  onClick={() => remove(s.id)}
-                  aria-label="Remove seat"
-                >
-                  ×
-                </button>
+                <div className="seat-card-header">
+                  <div className="provider-emblem" aria-hidden="true">
+                    {s.cli === 'claude'
+                      ? '✳'
+                      : s.cli === 'codex'
+                        ? '◎'
+                        : s.cli === 'gemini'
+                          ? '✦'
+                          : '𝕏'}
+                  </div>
+                  <div className="seat-provider">
+                    <strong>{PROVIDERS[s.cli].name}</strong>
+                    <span>Seat {String(i + 1).padStart(2, '0')}</span>
+                  </div>
+                  <button
+                    className={`chair-toggle ${chairId === s.id ? 'selected' : ''}`}
+                    aria-pressed={chairId === s.id}
+                    onClick={() => setChairId(s.id)}
+                    title="The chair writes the final decision"
+                  >
+                    Chair
+                  </button>
+                  <button
+                    className="remove-seat"
+                    onClick={() => remove(s.id)}
+                    aria-label={`Remove ${PERSONAS[s.persona].label}`}
+                  >
+                    ×
+                  </button>
+                </div>
+                <label className="field-label">
+                  Role
+                  <select
+                    value={s.persona}
+                    onChange={(e) => patch(s.id, { persona: e.target.value as PersonaId })}
+                  >
+                    {PERSONA_IDS.map((p) => (
+                      <option key={p} value={p}>
+                        {PERSONAS[p].label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="field-label">
+                  Connection
+                  <select
+                    value={s.cli}
+                    onChange={(e) =>
+                      patch(s.id, {
+                        cli: e.target.value as Cli,
+                        model: undefined,
+                        resolvedModel: undefined,
+                        check: undefined,
+                        message: undefined
+                      })
+                    }
+                  >
+                    {ORDER.map((c) => (
+                      <option key={c} value={c}>
+                        {CLI_META[c].name}
+                        {installed[c] ? '' : ' (not detected)'}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="field-label">
+                  Model
+                  <input
+                    value={s.model ?? ''}
+                    onChange={(e) =>
+                      patch(s.id, { model: e.target.value, resolvedModel: undefined })
+                    }
+                    placeholder={s.resolvedModel ?? 'Automatic · resolved on connection'}
+                    list={`models-${s.cli}`}
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                </label>
+                <div className="seat-connection">
+                  <span className={`connection-dot ${s.check ?? ''}`} />
+                  <button
+                    className="text-button"
+                    disabled={s.check === 'checking'}
+                    onClick={() => void check(s)}
+                  >
+                    {s.check === 'checking'
+                      ? 'Connecting…'
+                      : s.check === 'ok'
+                        ? 'Connected'
+                        : s.check === 'error'
+                          ? 'Retry connection'
+                          : installed[s.cli]
+                            ? 'Installed · test connection'
+                            : 'Check connection'}
+                  </button>
+                </div>
+                {s.message && (
+                  <p className="connection-error" role="alert">
+                    {s.message}
+                  </p>
+                )}
               </div>
             ))}
           </div>
-          <p className="text-[12px] text-ink-3 mt-2">
-            Members only ever see each other&apos;s persona. The model behind a seat stays hidden
-            from the table.
+          <p className="seats-note">
+            Different roles keep the conversation honest. Your agents know each other by role,
+            without seeing the model behind it.
           </p>
+          <div className="board-writer">
+            <p>
+              <strong>Whiteboard writer</strong>
+              Keeps the live board of what&apos;s agreed, disputed and waiting on you.
+            </p>
+            <label className="field-label">
+              Connection
+              <select
+                value={writer?.cli ?? ''}
+                onChange={(e) =>
+                  setWriter(e.target.value ? { cli: e.target.value as Cli, model: '' } : null)
+                }
+              >
+                <option value="">Same as the chair</option>
+                {ORDER.map((c) => (
+                  <option key={c} value={c}>
+                    {CLI_META[c].name}
+                    {installed[c] ? '' : ' (not detected)'}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="field-label">
+              Model
+              <input
+                value={writer?.model ?? ''}
+                onChange={(e) => writer && setWriter({ ...writer, model: e.target.value })}
+                disabled={!writer}
+                placeholder={writer ? 'CLI default' : "The chair's model"}
+                list={writer ? `models-${writer.cli}` : undefined}
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </label>
+          </div>
         </section>
 
-        <section className="mt-10 flex items-center gap-6">
-          <div className="flex items-center gap-2 text-[13px] text-ink-2">
-            <span title="Turns across all members; the last cycle is always final statements">
-              Turns
-            </span>
+        <section className="launch-bar">
+          <div>
+            <h2>Room to think.</h2>
+            <p>Set the maximum turns for this meeting.</p>
+          </div>
+          <div className="turn-options" aria-label="Maximum meeting turns">
             {[20, 30, 50].map((r) => (
               <button
                 key={r}
+                aria-pressed={turns === r}
+                className={turns === r ? 'selected' : ''}
                 onClick={() => setTurns(r)}
-                className={`w-8 h-7 rounded-full border text-[12px] ${turns === r ? 'border-gold text-gold' : 'border-line-2 text-ink-3 hover:text-ink'}`}
               >
                 {r}
               </button>
             ))}
           </div>
-          <button
-            onClick={start}
-            className="ml-auto bg-gold text-canvas font-medium text-[14px] px-6 h-10 rounded-full hover:brightness-110 transition"
-          >
-            Convene
+          <button className="primary-button" onClick={start}>
+            Start meeting <span aria-hidden="true">↗</span>
           </button>
         </section>
-        {problem && <p className="text-red text-[13px] mt-3 text-right">{problem}</p>}
-
-        {sessions.length > 0 && (
-          <section className="mt-16">
-            <h2 className="text-[11px] uppercase tracking-[0.18em] text-ink-3">Past sessions</h2>
-            <div className="mt-3 divide-y divide-line border-y border-line">
-              {sessions.slice(0, 12).map((x) => (
-                <button
-                  key={x.id}
-                  onClick={() => void window.api!.loadSession(x.id).then((s) => s && onOpen(s))}
-                  className="w-full text-left py-2.5 flex items-center gap-4 hover:bg-surface px-1 -mx-1 rounded"
-                >
-                  <span className="font-voice text-[15px] truncate flex-1">{x.task}</span>
-                  <span
-                    className={`text-[10px] uppercase tracking-[0.14em] ${x.status === 'done' ? 'text-gold' : 'text-ink-3'}`}
-                  >
-                    {x.status}
-                  </span>
-                  <span className="font-mono text-[11px] text-ink-3">
-                    {new Date(x.createdAt).toLocaleDateString()}
-                  </span>
-                </button>
-              ))}
-            </div>
-          </section>
+        {problem && (
+          <p className="form-error" role="alert">
+            {problem}
+          </p>
         )}
-      </div>
+
+        <Library
+          sessions={sessions}
+          onOpen={onOpen}
+          onContinue={onContinue}
+          onRerun={rerun}
+          onProblem={setProblem}
+        />
+        <footer className="lobby-footer">
+          <span>Several minds. One shared direction.</span>
+          <span>Powered by your connected agents</span>
+        </footer>
+      </main>
       {ORDER.map((cli) => (
         <datalist key={cli} id={`models-${cli}`}>
           {(models[cli] ?? []).map((id) => (
