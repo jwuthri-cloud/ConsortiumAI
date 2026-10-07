@@ -1,0 +1,9 @@
+node_modules
+dist
+out
+.DS_Store
+.eslintcache
+*.log*
+
+# decision documents the app writes when this repo is attached as a project
+consortium/

@@ -1,0 +1,232 @@
+@import '@fontsource-variable/fraunces';
+@import '@fontsource-variable/source-serif-4';
+@import '@fontsource-variable/geist';
+@import '@fontsource-variable/geist-mono';
+@import 'tailwindcss';
+
+@theme {
+  --color-canvas: #0a0d14;
+  --color-surface: #10141d;
+  --color-surface-2: #161b27;
+  --color-line: #222a3b;
+  --color-line-2: #30394d;
+  --color-ink: #e7eaf1;
+  --color-ink-2: #9aa3b5;
+  --color-ink-3: #5f6878;
+  --color-gold: #e2be7a;
+  --color-gold-2: #8e7640;
+  --color-red: #f0655c;
+  --font-display: 'Fraunces Variable', Georgia, serif;
+  --font-voice: 'Source Serif 4 Variable', Georgia, serif;
+  --font-sans: 'Geist Variable', system-ui, sans-serif;
+  --font-mono: 'Geist Mono Variable', ui-monospace, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--color-gold) 35%, transparent);
+}
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-2) transparent;
+}
+
+.drag {
+  -webkit-app-region: drag;
+}
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/* the speaking seat */
+@keyframes pulse {
+  0% {
+    transform: scale(0.92);
+    opacity: 0.9;
+  }
+  100% {
+    transform: scale(1.35);
+    opacity: 0;
+  }
+}
+.pulse {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: pulse 1.6s ease-out infinite;
+}
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+.cursor::after {
+  content: '▍';
+  animation: blink 1s steps(1) infinite;
+  color: var(--color-gold);
+}
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.rise {
+  animation: rise 0.6s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+.ring {
+  transition: stroke-dashoffset 1.1s cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+@media (prefers-reduced-motion: reduce) {
+  .pulse,
+  .cursor::after,
+  .rise {
+    animation: none;
+  }
+  .ring {
+    transition: none;
+  }
+}
+
+/* members' voices and the consortium document */
+.prose {
+  font-family: var(--font-voice);
+  font-size: 15.5px;
+  line-height: 1.65;
+  color: var(--color-ink);
+}
+.prose h1 {
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: 30px;
+  line-height: 1.15;
+  letter-spacing: -0.01em;
+  margin: 0 0 0.8em;
+}
+.prose h2 {
+  font-family: var(--font-sans);
+  font-weight: 500;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-gold);
+  margin: 2.2em 0 0.7em;
+  padding-top: 1.2em;
+  border-top: 1px solid var(--color-line);
+}
+.prose h3 {
+  font-family: var(--font-sans);
+  font-weight: 500;
+  font-size: 13px;
+  color: var(--color-ink-2);
+  margin: 1.6em 0 0.5em;
+}
+.prose p {
+  margin: 0 0 0.9em;
+}
+.prose ul,
+.prose ol {
+  padding-left: 1.3em;
+  margin: 0 0 0.9em;
+}
+.prose ul {
+  list-style: disc;
+}
+.prose ol {
+  list-style: decimal;
+}
+.prose li {
+  margin: 0.25em 0;
+}
+.prose li::marker {
+  color: var(--color-ink-3);
+}
+.prose strong {
+  font-weight: 600;
+  color: var(--color-ink);
+}
+.prose code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--color-surface-2);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+.prose pre {
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  padding: 12px 14px;
+  overflow-x: auto;
+  font-size: 12.5px;
+}
+.prose pre code {
+  background: none;
+  padding: 0;
+}
+.prose blockquote {
+  border-left: 2px solid var(--color-gold-2);
+  margin: 0 0 0.9em;
+  padding-left: 1em;
+  color: var(--color-ink-2);
+}
+.prose table {
+  border-collapse: collapse;
+  font-family: var(--font-sans);
+  font-size: 12.5px;
+  margin: 0 0 1em;
+}
+.prose th,
+.prose td {
+  border: 1px solid var(--color-line);
+  padding: 5px 10px;
+  text-align: left;
+}
+.prose th {
+  color: var(--color-ink-2);
+  font-weight: 500;
+}
+.prose hr {
+  border: 0;
+  border-top: 1px solid var(--color-line);
+  margin: 2em 0;
+}
+.prose a {
+  color: var(--color-gold);
+}
+/* conversation turns: tighter, no section chrome */
+.prose.compact {
+  font-size: 14.5px;
+  line-height: 1.55;
+}
+.prose.compact p,
+.prose.compact ul,
+.prose.compact ol {
+  margin: 0 0 0.5em;
+}
+.prose.compact h1,
+.prose.compact h2,
+.prose.compact h3 {
+  font: inherit;
+  font-weight: 600;
+  color: var(--color-ink);
+  letter-spacing: 0;
+  text-transform: none;
+  margin: 0.4em 0 0.2em;
+  padding: 0;
+  border: 0;
+}
