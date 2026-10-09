@@ -23,11 +23,13 @@ export type RunArgs = {
   cwd?: string
   dirs?: string[] // extra read-only folders (attachments); codex's read-only sandbox and grok read them by absolute path
   resume?: string
+  costBefore?: number // claude: the resumed session's last running cost (see costTotal)
 }
 export type RunResult = {
   text: string
   sessionId?: string
-  costUsd?: number
+  costUsd?: number // this run only
+  costTotal?: number // claude: the session's running cost, which Claude Code reports instead of the run's
   model?: string
   usage?: Usage // this run only, priced
 }
@@ -485,8 +487,13 @@ export async function runMember(
     if (code !== 0 && !final) throw new Error(tail || `${cli} exited with code ${code}`)
     await lookupModel()
     if (!model) reportModel(await defaultLookup)
+    // Claude Code reports a resumed session's running cost; this run is the difference.
+    // Claude Code's total_cost_usd is cumulative for a resumed session (its token counts are per run)
+    const costTotal = cli === 'claude' ? costUsd : undefined
+    if (costTotal !== undefined)
+      costUsd = Math.max(0, costTotal - (a.resume ? (a.costBefore ?? 0) : 0))
     const spent = usage && priced({ ...minus(usage, before), costUsd }, model)
-    return { text: out, sessionId, costUsd, model, usage: spent }
+    return { text: out, sessionId, costUsd, costTotal, model, usage: spent }
   } catch (e) {
     if (e instanceof Error && (e as NodeJS.ErrnoException).code === 'ENOENT')
       throw new Error(`${cli} is not installed (or not on PATH)`)

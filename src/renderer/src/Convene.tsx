@@ -12,6 +12,7 @@ import {
   type SessionSummary
 } from '@shared/types'
 import { PERSONAS, PERSONA_IDS } from '@shared/personas'
+import { BOARD_WRITER } from '@shared/whiteboard'
 
 type Seat = Member & { check?: 'checking' | 'ok' | 'error'; message?: string }
 type Props = {
@@ -21,6 +22,8 @@ type Props = {
 }
 
 const ORDER: Cli[] = ['claude', 'codex', 'gemini', 'grok']
+// a new seat's model; other CLIs start on their own default
+const DEFAULT_MODEL: Partial<Record<Cli, string>> = { claude: 'opus' }
 const DEFAULT_PERSONA: Record<Cli, PersonaId> = {
   claude: 'strategist',
   codex: 'engineer',
@@ -38,7 +41,7 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
   const [chairId, setChairId] = useState('')
   const [turns, setTurns] = useState(30)
   // null = the board is written by the chair's CLI and model
-  const [writer, setWriter] = useState<{ cli: Cli; model: string } | null>(null)
+  const [writer, setWriter] = useState<{ cli: Cli; model: string } | null>({ ...BOARD_WRITER })
   const [installed, setInstalled] = useState<Partial<Record<Cli, string>>>({})
   const [sessions, setSessions] = useState<SessionSummary[]>([])
   const [problem, setProblem] = useState<string | null>(null)
@@ -111,10 +114,13 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
         const initial = clis.map((cli) => ({
           id: `seat-${++seatSeq}`,
           cli,
+          model: DEFAULT_MODEL[cli],
           persona: DEFAULT_PERSONA[cli]
         }))
         setSeats(initial)
         setChairId(initial[0]?.id ?? '')
+        // no Claude Code here: the chair writes the board
+        if (!clis.includes(BOARD_WRITER.cli)) setWriter(null)
       })
     void window
       .api!.listSessions()
@@ -136,7 +142,7 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
   const add = (): void => {
     const cli = ORDER.find((c) => !seats.some((x) => x.cli === c)) ?? 'claude'
     const persona = PERSONA_IDS.find((p) => !seats.some((x) => x.persona === p)) ?? 'skeptic'
-    const seat = { id: `seat-${++seatSeq}`, cli, persona }
+    const seat = { id: `seat-${++seatSeq}`, cli, model: DEFAULT_MODEL[cli], persona }
     setSeats((xs) => [...xs, seat])
     if (!chairId) setChairId(seat.id)
   }
@@ -386,7 +392,7 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
                     onChange={(e) =>
                       patch(s.id, {
                         cli: e.target.value as Cli,
-                        model: undefined,
+                        model: DEFAULT_MODEL[e.target.value as Cli],
                         resolvedModel: undefined,
                         check: undefined,
                         message: undefined
@@ -514,6 +520,7 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
           onContinue={onContinue}
           onRerun={rerun}
           onProblem={setProblem}
+          onDeleted={(id) => setSessions((all) => all.filter((s) => s.id !== id))}
         />
         <footer className="lobby-footer">
           <span>Several minds. One shared direction.</span>

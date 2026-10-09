@@ -45,6 +45,7 @@ test('pricing keeps reported cost, estimates the rest, and sums', () => {
   assert.equal(est.costUsd, 10.5) // 0.5M × $10 + 0.5M × $1 + 0.1M × $50
   assert.equal(est.estimated, true)
   assert.equal(priced({ input: 5, cached: 0, output: 5 }, 'mystery-1').costUsd, undefined)
+  assert.equal(priced({ input: 1e6, cached: 0, output: 0 }, 'gemini-3.8-flash').costUsd, 0.75)
   const total = sumUsage([est, undefined, { input: 10, cached: 0, output: 0, costUsd: 0.5 }])!
   assert.equal(total.costUsd, 11)
   assert.equal(total.input, 1_000_010)

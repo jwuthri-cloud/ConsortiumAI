@@ -40,6 +40,12 @@ test('unfinished: title from the question, outcome from where the table leans', 
   assert.equal(s.projectPath, '/r/acme')
   assert.equal(summarize({ ...base, shape: null, turns: [] }).outcome, undefined)
   assert.equal(s.usage, undefined) // saved before usage tracking
+  assert.equal(s.files, undefined)
+  assert.deepEqual(
+    summarize({ ...base, brief: { ...base.brief, attachments: ['/a/b/notes.pdf', '/a/shot.png'] } })
+      .files,
+    ['notes.pdf', 'shot.png']
+  )
   const spent = summarize({
     ...base,
     usage: {

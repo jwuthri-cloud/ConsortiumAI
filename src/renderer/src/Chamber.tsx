@@ -94,7 +94,9 @@ export default function Chamber({
   const brief = s.brief!
   const members = brief.members
   const [view, setView] = useState<'gallery' | 'speaker' | 'whiteboard'>('gallery')
-  const [panel, setPanel] = useState<'conversation' | 'decision' | null>('decision')
+  const [panel, setPanel] = useState<'conversation' | 'decision' | null>(
+    s.focusTurn ? 'conversation' : 'decision'
+  )
   const [pinned, setPinned] = useState<string | null>(null)
   const [thought, setThought] = useState('')
   const [hostMode, setHostMode] = useState('thought')
@@ -102,7 +104,7 @@ export default function Chamber({
   const [sending, setSending] = useState(false)
   const [stopping, setStopping] = useState(false)
   const [pauseRequested, setPaused] = useState(false)
-  const [stick, setStick] = useState(true)
+  const [stick, setStick] = useState(!s.focusTurn)
   const feedRef = useRef<HTMLDivElement | null>(null)
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
   const running = ['open', 'debate', 'converge', 'decide'].includes(s.stage)
@@ -187,20 +189,22 @@ export default function Chamber({
     setPanel('conversation')
     requestAnimationFrame(() => inputRef.current?.focus())
   }
+  const scrollToTurn = (n: number): void => {
+    const el = document.getElementById(`turn-${n}`)
+    el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    el?.animate([{ backgroundColor: '#c5b8ee26' }, { backgroundColor: 'transparent' }], {
+      duration: 2000
+    })
+  }
   const viewSource = (n: number): void => {
     setPanel('conversation')
     setStick(false)
-    requestAnimationFrame(() => {
-      const el = document.getElementById(`turn-${n}`)
-      el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-      el?.animate([{ backgroundColor: '#c5b8ee26' }, { backgroundColor: 'transparent' }], {
-        duration: 2000
-      })
-    })
+    requestAnimationFrame(() => scrollToTurn(n))
   }
-  // opened from a citation on the decision page; Chamber remounts each time, so once is enough
+  // opened from a citation on the decision page: the panel and stick already start there (above).
+  // Chamber remounts on each visit, so running once is enough.
   useEffect(() => {
-    if (s.focus) viewSource(s.focus)
+    if (s.focusTurn) scrollToTurn(s.focusTurn)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
   const answer = (question: string): void => {

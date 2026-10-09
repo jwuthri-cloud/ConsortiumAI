@@ -10,6 +10,7 @@ type Props = {
   onContinue: (session: Session) => void
   onRerun: (session: Session, title: string) => void
   onProblem: (message: string) => void
+  onDeleted: (id: string) => void
 }
 
 const STATUS: Record<SessionSummary['status'], string> = {
@@ -28,7 +29,8 @@ export default function Library({
   onOpen,
   onContinue,
   onRerun,
-  onProblem
+  onProblem,
+  onDeleted
 }: Props): React.JSX.Element {
   const [query, setQuery] = useState('')
   const [project, setProject] = useState('') // '' = all projects
@@ -43,7 +45,7 @@ export default function Library({
       (!onlyUnfinished || unfinished(s)) &&
       (!project || (project === NO_PROJECT ? !s.projectPath : s.projectPath === project)) &&
       words.every((w) =>
-        `${s.title} ${s.task} ${s.outcome ?? ''} ${s.projectPath ? folder(s.projectPath) : ''}`
+        `${s.title} ${s.task} ${s.outcome ?? ''} ${s.projectPath ? folder(s.projectPath) : ''} ${s.files?.join(' ') ?? ''}`
           .toLowerCase()
           .includes(w)
       )
@@ -53,6 +55,18 @@ export default function Library({
       .api!.loadSession(id)
       .then((s) => (s ? then(s) : onProblem('This meeting could not be opened.')))
       .catch(() => onProblem('This meeting could not be opened.'))
+  const remove = (x: SessionSummary): void => {
+    if (
+      !window.confirm(
+        `Delete "${x.title}"? The transcript and its attachments are removed for good.`
+      )
+    )
+      return
+    void window
+      .api!.deleteSession(x.id)
+      .then(() => onDeleted(x.id))
+      .catch(() => onProblem('This meeting could not be deleted. Stop it first if it is running.'))
+  }
   const clear = (): void => {
     setQuery('')
     setProject('')
@@ -152,12 +166,27 @@ export default function Library({
                         </i>
                       ))}
                     </span>
-                    {x.projectPath && (
-                      <span className="meeting-card-project" title={x.projectPath}>
-                        ⌘ {folder(x.projectPath)}
+                    <span
+                      className={`meeting-card-project ${x.projectPath ? '' : 'none'}`}
+                      title={x.projectPath ?? 'Ran without a project folder'}
+                    >
+                      ⌘ {x.projectPath ? folder(x.projectPath) : 'No folder'}
+                    </span>
+                    {x.files && (
+                      <span className="meeting-card-files" title={x.files.join('\n')}>
+                        {x.files.length} {x.files.length === 1 ? 'file' : 'files'}
                       </span>
                     )}
                     <span className="meeting-card-actions">
+                      {x.status !== 'running' && (
+                        <button
+                          className="text-button delete-button"
+                          onClick={() => remove(x)}
+                          aria-label={`Delete ${x.title}`}
+                        >
+                          Delete
+                        </button>
+                      )}
                       <button
                         className="text-button"
                         onClick={() => load(x.id, (s) => onRerun(s, x.title))}

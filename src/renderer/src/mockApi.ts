@@ -66,6 +66,7 @@ const demo = (
     leaning?: string
     team?: Member[]
     usage?: Record<string, Usage>
+    attachments?: string[]
   } = {}
 ): Session => {
   const members = extra.team ?? TEAM
@@ -74,7 +75,14 @@ const demo = (
     version: 2,
     id,
     createdAt: new Date(Date.now() - daysAgo * 864e5).toISOString(),
-    brief: { task, projectPath: extra.projectPath, members, chairId: members[0].id, maxTurns: 30 },
+    brief: {
+      task,
+      projectPath: extra.projectPath,
+      attachments: extra.attachments,
+      members,
+      chairId: members[0].id,
+      maxTurns: 30
+    },
     labels,
     turns: Array.from({ length: turns }, (_, i) => {
       const m = members[i % members.length]
@@ -125,6 +133,7 @@ const DEMO: Session[] = [
     18,
     {
       team: TEAM.slice(0, 3),
+      attachments: ['/Users/you/Desktop/funnel-sep.csv', '/Users/you/Desktop/pricing-page.png'],
       decision:
         '# Consortium: Pricing page lead offer\n\n## Decision\nLead with the team plan and keep the free tier one click away. The funnel shows free sign-ups rarely convert.\n\n## Rationale\n…'
     }
@@ -477,6 +486,10 @@ export const mockApi: Api = {
   },
   async loadSession(id) {
     return DEMO.find((x) => x.id === id) ?? null
+  },
+  async deleteSession(id) {
+    const i = DEMO.findIndex((x) => x.id === id)
+    if (i >= 0) DEMO.splice(i, 1)
   },
   onEvent(cb) {
     listeners.add(cb)

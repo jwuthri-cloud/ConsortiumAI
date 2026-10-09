@@ -21,6 +21,7 @@ const api: Api = {
   models: (cli: Cli) => ipcRenderer.invoke('cli:models', cli),
   listSessions: () => ipcRenderer.invoke('sessions:list'),
   loadSession: (id: string) => ipcRenderer.invoke('sessions:load', id),
+  deleteSession: (id: string) => ipcRenderer.invoke('sessions:delete', id),
   onEvent: (cb) => {
     const h = (_: IpcRendererEvent, e: DebateEvent): void => cb(e)
     ipcRenderer.on('debate:event', h)

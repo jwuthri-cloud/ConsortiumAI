@@ -86,6 +86,7 @@ app.whenReady().then(() => {
   ipcMain.handle('cli:models', (_, cli: Cli) => listModels(cli))
   ipcMain.handle('sessions:list', () => debate.listSessions())
   ipcMain.handle('sessions:load', (_, id: string) => debate.loadSession(id))
+  ipcMain.handle('sessions:delete', (_, id: string) => debate.deleteSession(id))
 
   createWindow()
   app.on('activate', () => {

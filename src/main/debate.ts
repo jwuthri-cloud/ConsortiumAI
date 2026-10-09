@@ -3,7 +3,7 @@ import { createBoardWriter } from './whiteboard'
 import type { HostInput, HostMessage } from '../shared/whiteboard'
 import { memberModel, modelName } from '../shared/models'
 import { summarize } from '../shared/summary'
-import { addUsage } from '../shared/usage'
+import { addUsage, priced } from '../shared/usage'
 import { randomUUID } from 'node:crypto'
 import {
   mkdirSync,
@@ -11,7 +11,8 @@ import {
   readdirSync,
   readFileSync,
   existsSync,
-  copyFileSync
+  copyFileSync,
+  rmSync
 } from 'node:fs'
 import { join, basename, dirname } from 'node:path'
 import {
@@ -90,6 +91,19 @@ function save(s: Session): void {
   writeFileSync(join(userData, 'sessions', `${s.id}.json`), JSON.stringify(s))
 }
 
+// Meetings saved before their model had a price get one when read back.
+function withPrices(s: Session): Session {
+  if (!s.usage) return s
+  const model = (id: string): string | undefined => {
+    const m = s.brief.members.find((x) => x.id === (id === 'chair' ? s.brief.chairId : id))
+    return m && memberModel(m)
+  }
+  const usage = Object.fromEntries(
+    Object.entries(s.usage).map(([id, u]) => [id, priced(u, model(id))])
+  )
+  return { ...s, usage }
+}
+
 export function listSessions(): SessionSummary[] {
   const dir = join(userData, 'sessions')
   if (!existsSync(dir)) return []
@@ -99,7 +113,7 @@ export function listSessions(): SessionSummary[] {
       try {
         const s = JSON.parse(readFileSync(join(dir, f), 'utf8')) as Session
         if (s.version !== 2) return null
-        return summarize({ ...s, status: sessionStatus(s) })
+        return summarize(withPrices({ ...s, status: sessionStatus(s) }))
       } catch {
         return null
       }
@@ -112,7 +126,14 @@ export function loadSession(id: string): Session | null {
   const f = join(userData, 'sessions', `${id}.json`)
   if (!existsSync(f)) return null
   const s = JSON.parse(readFileSync(f, 'utf8')) as Session
-  return s.version === 2 ? { ...s, status: sessionStatus(s) } : null
+  return s.version === 2 ? withPrices({ ...s, status: sessionStatus(s) }) : null
+}
+
+// Removes the transcript and its copied attachments; a meeting still in progress is left alone.
+export function deleteSession(id: string): void {
+  if (current?.id === id) throw new Error('Stop this meeting before deleting it.')
+  rmSync(join(userData, 'sessions', `${id}.json`), { force: true })
+  rmSync(join(userData, 'attachments', id), { recursive: true, force: true })
 }
 
 // Copied into the session's own folder: stable across resumes, and the members can read that folder
@@ -252,10 +273,13 @@ export function runDebate(
   }
   // Every CLI call goes through here, so members, the whiteboard writer and the chair are all counted.
   const spent = (session.usage ??= {})
-  const runner: typeof runMember = async (...args) => {
-    const r = await run(...args)
+  // Saved with the session, so a resume after an app restart still knows where each Claude session's running cost stood.
+  const costs = (session.cliCosts ??= {})
+  const runner: typeof runMember = async (cli, a, ...rest) => {
+    const r = await run(cli, { ...a, costBefore: a.resume ? costs[a.resume] : undefined }, ...rest)
+    if (r.sessionId && r.costTotal !== undefined) costs[r.sessionId] = r.costTotal
     if (r.usage) {
-      const bucket = args[3].slice(id.length + 1) // `${id}:${member id | 'whiteboard' | 'chair'}`
+      const bucket = rest[1].slice(id.length + 1) // `${id}:${member id | 'whiteboard' | 'chair'}`
       spent[bucket] = addUsage(spent[bucket], r.usage)
       emit({ sessionId: id, type: 'usage', usage: spent })
     }
@@ -278,16 +302,16 @@ export function runDebate(
   let writerModel = writer.model ?? (brief.board ? undefined : chairMember.resolvedModel)
   const board = createBoardWriter({
     previous: session.whiteboard,
-    generate: async (prompt) =>
-      (
-        await runner(
-          writer.cli,
-          { prompt, model: writer.model },
-          () => {},
-          `${id}:whiteboard`,
-          (model) => (writerModel = model)
-        )
-      ).text,
+    generate: async (prompt, resume) => {
+      const r = await runner(
+        writer.cli,
+        { prompt, model: writer.model, resume },
+        () => {},
+        `${id}:whiteboard`,
+        (model) => (writerModel = model)
+      )
+      return { text: r.text, sessionId: r.sessionId }
+    },
     cancel: () => killRun(`${id}:whiteboard`),
     publish: (whiteboard) => {
       if (me.cancelled || current !== me) return

@@ -14,6 +14,7 @@ const PRICES: [RegExp, number, number, number][] = [
   [/gpt-6/i, 10, 1, 50],
   [/gpt-5\.6/i, 4, 0.4, 20],
   [/gemini-3(?:\.\d+)?-pro/i, 2, 0.2, 12],
+  [/gemini-3(?:\.\d+)?-flash(?!-lite)/i, 0.75, 0.075, 3.75], // intro rate through Dec 2026
   [/grok-4/i, 2, 0.5, 6] // cached rate assumed
 ]
 

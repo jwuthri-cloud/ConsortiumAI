@@ -46,6 +46,9 @@ export function summarize(s: Session): SessionSummary {
         ? clip(`Leaning toward: ${plain(leaning)}`, 180)
         : undefined,
     projectPath: s.brief.projectPath,
+    files: s.brief.attachments?.length
+      ? s.brief.attachments.map((f) => f.split('/').pop() ?? f)
+      : undefined,
     team: s.brief.members.map(({ cli, persona }) => ({ cli, persona })),
     turn: Math.max(0, ...s.turns.filter((t) => t.speaker !== HUMAN).map((t) => t.n)),
     maxTurns: s.brief.maxTurns,

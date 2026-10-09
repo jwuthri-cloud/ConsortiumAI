@@ -74,18 +74,32 @@ Add a "visuals" array to the JSON. Use only these formats (at most 3 visuals tot
 - {"id":"stable-plan-id","kind":"sequence","title":"Proposed sequence","caption":"Proposal, not a commitment","sources":[1],"steps":[{"id":"step-id","label":"Short step","detail":"What happens here","status":"proposed|agreed|question","sources":[1]}]}. 2–6 steps, with no invented dates.
 Return ONLY JSON: {"recommendation":"current direction, or No recommendation yet","agreed":[{"id":"stable-id","text":"short note","sources":[1]}],"disputed":[],"questions":[],"actions":[],"visuals":[]}.
 Question: ${snapshot.task}
+Conversation:\n${snapshot.turns.slice(-24).map(turnLine).join('\n')}
 Previous board: ${previous ? JSON.stringify(previous) : 'None'}
-Conversation:\n${snapshot.turns
-    .slice(-24)
-    .map((t) => `Turn ${t.n} · ${t.label}: ${t.text.slice(0, 1800)}`)
-    .join('\n')}
-${snapshot.live ? `Provisional turn ${snapshot.live.n} · ${snapshot.live.label}: ${snapshot.live.text.slice(-2200)}` : ''}`
+${liveLine(snapshot)}`
+}
+// Stable parts first, changing parts last: providers that cache by prompt prefix reuse the conversation.
+const turnLine = (t: { n: number; label: string; text: string }): string =>
+  `Turn ${t.n} · ${t.label}: ${t.text.slice(0, 1800)}`
+const liveLine = ({ live }: BoardSnapshot): string =>
+  live ? `Provisional turn ${live.n} · ${live.label}: ${live.text.slice(-2200)}` : ''
+
+// A resumed writer session already holds the rules, earlier turns and its last board: send only what's new.
+export function boardUpdatePrompt(snapshot: BoardSnapshot, since: number): string {
+  return `New in the conversation since your last board:
+${snapshot.turns.slice(since).map(turnLine).join('\n') || '(no new completed turns)'}
+${liveLine(snapshot)}
+Update your last board under the same rules. Return ONLY the full JSON in the same format.`
 }
 
 // One writer at a time. Intermediate snapshots are coalesced, never queued as a
 // backlog. Speaker work never waits for this worker, including on failures.
 export function createBoardWriter(options: {
-  generate: (prompt: string) => Promise<string>
+  // resume = the writer's own CLI session; return its id so later updates send only new turns
+  generate: (
+    prompt: string,
+    resume?: string
+  ) => Promise<string | { text: string; sessionId?: string }>
   cancel: () => void
   publish: (board: Whiteboard) => void
   status: (status: BoardStatus, error?: string) => void
@@ -99,6 +113,9 @@ export function createBoardWriter(options: {
   let disposed = false
   let lastStart = 0
   let lastInput = ''
+  let session: string | undefined
+  let sent = 0 // snapshot turns the session has already seen
+  let resumed = 0
   const interval = options.intervalMs ?? 8000
   const schedule = (immediate = false): void => {
     if (disposed || busy || !pending) return
@@ -123,12 +140,22 @@ export function createBoardWriter(options: {
     options.status('updating')
     const timeout = setTimeout(options.cancel, 60000)
     try {
-      const result = await options.generate(boardPrompt(snapshot, previous))
+      // ponytail: a fresh session every 20 updates keeps the resumed history from growing without bound
+      const resume = resumed < 20 ? session : undefined
+      const out = await options.generate(
+        resume ? boardUpdatePrompt(snapshot, sent) : boardPrompt(snapshot, previous),
+        resume
+      )
       if (disposed) return
+      const result = typeof out === 'string' ? out : out.text
+      session = typeof out === 'string' ? undefined : out.sessionId
+      resumed = resume && session ? resumed + 1 : 0
+      sent = snapshot.turns.length
       previous = parseBoard(result, snapshot, previous)
       options.publish(previous)
       options.status('idle')
     } catch (error) {
+      session = undefined // a failed or killed run leaves the session's history uncertain
       if (!disposed)
         options.status(
           'error',

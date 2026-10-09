@@ -23,7 +23,7 @@ export type ActivityState = {
   updatedAt: number
 }
 export type State = {
-  focus?: number // member turn to scroll to when the meeting room opens from a citation
+  focusTurn?: number // member turn to scroll to when the meeting room opens from a citation
   whiteboard?: Whiteboard
   boardStatus: BoardStatus
   boardError?: string
@@ -143,7 +143,7 @@ export function reducer(s: State, a: Action): State {
     case 'show-consortium':
       return { ...s, screen: 'consortium', revealed: true }
     case 'show-chamber':
-      return { ...s, screen: 'chamber', focus: a.turn }
+      return { ...s, screen: 'chamber', focusTurn: a.turn }
   }
   if (a.sessionId !== s.sessionId) return s
   switch (a.type) {

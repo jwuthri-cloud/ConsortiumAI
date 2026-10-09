@@ -1,5 +1,7 @@
 import type { BoardVisual } from './boardVisuals'
 export const WHITEBOARD_MODEL = 'gpt-6.1-sol'
+// The default whiteboard writer: summarizing needs a fast model, not the chair's.
+export const BOARD_WRITER = { cli: 'claude', model: 'claude-haiku-5-5' } as const
 export const BOARD_COLUMNS = ['agreed', 'disputed', 'questions', 'actions'] as const
 export type BoardColumn = (typeof BOARD_COLUMNS)[number]
 export type BoardNote = { id: string; text: string; sources: number[] }

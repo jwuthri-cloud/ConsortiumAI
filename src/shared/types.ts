@@ -72,6 +72,7 @@ export type Session = {
   hostMessages?: HostMessage[]
   focus?: string
   cliSessions?: Record<string, string | undefined> // member id → CLI session, so a resume keeps each member's memory
+  cliCosts?: Record<string, number> // Claude session → its running cost, so a resumed turn counts only itself
   usage?: Record<string, Usage> // member id, 'whiteboard' or 'chair' → tokens and cost so far
 }
 
@@ -109,6 +110,7 @@ export type SessionSummary = {
   turn: number // last member turn reached
   maxTurns: number
   usage?: Usage // the whole meeting: members, whiteboard and chair
+  files?: string[] // names of the files attached to the question
   status: Session['status']
 }
 
@@ -133,5 +135,6 @@ export type Api = {
   models(cli: Cli): Promise<string[]>
   listSessions(): Promise<SessionSummary[]>
   loadSession(id: string): Promise<Session | null>
+  deleteSession(id: string): Promise<void>
   onEvent(cb: (e: DebateEvent) => void): () => void
 }

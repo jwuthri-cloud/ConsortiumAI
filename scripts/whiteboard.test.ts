@@ -185,3 +185,44 @@ test('host targeting takes the next turn; focus persists; conclude while paused 
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('writer resumes its session with only the new turns, and starts fresh after a failure', async () => {
+  const calls: { prompt: string; resume?: string }[] = []
+  let fail = false
+  const writer = createBoardWriter({
+    intervalMs: 0,
+    generate: async (prompt, resume) => {
+      calls.push({ prompt, resume })
+      if (fail) throw new Error('offline')
+      return { text: json, sessionId: 'S' }
+    },
+    publish: () => {},
+    status: () => {},
+    cancel: () => {}
+  })
+  try {
+    const two = {
+      ...snapshot,
+      turns: [...snapshot.turns, { n: 2, label: 'Skeptic', text: 'Who asked?' }]
+    }
+    writer.update(snapshot)
+    await until(() => calls.length === 1)
+    writer.update(two)
+    await until(() => calls.length === 2)
+    assert.equal(calls[0].resume, undefined)
+    assert.match(calls[0].prompt, /Turn 1 · Engineer: Try CSV/)
+    assert.equal(calls[1].resume, 'S')
+    assert.match(calls[1].prompt, /Turn 2 · Skeptic: Who asked\?/)
+    assert.doesNotMatch(calls[1].prompt, /Try CSV/)
+    fail = true
+    writer.update({ ...two, task: 'retry' })
+    await until(() => calls.length === 3)
+    fail = false
+    writer.update(two, true)
+    await until(() => calls.length === 4)
+    assert.equal(calls[3].resume, undefined)
+    assert.match(calls[3].prompt, /Try CSV/)
+  } finally {
+    writer.dispose()
+  }
+})
