@@ -7,10 +7,10 @@ export const CLI_META: Record<Cli, { name: string; color: string }> = {
   codex: { name: 'Codex', color: '#43C79A' },
   gemini: { name: 'Gemini CLI', color: '#7F93FF' },
   grok: { name: 'Grok Build', color: '#C9D0DC' },
-  harness: { name: 'Harness', color: '#F0A3C4' }
+  harness: { name: 'Deep-agent', color: '#F0A3C4' }
 }
 
-// The harness seat's model is "provider:model". Every provider is reached through its
+// The Deep-agent seat's (id "harness") model is "provider:model". Every provider is reached through its
 // OpenAI-compatible endpoint; `or` is its prefix in OpenRouter's catalogue (for prices and suggestions).
 export type ApiProvider = 'openrouter' | 'openai' | 'anthropic' | 'google' | 'xai'
 export type KeySource = 'saved' | 'env' | null // saved = in the keychain; env = an environment variable
@@ -145,6 +145,7 @@ export type DebateEvent = { sessionId: string } & (
   | { type: 'delta'; memberId: string; turn: number; text: string } // turn 0 = the chair
   | { type: 'turn-done'; turn: Turn }
   | { type: 'turn-error'; memberId: string; turn: number; message: string }
+  | { type: 'turn-cancelled'; memberId: string; turn: number } // a raised hand stopped it; it runs again
   | { type: 'human'; turn: Turn }
   | { type: 'shape'; turn: number; shape: Shape | null }
   | { type: 'chair-start'; memberId: string }
@@ -186,6 +187,7 @@ export type Api = {
   stop(): Promise<void>
   resume(sessionId: string): Promise<void> // continue an unfinished session where it stopped
   pause(on: boolean): Promise<void> // takes effect before the next turn
+  raiseHand(on: boolean): Promise<void> // hold the meeting and stop the seat preparing its turn
   spoken(sessionId: string, turn: number): Promise<void> // a turn's answer has finished playing
   interject(text: string): Promise<void>
   host(input: HostInput): Promise<void>

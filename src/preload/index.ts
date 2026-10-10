@@ -6,6 +6,7 @@ const api: Api = {
   stop: () => ipcRenderer.invoke('debate:stop'),
   resume: (sessionId: string) => ipcRenderer.invoke('debate:resume', sessionId),
   pause: (on: boolean) => ipcRenderer.invoke('debate:pause', on),
+  raiseHand: (on: boolean) => ipcRenderer.invoke('debate:raiseHand', on),
   spoken: (id: string, turn: number) => ipcRenderer.invoke('debate:spoken', id, turn),
   host: (input) => ipcRenderer.invoke('debate:host', input),
   conclude: () => ipcRenderer.invoke('debate:conclude'),

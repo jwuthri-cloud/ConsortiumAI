@@ -14,8 +14,9 @@ export function toolDetail(input: unknown): string | undefined {
   const path =
     str(o.file_path) ?? str(o.absolute_path) ?? str(o.path) ?? str(o.dir_path) ?? str(o.directory)
   const query = str(o.pattern) ?? str(o.query) ?? str(o.glob)
-  const command = str(o.command)
+  const command = str(o.command) ?? (Array.isArray(o.args) ? o.args.join(' ') : undefined)
   if (command) return command
+  if (str(o.url)) return String(o.url)
   if (query) return path ? `"${query}" in ${path}` : `"${query}"`
   const from = Number(o.start_line ?? o.offset) || 0 // gemini's read_file / Claude's Read
   const to = Number(o.end_line) || 0

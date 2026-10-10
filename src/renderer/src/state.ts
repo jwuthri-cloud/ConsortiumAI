@@ -238,6 +238,15 @@ export function reducer(s: State, a: Action): State {
       if (i >= 0) turns[i] = { ...turns[i], status: 'error', error: a.message }
       return { ...s, turns, speaking: undefined, activity: undefined }
     }
+    case 'turn-cancelled':
+      return {
+        ...s,
+        turns: s.turns.filter(
+          (t) => !(t.status === 'running' && t.speaker === a.memberId && t.n === a.turn)
+        ),
+        speaking: undefined,
+        activity: undefined
+      }
     case 'human':
       return { ...s, turns: [...s.turns, { ...a.turn, status: 'done' }] }
     case 'shape':

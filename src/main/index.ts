@@ -63,6 +63,7 @@ app.whenReady().then(() => {
   ipcMain.handle('debate:stop', () => debate.stop())
   ipcMain.handle('debate:resume', (_, id: string) => debate.resume(id, send))
   ipcMain.handle('debate:pause', (_, on: boolean) => debate.pause(on))
+  ipcMain.handle('debate:raiseHand', (_, on: boolean) => debate.raiseHand(on))
   ipcMain.handle('debate:spoken', (_, id: string, turn: number) => debate.spoken(id, turn))
   ipcMain.handle('debate:host', (_, input) => debate.host(input))
   ipcMain.handle('debate:conclude', () => debate.conclude())

@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { API_PROVIDERS, type ApiProvider, type KeySource } from '../shared/types'
 
-// API keys for the harness seat, encrypted with the OS keychain (safeStorage), never sent to the renderer.
+// API keys for the Deep-agent seat, encrypted with the OS keychain (safeStorage), never sent to the renderer.
 // An environment variable (OPENROUTER_API_KEY, …) works too, for `npm run dev` from a shell.
 const file = (): string => join(app.getPath('userData'), 'keys.json')
 

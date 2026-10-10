@@ -14,6 +14,7 @@ export default function App(): React.JSX.Element {
         // audio goes to the player, not the state; the lobby stays silent (and acks, so nothing waits)
         if (e.type === 'voice') return voice.play(e, screen.current !== 'convene')
         if (e.type === 'stopped' || e.type === 'failed') voice.stop()
+        if (e.type === 'turn-start') voice.turnStarted(e.turn)
         dispatch(e)
       }),
     []

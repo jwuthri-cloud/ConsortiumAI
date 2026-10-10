@@ -3,6 +3,7 @@ import { PROVIDERS } from './avatarTheme'
 import { useEffect, useRef, useState } from 'react'
 import Library from './Library'
 import Settings from './Settings'
+import { useDictation } from './useDictation'
 import ModelPicker from './ModelPicker'
 import {
   API_PROVIDERS,
@@ -30,7 +31,7 @@ type Props = {
 
 const ORDER: Cli[] = ['claude', 'codex', 'gemini', 'grok', 'harness']
 const PROVIDER_IDS = Object.keys(API_PROVIDERS) as ApiProvider[]
-// a new seat's model; the harness has none, you pick a provider and model
+// a new seat's model; the Deep-agent has none, you pick a provider and model
 const DEFAULT_MODEL: Partial<Record<Cli, string>> = {
   claude: 'claude-opus-5-5',
   codex: 'gpt-6.1-sol',
@@ -64,12 +65,6 @@ async function testSeat(seat: Seat): Promise<Checked> {
     return { check: 'error', message: 'Connection failed. Try again.' }
   }
 }
-const ipcError = (e: unknown): string =>
-  (e instanceof Error ? e.message : String(e)).replace(
-    /^Error invoking remote method '[^']+': (Error: )?/,
-    ''
-  )
-
 export default function Convene({ onStart, onOpen, onContinue }: Props): React.JSX.Element {
   const [task, setTask] = useState('')
   const [rerunOf, setRerunOf] = useState<string>()
@@ -99,8 +94,6 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
   const [sessions, setSessions] = useState<SessionSummary[]>([])
   const [problem, setProblem] = useState<string | null>(null)
   const [files, setFiles] = useState<string[]>([])
-  const [recorder, setRecorder] = useState<MediaRecorder | null>(null)
-  const [transcribing, setTranscribing] = useState(false)
   const addFiles = (paths: string[]): void =>
     setFiles((f) => [...new Set([...f, ...paths.filter(Boolean)])])
   // pasted screenshots have no path on disk: save their bytes first
@@ -114,40 +107,10 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
       )
     )
   }
-  const dictate = async (): Promise<void> => {
-    if (recorder) return recorder.stop()
-    let stream: MediaStream
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-    } catch {
-      return setProblem(
-        'No microphone access. Allow it in System Settings → Privacy & Security → Microphone.'
-      )
-    }
-    const rec = new MediaRecorder(stream)
-    const chunks: Blob[] = []
-    rec.ondataavailable = (e) => chunks.push(e.data)
-    rec.onstop = async () => {
-      stream.getTracks().forEach((t) => t.stop())
-      setRecorder(null)
-      setTranscribing(true)
-      try {
-        const path = await window.api!.saveFile(
-          'dictation.webm',
-          await new Blob(chunks).arrayBuffer()
-        )
-        const text = await window.api!.transcribe(path)
-        if (text) setTask((t) => (t.trim() ? `${t.trimEnd()} ${text}` : text))
-      } catch (e) {
-        setProblem(ipcError(e))
-      } finally {
-        setTranscribing(false)
-      }
-    }
-    rec.start()
-    setRecorder(rec)
-    setProblem(null)
-  }
+  const dictation = useDictation(
+    (text) => setTask((t) => (t.trim() ? `${t.trimEnd()} ${text}` : text)),
+    setProblem
+  )
 
   const [models, setModels] = useState<Partial<Record<Cli, string[]>>>({})
   const [keys, setKeys] = useState<Partial<Record<ApiProvider, KeySource>>>({})
@@ -259,7 +222,7 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
     if (seats.length < 2) return setProblem('A consortium needs at least two seats.')
     if (!seats.some((x) => x.id === chairId)) return setProblem('Pick a chair.')
     if (seats.some((x) => x.cli === 'harness' && !splitModel(x.model).model))
-      return setProblem('Pick a model for the harness seat.')
+      return setProblem('Pick a model for the Deep-agent seat.')
     setProblem(null)
     // every seat speaks with its own voice (older meetings re-run without one get the next free one)
     const used: string[] = []
@@ -394,12 +357,19 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
                 + Files
               </button>
               <button
-                className={`text-button dictate ${recorder ? 'recording' : ''}`}
-                onClick={() => void dictate()}
-                disabled={transcribing}
-                aria-pressed={!!recorder}
+                className={`text-button dictate ${dictation.recording ? 'recording' : ''}`}
+                onClick={() => {
+                  setProblem(null)
+                  void dictation.toggle()
+                }}
+                disabled={dictation.transcribing}
+                aria-pressed={dictation.recording}
               >
-                {transcribing ? 'Transcribing…' : recorder ? '● Stop' : '🎙 Dictate'}
+                {dictation.transcribing
+                  ? 'Transcribing…'
+                  : dictation.recording
+                    ? '● Stop'
+                    : '🎙 Dictate'}
               </button>
             </span>
           </div>
@@ -704,7 +674,7 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
   )
 }
 
-// The harness seat picks a provider and a model; its key lives in Settings.
+// The Deep-agent seat picks a provider and a model; its key lives in Settings.
 function HarnessFields({
   model: value,
   options,

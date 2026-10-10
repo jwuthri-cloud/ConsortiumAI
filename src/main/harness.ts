@@ -2,7 +2,7 @@ import { app } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { CompositeBackend, FilesystemBackend, StateBackend, createDeepAgent } from 'deepagents'
+import { CompositeBackend, StateBackend, createDeepAgent } from 'deepagents'
 import { ChatOpenAI } from '@langchain/openai'
 import {
   AIMessageChunk,
@@ -17,16 +17,32 @@ import { API_PROVIDERS, splitModel, type ActivityKind, type TraceStep } from '..
 import { priced, sumUsage, type Usage } from '../shared/usage'
 import { getKey } from './keys'
 import { tidy, toolDetail } from './trace'
+import { ReadOnlyFolder, fetchTool, gitTool, searchTool } from './agentTools'
 import { humanError, openrouterPrice, track, type Price, type RunArgs, type RunResult } from './cli'
 
-// The harness seat: a LangChain Deep Agent (planning, read-only file tools, subagents) running
-// in-process on an API key, instead of a spawned coding-agent CLI.
+// The Deep-agent seat (id "harness"): a LangChain Deep Agent running in-process on an API key,
+// instead of a spawned coding-agent CLI. Planning, subagents, read-only files and git, the web.
 
 export function toolActivity(name = ''): ActivityKind {
-  if (name === 'read_file' || name === 'ls') return 'reading'
-  if (name === 'glob' || name === 'grep') return 'searching'
+  if (name === 'read_file' || name === 'ls' || name === 'git' || name === 'fetch_url')
+    return 'reading'
+  if (name === 'glob' || name === 'grep' || name === 'web_search') return 'searching'
   if (name === 'write_todos') return 'thinking'
   return 'tool'
+}
+
+// What the agent is told about its setup; the meeting's own prompt says what to do.
+export function setupPrompt(mounts: string[], web: boolean, today = new Date()): string {
+  return [
+    `Today is ${today.toDateString()}.`,
+    mounts.length
+      ? `You can read these folders by their absolute paths, read-only: ${mounts.join(', ')}. The git tool reads the project's history (log, blame, show, diff).`
+      : 'There are no files to read.',
+    web
+      ? 'You have internet access: web_search finds pages, fetch_url reads one. Use it when a claim depends on current facts or on something outside the project, and name the URLs you relied on.'
+      : 'fetch_url reads a public web page; web search needs an OpenRouter key, which is not set.',
+    'Secrets (.env files, private keys, credentials) are blocked; never try to reach them or send project contents to a website.'
+  ].join('\n')
 }
 
 type Call = { usage_metadata?: UsageMetadata }
@@ -79,7 +95,7 @@ export async function runHarness(
   const { provider, model } = splitModel(a.model)
   const p = API_PROVIDERS[provider]
   if (!model)
-    throw new Error('Pick a model for the harness, like openrouter:anthropic/claude-opus-5.5')
+    throw new Error('Pick a model for the Deep-agent, like openrouter:anthropic/claude-opus-5.5')
   const apiKey = getKey(provider)
   if (!apiKey) throw new Error(`No ${p.name} API key. Paste one in the seat, or set ${p.env}.`)
   onModel(model)
@@ -88,6 +104,7 @@ export async function runHarness(
 
   // Each folder is mounted at its real absolute path, so the paths the prompts name work as is.
   const mounts = [a.cwd, ...(a.dirs ?? [])].filter((d): d is string => !!d)
+  const searchKey = getKey('openrouter') // web search runs on OpenRouter whatever the seat's provider
   const agent = createDeepAgent({
     // ponytail: every provider through its OpenAI-compatible endpoint; add a native @langchain
     // package when a provider-only knob (Anthropic thinking budget, …) is needed
@@ -106,15 +123,18 @@ export async function runHarness(
           Object.fromEntries(
             mounts.map((d) => [
               d.replace(/\/?$/, '/'),
-              new FilesystemBackend({ rootDir: d, virtualMode: true })
+              new ReadOnlyFolder({ rootDir: d, virtualMode: true })
             ])
           )
         )
       : undefined,
     permissions: [{ operations: ['write'], paths: ['/**'], mode: 'deny' }],
-    systemPrompt: mounts.length
-      ? `You can read these folders, read-only, by their absolute paths: ${mounts.join(', ')}.`
-      : 'There are no files to read.'
+    tools: [
+      ...(a.cwd ? [gitTool(a.cwd)] : []),
+      fetchTool,
+      ...(searchKey ? [searchTool(searchKey)] : [])
+    ],
+    systemPrompt: setupPrompt(mounts, !!searchKey)
   })
 
   const thread = a.resume && /^[\w-]+$/.test(a.resume) ? a.resume : randomUUID()
@@ -188,9 +208,9 @@ export async function runHarness(
     }
     flush()
   } catch (e) {
-    if (ctrl.signal.aborted) throw new Error('harness stopped')
-    if (signal.aborted) throw new Error('harness timed out after 20 minutes')
-    throw new Error(humanError(e instanceof Error ? e.message : String(e)) || 'harness failed')
+    if (ctrl.signal.aborted) throw new Error('Deep-agent stopped')
+    if (signal.aborted) throw new Error('Deep-agent timed out after 20 minutes')
+    throw new Error(humanError(e instanceof Error ? e.message : String(e)) || 'Deep-agent failed')
   } finally {
     untrack()
   }

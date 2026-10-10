@@ -2,7 +2,7 @@
 
 One question. Several AI members that disagree on purpose — each one a coding-agent CLI you already pay for (Claude Code, Codex, Gemini CLI, Grok Build). They sit at a table and talk it through in short turns — opening statements, then real back-and-forth, then a forced convergence — and a chair writes the **consortium**: one decision document with the rationale, a plan, and the dissent kept in.
 
-Local-first desktop app (Electron). No accounts, no server: the app spawns the CLIs that are already signed in on your machine. An optional fifth seat, the **Harness**, runs on an API key instead.
+Local-first desktop app (Electron). No accounts, no server: the app spawns the CLIs that are already signed in on your machine. An optional fifth seat, the **Deep-agent**, runs on an API key instead.
 
 ## Setup
 
@@ -44,7 +44,7 @@ Setup, meeting history, the live room, and the decision document share the charc
 
 Model names come from CLI response metadata, the matching Codex rollout, or Grok’s default-model catalogue. They are saved with each seat; older sessions without recorded model metadata display “Model not recorded.” “Check connections” also resolves the current default into the setup field.
 
-Model-metadata, saved-state and harness tests: `npx tsx --tsconfig tsconfig.web.json --test scripts/*.test.ts`. Reopened sessions left running by an app restart display as stopped unless their engine is still active.
+Model-metadata, saved-state and Deep-agent tests: `npx tsx --tsconfig tsconfig.web.json --test scripts/*.test.ts`. Reopened sessions left running by an app restart display as stopped unless their engine is still active.
 
 ## How it talks to the CLIs
 
@@ -79,9 +79,16 @@ Open the renderer at the Vite URL in a normal browser (no Electron) and it runs 
 npm run build:mac
 ```
 
-### The Harness seat
+### The Deep-agent seat
 
-Our own member: a [Deep Agents](https://docs.langchain.com/oss/javascript/deepagents/overview) agent (planning, read-only file tools, subagents) that runs inside the app on an API key. Pick it under **Connection**, then a provider and a model. Its tools are `ls`, `read_file`, `glob` and `grep` on the attached project and files, plus planning (`write_todos`) and subagents (`task`). It has no shell and cannot write.
+Our own member: a [Deep Agents](https://docs.langchain.com/oss/javascript/deepagents/overview) agent (planning, read-only file tools, subagents) that runs inside the app on an API key. Pick it under **Connection**, then a provider and a model. Its tools:
+
+- **Files:** `ls`, `read_file`, `glob` and `grep` on the attached project and files, read-only.
+- **Git:** `git` runs read-only commands in the project (`log`, `show`, `diff`, `blame`, `status`, `shortlog`, `ls-files`, `grep`, `rev-parse`, `describe`, `for-each-ref`; `branch` and `tag` only list). No shell: options that write, run programs or read outside the repo are refused.
+- **Internet:** `web_search` (OpenRouter's web search on your OpenRouter key, about $0.007 a search, not counted in the usage meter) and `fetch_url` (reads a public page; local and private addresses are refused).
+- **Planning and subagents:** `write_todos` and `task`.
+
+Secrets stay out of reach: `.env` files, private keys and credential files can't be read or matched by search, so a web page can't talk the agent into sending them out.
 
 | Provider   | Model examples                                   | Key                  |
 | ---------- | ------------------------------------------------ | -------------------- |
@@ -91,7 +98,7 @@ Our own member: a [Deep Agents](https://docs.langchain.com/oss/javascript/deepag
 | Google     | `gemini-3.8-flash`                               | `GEMINI_API_KEY`     |
 | xAI        | `grok-4.7`                                       | `XAI_API_KEY`        |
 
-Add the key under **Settings** (top right of the lobby), or from the seat's **Add key** link: it is encrypted with the macOS keychain into the app's data folder and only ever sent to that provider. The environment variable works too. Cost is the catalogue list price from OpenRouter, so it shows as ≈. The seat only reads the attached project and files; each seat's memory lives in `harness/<thread>.json` in the app's data folder.
+Add the key under **Settings** (top right of the lobby), or from the seat's **Add key** link: it is encrypted with the macOS keychain into the app's data folder and only ever sent to that provider. The environment variable works too. Cost is the catalogue list price from OpenRouter, so it shows as ≈. Each seat's memory lives in `harness/<thread>.json` in the app's data folder (`harness` is the seat's internal id).
 
 ### Voices
 
@@ -118,6 +125,8 @@ Open **Whiteboard** in the meeting toolbar for a dedicated view of the current d
 
 The conversation strip updates as speech arrives. The writer coalesces new text into short batches (normally at least eight seconds between starts, with turn-end/manual refreshes requesting an immediate update). Model generation adds latency; only one writer runs at a time, and speakers never wait for it. A failed update keeps the previous board. Snapshots are saved with the session; the timestamp and turn number show their coverage. The writer stops when the meeting ends, so the last board can trail the final transcript; the chair's decision is the final synthesis.
 
+- **Raise hand** stops the voice that is talking, cancels the turn being prepared and holds the meeting. Type, or press the mic and speak (local Whisper), then send: the meeting resumes and the interrupted seat retakes its turn, now hearing you. **Lower hand** resumes without a message.
+- The mic in the message box dictates any message, hand raised or not.
 - **Ask an agent** gives that seat the next turn after the current response finishes.
 - **Focus the discussion** sets a persistent instruction for later contributions.
 - **Add a thought** adds context for the next speaker.

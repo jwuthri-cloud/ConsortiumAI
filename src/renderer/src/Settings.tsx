@@ -17,7 +17,7 @@ type Props = {
   onChange: () => Promise<void>
 }
 
-// App settings: the API keys the Harness seat runs on. The page never sees a saved key, only where it comes from.
+// App settings: the API keys the Deep-agent seat runs on. The page never sees a saved key, only where it comes from.
 export default function Settings({
   open,
   focus,
@@ -51,9 +51,9 @@ export default function Settings({
         </header>
         <h3>API keys</h3>
         <p className="settings-note">
-          The Harness seat runs on these, and the voices on the OpenRouter key. Each key is
-          encrypted with your macOS keychain and only ever sent to its own provider. An environment
-          variable works too.
+          The Deep-agent seat runs on these; its web search and the voices use the OpenRouter key.
+          Each key is encrypted with your macOS keychain and only ever sent to its own provider. An
+          environment variable works too.
         </p>
         {PROVIDER_IDS.map((p) => (
           <KeyRow key={p} provider={p} source={keys[p] ?? null} onChange={onChange} />

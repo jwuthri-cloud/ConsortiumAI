@@ -3888,7 +3888,7 @@ button:disabled {
   color: var(--color-ink);
 }
 
-/* harness seat: whether its provider has a key */
+/* Deep-agent seat: whether its provider has a key */
 .key-status {
   display: flex;
   align-items: center;
@@ -4168,4 +4168,28 @@ button:disabled {
   margin-top: 6px;
   font-size: 10.5px;
   color: #8e8d9d;
+}
+
+.meeting-composer button.composer-mic {
+  background: transparent;
+  color: #c6b7e5;
+  border: 1px solid #46414f;
+}
+.meeting-composer button.composer-mic.recording {
+  color: #e09395;
+  border-color: #e09395;
+  animation: mic-pulse 1.2s ease-in-out infinite;
+}
+@keyframes mic-pulse {
+  50% {
+    box-shadow: 0 0 0 4px #e0939526;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .meeting-composer button.composer-mic.recording {
+    animation: none;
+  }
+}
+.meeting-tool.hand-raised .tool-icon {
+  color: #f0c674;
 }

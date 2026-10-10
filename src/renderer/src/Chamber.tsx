@@ -12,6 +12,7 @@ import { lastTurnOf, latestVotes, type State } from './state'
 import Markdown from './Markdown'
 import AgentAvatar, { type Presence } from './AgentAvatar'
 import * as voice from './voice'
+import { useDictation } from './useDictation'
 import { PROVIDERS } from './avatarTheme'
 import { AgentUsage, UsageMeter } from './Usage'
 
@@ -39,6 +40,8 @@ type IconName =
   | 'play'
   | 'sound'
   | 'muted'
+  | 'hand'
+  | 'mic'
   | 'trace'
 function Icon({ name, size = 18 }: { name: IconName; size?: number }): React.JSX.Element {
   const paths: Record<IconName, string> = {
@@ -60,6 +63,8 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }): React.JSX
     play: 'M7 4v16l13-8Z',
     sound: 'M4 9h4l5-4v14l-5-4H4ZM16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12',
     muted: 'M4 9h4l5-4v14l-5-4H4ZM17 9l5 6m0-6-5 6',
+    hand: 'M8 13V5.5a1.5 1.5 0 0 1 3 0V11m0-1V4a1.5 1.5 0 0 1 3 0v7m0-1.5V6a1.5 1.5 0 0 1 3 0v8a7 7 0 0 1-7 7h-.5a6 6 0 0 1-5-2.7L3 14.6a1.5 1.5 0 0 1 2.5-1.7L8 15',
+    mic: 'M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3ZM5 11a7 7 0 0 0 14 0M12 18v3',
     trace: 'm4 17 6-5-6-5M12 19h8'
   }
   return (
@@ -109,6 +114,11 @@ export default function Chamber({
   const [thought, setThought] = useState('')
   const [hostMode, setHostMode] = useState('thought')
   const [notice, setNotice] = useState<string | null>(null)
+  const [hand, setHand] = useState(false) // the human has the floor: the meeting holds until they speak
+  const dictation = useDictation((text) => {
+    setThought((t) => (t.trim() ? `${t.trimEnd()} ${text}` : text))
+    requestAnimationFrame(() => inputRef.current?.focus())
+  }, setNotice)
   const [sending, setSending] = useState(false)
   const [stopping, setStopping] = useState(false)
   const [pauseRequested, setPaused] = useState(false)
@@ -254,6 +264,21 @@ export default function Chamber({
       setPanel('conversation')
     }
   }
+  const raiseHand = async (on: boolean): Promise<void> => {
+    try {
+      await window.api!.raiseHand(on)
+      if (on) {
+        voice.cut() // the seat talking stops now; the one preparing will speak after you
+        setPanel('conversation')
+        setStick(true)
+        requestAnimationFrame(() => inputRef.current?.focus())
+      }
+      setHand(on)
+      setNotice(null)
+    } catch {
+      setNotice(on ? 'Could not raise your hand. Please try again.' : 'Could not resume.')
+    }
+  }
   const addContext = (): void => {
     setPanel('conversation')
     requestAnimationFrame(() => inputRef.current?.focus())
@@ -272,6 +297,7 @@ export default function Chamber({
       setThought('')
       setNotice(null)
       setStick(true)
+      if (hand) void raiseHand(false) // said your piece: the room carries on
     } catch {
       setNotice('Could not send. Please try again.')
     } finally {
@@ -555,13 +581,15 @@ export default function Chamber({
             </div>
             <div>
               <strong>
-                {audible
-                  ? `${s.labels[audible]?.replace(/^The /, '')} is speaking`
-                  : s.speaking
-                    ? `${activeName}${chairWriting ? ' · chair' : ' has the floor'}`
-                    : running
-                      ? 'Around the table'
-                      : 'Meeting recap'}
+                {hand && running
+                  ? 'You have the floor'
+                  : audible
+                    ? `${s.labels[audible]?.replace(/^The /, '')} is speaking`
+                    : s.speaking
+                      ? `${activeName}${chairWriting ? ' · chair' : ' has the floor'}`
+                      : running
+                        ? 'Around the table'
+                        : 'Meeting recap'}
               </strong>
               {s.activity && running ? (
                 <ActivityStatus
@@ -805,18 +833,40 @@ export default function Chamber({
                     maxLength={4000}
                     disabled={!canInterject || sending}
                     placeholder={
-                      canInterject
-                        ? hostMode === 'focus'
-                          ? 'What should the room focus on?'
-                          : hostMode === 'thought'
-                            ? 'Say something to the room…'
-                            : 'Your question for this agent…'
-                        : chairWriting
-                          ? 'The chair is writing…'
-                          : 'This session has ended'
+                      canInterject && hand
+                        ? 'The room is listening. Type, or press the mic and speak…'
+                        : canInterject
+                          ? hostMode === 'focus'
+                            ? 'What should the room focus on?'
+                            : hostMode === 'thought'
+                              ? 'Say something to the room…'
+                              : 'Your question for this agent…'
+                          : chairWriting
+                            ? 'The chair is writing…'
+                            : 'This session has ended'
                     }
                     aria-label="Message to the discussion"
                   />
+                  <button
+                    type="button"
+                    className={`composer-mic ${dictation.recording ? 'recording' : ''}`}
+                    aria-label={dictation.recording ? 'Stop and transcribe' : 'Dictate'}
+                    aria-pressed={dictation.recording}
+                    title={
+                      dictation.transcribing
+                        ? 'Transcribing…'
+                        : dictation.recording
+                          ? 'Stop and transcribe'
+                          : 'Dictate (local Whisper)'
+                    }
+                    onClick={() => {
+                      setNotice(null)
+                      void dictation.toggle()
+                    }}
+                    disabled={!canInterject || sending || dictation.transcribing}
+                  >
+                    {dictation.transcribing ? '…' : <Icon name="mic" size={15} />}
+                  </button>
                   <button
                     type="submit"
                     aria-label="Send message"
@@ -828,7 +878,11 @@ export default function Chamber({
                 <p role="status">
                   {notice ??
                     (canInterject
-                      ? 'Your message joins the next turn.'
+                      ? dictation.recording
+                        ? 'Listening… press the mic again when you are done.'
+                        : hand
+                          ? 'The meeting is holding for you. Sending resumes it.'
+                          : 'Your message joins the next turn.'
                       : 'Every perspective stays in the transcript.')}
                 </p>
               </div>
@@ -856,7 +910,7 @@ export default function Chamber({
             className={`meeting-tool ${paused ? 'tool-active' : ''}`}
             aria-pressed={paused}
             onClick={() => void togglePause()}
-            disabled={!running || chairWriting}
+            disabled={!running || chairWriting || hand}
           >
             <span className="tool-icon">
               <Icon name={paused ? 'play' : 'pause'} />
@@ -896,6 +950,22 @@ export default function Chamber({
               <span>Speed</span>
             </button>
           )}
+          <button
+            className={`meeting-tool ${hand && running ? 'tool-active hand-raised' : ''}`}
+            aria-pressed={hand && running}
+            onClick={() => void raiseHand(!hand)}
+            disabled={!canInterject}
+            title={
+              hand
+                ? 'Lower your hand: the meeting carries on'
+                : 'Stop the voices and hold the meeting so you can speak'
+            }
+          >
+            <span className="tool-icon">
+              <Icon name="hand" />
+            </span>
+            <span>{hand && running ? 'Lower hand' : 'Raise hand'}</span>
+          </button>
           <button className="meeting-tool" onClick={addContext} disabled={!canInterject}>
             <span className="tool-icon">
               <Icon name="chat" />

@@ -50,6 +50,7 @@ let current: {
   finish: () => void
   refreshBoard: () => void
   heard: Map<number, () => void> // turn → resolves when the renderer has played its answer
+  raise: (on: boolean) => void
 } | null = null
 
 export function configure(dir: string): void {
@@ -79,6 +80,13 @@ export function pause(on: boolean): void {
   if (!current) return
   current.paused = on
   if (!on) current.wake?.()
+}
+
+// The human raises a hand: the meeting holds, and the seat preparing its turn stops and takes it
+// again after the human has spoken, so it hears them. Lowering the hand resumes.
+export function raiseHand(on: boolean): void {
+  if (!current || current.cancelled) throw new Error('There is no active meeting.')
+  current.raise(on)
 }
 
 export function stop(): void {
@@ -228,6 +236,60 @@ ${memberTurns.length} turns · ${s.converged ? 'full consensus' : 'dissent recor
 `
 }
 
+// Everything the table said and did, turn by turn: the record behind the decision document.
+export function fullTranscript(s: Session): string {
+  const { brief, labels } = s
+  const seat = (id: string): string => {
+    const m = brief.members.find((x) => x.id === id)
+    return m ? `${CLI_META[m.cli].name} · ${memberModel(m) || 'model not recorded'}` : ''
+  }
+  const seats = brief.members
+    .map(
+      (m) =>
+        `| ${labels[m.id]} | ${PERSONAS[m.persona].label.replace('The ', '')} | ${CLI_META[m.cli].name} | ${memberModel(m) || 'Not recorded'}${m.id === brief.chairId ? ' · chair' : ''} |`
+    )
+    .join('\n')
+  const step = (t: TraceStep): string =>
+    t.kind === 'tool'
+      ? `- 🔧 \`${t.name}\`${t.detail ? ` ${t.detail.replace(/\s+/g, ' ')}` : ''}`
+      : t.text
+        ? `- 💭 ${t.text.replace(/\s+/g, ' ')}`
+        : `- 💭 thought privately${t.tokens ? ` (~${t.tokens} tokens)` : ''}`
+  const turns = s.turns
+    .map((t) => {
+      const who = t.speaker === HUMAN ? 'Host' : `${t.label} (${seat(t.speaker)})`
+      const parts = [`## Turn ${t.n} · ${who}`]
+      if (t.trace?.length) parts.push(`### Trace\n${t.trace.map(step).join('\n')}`)
+      parts.push(`### Message\n${t.text || '_(empty)_'}`)
+      if (t.vote) parts.push(`### Vote\n\`\`\`json\n${JSON.stringify(t.vote, null, 2)}\n\`\`\``)
+      if (t.error) parts.push(`**Error:** ${t.error}`)
+      if (t.costUsd) parts.push(`_reported cost $${t.costUsd.toFixed(4)}_`)
+      return parts.join('\n\n')
+    })
+    .join('\n\n---\n\n')
+  const usage = Object.entries(s.usage ?? {})
+    .map(
+      ([id, u]) =>
+        `| ${labels[id] ?? id} | ${u.input} | ${u.cached} | ${u.output} | ${u.costUsd != null ? `$${u.costUsd.toFixed(4)}${u.estimated ? ' (est.)' : ''}` : '—'} |`
+    )
+    .join('\n')
+  return `# Transcript
+
+**Question:** ${brief.task}
+
+${new Date(s.createdAt).toLocaleString()} · ${brief.maxTurns} turn budget · session ${s.id}${brief.attachments?.length ? `\n\n**Attachments:** ${brief.attachments.map((a) => basename(a)).join(', ')}` : ''}
+
+## Seats
+| Label | Lens | CLI | Model |
+|---|---|---|---|
+${seats}
+
+---
+
+${turns}
+${usage ? `\n---\n\n## Usage\n| Seat | Input | Cached | Output | Cost |\n|---|---|---|---|---|\n${usage}\n` : ''}`
+}
+
 export function phaseOf(n: number, members: number, budget: number): Phase {
   if (n <= members) return 'open'
   if (n > budget - members) return 'decide'
@@ -255,7 +317,8 @@ export function runDebate(
     host: () => {},
     finish: () => {},
     refreshBoard: () => {},
-    heard: new Map()
+    heard: new Map(),
+    raise: () => {}
   }
   current = me
   const labels = makeLabels(brief.members)
@@ -314,6 +377,17 @@ export function runDebate(
   )
   let rotation = Math.max(0, first - 1 - requestedTurns.size)
   let chairStarted = false
+  let preparing: Member | undefined // the member whose turn is running
+  let yielded: Member | undefined // stopped by a raised hand; it speaks again next
+  const cutOff = (x: Member): boolean => yielded === x // set from the IPC handler, outside this flow
+  me.raise = (on) => {
+    me.paused = on
+    if (!on) return me.wake?.()
+    if (preparing && !chairStarted) {
+      yielded = preparing
+      killRun(`${id}:${preparing.id}`)
+    }
+  }
   let live: { n: number; label: string; text: string } | undefined
   const writer = brief.board ?? { cli: chairMember.cli, model: chairMember.model }
   let writerModel = writer.model ?? (brief.board ? undefined : chairMember.resolvedModel)
@@ -491,7 +565,9 @@ export function runDebate(
           (message) => message.status === 'queued' && message.kind === 'ask'
         )
         const requested = members.find((member) => member.id === asked?.targetId)
-        const m = requested ?? members[rotation++ % N]
+        // a member cut off by the raised hand goes again, unless the human asked someone else
+        const m = requested ?? yielded ?? members[rotation++ % N]
+        yielded = undefined
         const phase = transcript.some((t) => t.speaker === m.id)
           ? phaseOf(n, N, brief.maxTurns)
           : 'open'
@@ -500,7 +576,9 @@ export function runDebate(
         let sampled = 0
         // no CLI session (resumed, or the CLI never gave one) = no memory: show everything
         const since = cliSessions[m.id] ? transcript.slice(seen[m.id] ?? 0) : transcript
+        const seenBefore = seen[m.id]
         seen[m.id] = transcript.length
+        preparing = m
         emit({ sessionId: id, type: 'turn-start', memberId: m.id, turn: n, phase })
         const voice = voiceOf(m)
         // only the opening turn needs covering: later seats think while the previous one talks
@@ -569,10 +647,21 @@ export function runDebate(
           if (voice) sayAnswer(m, n, voice, r.text)
         } catch (e) {
           if (me.cancelled) throw e
+          if (cutOff(m)) {
+            // not an error: the human took the floor. Same turn number, same member, after them.
+            preparing = undefined
+            seen[m.id] = seenBefore
+            live = undefined
+            emit({ sessionId: id, type: 'turn-cancelled', memberId: m.id, turn: n })
+            n--
+            continue
+          }
           const message = e instanceof Error ? e.message : String(e)
           lastError[m.id] = message
           emit({ sessionId: id, type: 'turn-error', memberId: m.id, turn: n, message })
         }
+        preparing = undefined
+        if (cutOff(m)) yielded = undefined // it finished before the hand went up
         live = undefined
         updateBoard(true)
         save(session)
@@ -642,6 +731,7 @@ export function runDebate(
         `${slug(brief.task)}-${new Date().toISOString().slice(0, 16).replace(/[T:]/g, '-')}.md`
       )
       writeFileSync(path, markdown)
+      writeFileSync(path.replace(/\.md$/, '.transcript.md'), fullTranscript(session))
       session.consortium = { markdown, path }
       session.status = 'done'
       save(session)

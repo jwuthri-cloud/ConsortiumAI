@@ -459,6 +459,9 @@ export const mockApi: Api = {
     const s = DEMO.find((x) => x.id === id)
     if (s) void mockApi.start(s.brief, id) // ponytail: replays the script from turn 1
   },
+  async raiseHand(on) {
+    await mockApi.pause(on) // ponytail: the demo's scripted turn finishes instead of being redone
+  },
   async pause(on) {
     if (!activeRun) return
     activeRun.paused = on

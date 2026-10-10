@@ -69,8 +69,21 @@ function wav(pcm: Uint8Array): Blob {
 
 const ack = (e: VoiceEvent): void => void window.api?.spoken(e.sessionId, e.turn).catch(() => {})
 
+// A raised hand cuts the room off: everything queued or arriving is dropped (and acked, so the engine
+// doesn't wait for it) until the next turn starts.
+let floor = 0 // clips of turns below this are dropped
+export function cut(): void {
+  floor = Infinity
+  for (const c of [...queue.map((q) => q.e), ...(playing ? [playing.clip.e] : [])])
+    if (c.last) ack(c)
+  stop()
+}
+export function turnStarted(turn: number): void {
+  if (floor === Infinity) floor = turn
+}
+
 export function play(e: VoiceEvent, audible = true): void {
-  if (muted || !audible) {
+  if (muted || !audible || e.turn < floor) {
     if (e.last) ack(e) // a muted room runs at text pace
     return
   }
