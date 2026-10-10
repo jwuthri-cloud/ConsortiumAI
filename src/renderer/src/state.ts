@@ -45,6 +45,7 @@ export type State = {
   revealed: boolean // the consortium screen has been shown once; the chamber no longer auto-advances
   error?: string
   usage: Record<string, Usage> // member id, 'whiteboard' or 'chair'
+  voiceError?: string // the last read-aloud failure (bad key, no credits…); text carries on
 }
 
 export type Action =
@@ -170,6 +171,15 @@ export function reducer(s: State, a: Action): State {
             }
           }
         : s
+    case 'trace': {
+      const turns = s.turns.slice()
+      const i = turns.findIndex(
+        (t) => t.status === 'running' && t.speaker === a.memberId && t.n === a.turn
+      )
+      if (i < 0) return s
+      turns[i] = { ...turns[i], trace: [...(turns[i].trace ?? []), a.step] }
+      return { ...s, turns }
+    }
     case 'activity':
       if (!s.activity || a.memberId !== s.speaking || a.turn !== s.activity.turn) return s
       return { ...s, activity: { ...s.activity, kind: a.kind, updatedAt: Date.now() } }
@@ -262,6 +272,8 @@ export function reducer(s: State, a: Action): State {
       return { ...s, stage: 'failed', error: a.message, speaking: undefined, activity: undefined }
     case 'usage':
       return { ...s, usage: a.usage }
+    case 'voice-error':
+      return { ...s, voiceError: a.message }
   }
   return s
 }

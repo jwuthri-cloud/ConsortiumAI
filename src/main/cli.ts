@@ -1,4 +1,5 @@
 import { streamActivity } from './activity'
+import { tidy, traceParser } from './trace'
 import { promisify } from 'node:util'
 import { streamModel, codexSessionModel, codexThreadUsage } from './modelMetadata'
 import { minus, priced, readUsage, type Usage } from '../shared/usage'
@@ -8,7 +9,7 @@ import { createInterface } from 'node:readline'
 import { tmpdir, homedir } from 'node:os'
 import { mkdirSync, accessSync, readdirSync, readFileSync, constants } from 'node:fs'
 import { join } from 'node:path'
-import type { ActivityKind, Cli } from '../shared/types'
+import type { ActivityKind, ApiProvider, Cli, TraceStep } from '../shared/types'
 
 // Think-only runs (no project attached) get an empty directory, so a CLI that still has read tools finds nothing to read.
 function emptyDir(): string {
@@ -44,7 +45,7 @@ type Ev =
 // One entry per CLI: how to build the argv and how to read one JSONL line.
 // No project attached (cwd undefined) = think-only, all tools off. Project attached = read-only tools.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const ADAPTERS: Record<Cli, { args(a: RunArgs): string[]; parse(l: any): Ev }> = {
+const ADAPTERS: Record<Spawned, { args(a: RunArgs): string[]; parse(l: any): Ev }> = {
   claude: {
     args: ({ prompt, model, cwd, dirs, resume }) => [
       '-p',
@@ -74,8 +75,11 @@ const ADAPTERS: Record<Cli, { args(a: RunArgs): string[]; parse(l: any): Ev }> =
     }
   },
   codex: {
-    args: ({ prompt, model, cwd, resume }) =>
-      resume
+    // the reasoning summary feeds the Trace panel (codex shares none by default)
+    args: ({ prompt, model, cwd, resume }) => [
+      '-c',
+      'model_reasoning_summary="detailed"',
+      ...(resume
         ? [
             'exec',
             'resume',
@@ -95,7 +99,8 @@ const ADAPTERS: Record<Cli, { args(a: RunArgs): string[]; parse(l: any): Ev }> =
             '-C',
             cwd ?? emptyDir(),
             ...(model ? ['-m', model] : [])
-          ],
+          ])
+    ],
     parse: (l) => {
       if (l.type === 'thread.started') return { type: 'session', sessionId: l.thread_id }
       if (l.type === 'item.completed' && l.item?.type === 'agent_message')
@@ -165,7 +170,8 @@ const ADAPTERS: Record<Cli, { args(a: RunArgs): string[]; parse(l: any): Ev }> =
   }
 }
 
-const CLIS: Cli[] = ['claude', 'codex', 'gemini', 'grok']
+type Spawned = Exclude<Cli, 'harness'> // the harness runs in-process (harness.ts)
+const CLIS: Spawned[] = ['claude', 'codex', 'gemini', 'grok']
 
 function isExec(p: string): boolean {
   try {
@@ -257,7 +263,7 @@ export function detectBins(): Partial<Record<Cli, string>> {
       /* bare names then; spawn reports ENOENT */
     }
   }
-  bins = found
+  bins = { ...found, harness: 'built-in' }
   return bins
 }
 
@@ -267,21 +273,27 @@ const ALIASES: Record<Cli, string[]> = {
   claude: ['opus', 'sonnet', 'fable', 'haiku'],
   codex: [],
   gemini: ['auto', 'pro', 'flash'],
-  grok: []
+  grok: [],
+  harness: []
 }
 const OR_PREFIX: Record<Cli, string> = {
   claude: 'anthropic/',
   codex: 'openai/',
   gemini: 'google/',
-  grok: 'x-ai/'
+  grok: 'x-ai/',
+  harness: ''
 }
 const NOT_CHAT =
   /image|audio|tts|realtime|transcribe|embedding|moderation|dall-e|banana|whisper|sora|veo|search-preview/
-let openrouter: Promise<string[]> | null = null
-function openrouterIds(): Promise<string[]> {
+type Listing = {
+  id: string
+  pricing?: { prompt?: string; completion?: string; input_cache_read?: string }
+}
+let openrouter: Promise<Listing[]> | null = null
+function openrouterCatalog(): Promise<Listing[]> {
   openrouter ??= fetch('https://openrouter.ai/api/v1/models', { signal: AbortSignal.timeout(6000) })
-    .then((r) => r.json() as Promise<{ data: { id: string }[] }>)
-    .then((j) => j.data.map((m) => m.id))
+    .then((r) => r.json() as Promise<{ data: Listing[] }>)
+    .then((j) => j.data)
     .catch(() => {
       openrouter = null
       return []
@@ -289,7 +301,48 @@ function openrouterIds(): Promise<string[]> {
   return openrouter
 }
 
+export type Price = { prompt: number; completion: number; cacheRead?: number } // $ per token
+const norm = (id: string): string => id.toLowerCase().replace(/\./g, '-')
+// List price of an OpenRouter id. Direct-provider ids match too: claude-opus-5-5 ≈ claude-opus-5.5.
+export async function openrouterPrice(id: string): Promise<Price | undefined> {
+  const p = (await openrouterCatalog()).find((m) => norm(m.id) === norm(id))?.pricing
+  const [prompt, completion, cacheRead] = [p?.prompt, p?.completion, p?.input_cache_read].map(
+    Number
+  )
+  // missing = NaN; variable-price routers (openrouter/auto) say -1
+  if (!(prompt >= 0 && completion >= 0)) return undefined
+  return { prompt, completion, cacheRead: cacheRead >= 0 ? cacheRead : undefined }
+}
+
+// An OpenRouter id as the CLI (or that vendor's own API) names it; undefined = not one of its models
+function asCli(cli: Spawned, id: string): string | undefined {
+  if (!id.startsWith(OR_PREFIX[cli]) || id.includes(':') || NOT_CHAT.test(id)) return undefined
+  let name = id.slice(OR_PREFIX[cli].length)
+  if (cli === 'claude') name = name.replace(/\./g, '-') // anthropic/claude-opus-5.5 → claude-opus-5-5
+  if (cli === 'codex' && !/gpt|codex|^o\d/.test(name)) return undefined
+  if (cli === 'gemini' && !name.startsWith('gemini')) return undefined
+  return name
+}
+// direct API keys use the same model ids as the vendor's CLI
+const VENDOR_CLI: [ApiProvider, Spawned][] = [
+  ['anthropic', 'claude'],
+  ['openai', 'codex'],
+  ['google', 'gemini'],
+  ['xai', 'grok']
+]
+
 export async function listModels(cli: Cli): Promise<string[]> {
+  if (cli === 'harness') {
+    const all = (await openrouterCatalog()).map((m) => m.id)
+    return [
+      ...all
+        .filter((id) => !id.includes(':') && !NOT_CHAT.test(id))
+        .map((id) => `openrouter:${id}`),
+      ...VENDOR_CLI.flatMap(([p, c]) =>
+        all.flatMap((id) => asCli(c, id) ?? []).map((n) => `${p}:${n}`)
+      )
+    ]
+  }
   const ids: string[] = [...ALIASES[cli]]
   // What the account can actually use beats any catalogue: grok lists it, codex caches it.
   if (cli === 'grok') {
@@ -320,14 +373,9 @@ export async function listModels(cli: Cli): Promise<string[]> {
       /* no cache yet: OpenRouter below, and "check" will tell */
     }
   }
-  const all = await openrouterIds()
-  for (const id of all) {
-    if (!id.startsWith(OR_PREFIX[cli]) || id.includes(':') || NOT_CHAT.test(id)) continue
-    let name = id.slice(OR_PREFIX[cli].length)
-    if (cli === 'claude') name = name.replace(/\./g, '-') // anthropic/claude-opus-5.5 → claude-opus-5-5
-    if (cli === 'codex' && !/gpt|codex|^o\d/.test(name)) continue
-    if (cli === 'gemini' && !name.startsWith('gemini')) continue
-    if (!ids.includes(name)) ids.push(name)
+  for (const { id } of await openrouterCatalog()) {
+    const name = asCli(cli, id)
+    if (name && !ids.includes(name)) ids.push(name)
   }
   return ids
 }
@@ -352,6 +400,13 @@ export function humanError(raw: string): string {
 }
 
 const procs = new Map<string, ChildProcess>()
+const aborts = new Map<string, AbortController>() // in-process runs (the harness)
+export function track(key: string, c: AbortController): () => void {
+  aborts.set(key, c)
+  return () => {
+    if (aborts.get(key) === c) aborts.delete(key)
+  }
+}
 
 function kill(child: ChildProcess): void {
   try {
@@ -364,11 +419,14 @@ function kill(child: ChildProcess): void {
 export function killRun(key: string): void {
   const child = procs.get(key)
   if (child) kill(child)
+  aborts.get(key)?.abort()
 }
 
 export function killAll(): void {
   for (const c of procs.values()) kill(c)
   procs.clear()
+  for (const c of aborts.values()) c.abort()
+  aborts.clear()
 }
 
 export async function runMember(
@@ -377,9 +435,13 @@ export async function runMember(
   onDelta: (t: string) => void,
   key: string,
   onModel: (model: string) => void = () => {},
-  onActivity: (kind: ActivityKind) => void = () => {}
+  onActivity: (kind: ActivityKind) => void = () => {},
+  onTrace: (step: TraceStep) => void = () => {}
 ): Promise<RunResult> {
+  if (cli === 'harness')
+    return (await import('./harness')).runHarness(a, onDelta, key, onModel, onActivity, onTrace)
   const bin = detectBins()[cli] ?? cli
+  const trace = traceParser(cli)
   let model: string | undefined
   let finished = false
   let lastActivity: ActivityKind | undefined
@@ -457,6 +519,7 @@ export async function runMember(
         const raw = JSON.parse(line)
         reportModel(streamModel(cli, raw))
         reportActivity(streamActivity(cli, raw))
+        for (const step of trace(raw)) onTrace(tidy(step, [a.cwd, ...(a.dirs ?? [])]))
         ev = ADAPTERS[cli].parse(raw)
       } catch {
         continue
@@ -507,18 +570,20 @@ export async function runMember(
 }
 
 export async function checkCli(
-  cli: Cli
+  cli: Cli,
+  model?: string
 ): Promise<{ ok: boolean; message: string; model?: string }> {
-  const t = setTimeout(() => {
-    const c = procs.get(`check:${cli}`)
-    if (c) kill(c)
-  }, 120_000)
+  const key = `check:${cli}:${model ?? ''}`
+  const t = setTimeout(() => killRun(key), 120_000)
   try {
     const r = await runMember(
       cli,
-      { prompt: 'Reply with the single word OK and nothing else.' },
+      {
+        prompt: 'Reply with the single word OK and nothing else.',
+        model: model?.trim() || undefined
+      },
       () => {},
-      `check:${cli}`
+      key
     )
     return { ok: true, message: r.text.slice(0, 80), model: r.model }
   } catch (e) {

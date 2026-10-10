@@ -1,11 +1,12 @@
 import { contextBridge, ipcRenderer, webUtils, type IpcRendererEvent } from 'electron'
-import type { Api, Brief, Cli, DebateEvent } from '../shared/types'
+import type { Api, ApiProvider, Brief, Cli, DebateEvent } from '../shared/types'
 
 const api: Api = {
   start: (brief: Brief, sessionId: string) => ipcRenderer.invoke('debate:start', brief, sessionId),
   stop: () => ipcRenderer.invoke('debate:stop'),
   resume: (sessionId: string) => ipcRenderer.invoke('debate:resume', sessionId),
   pause: (on: boolean) => ipcRenderer.invoke('debate:pause', on),
+  spoken: (id: string, turn: number) => ipcRenderer.invoke('debate:spoken', id, turn),
   host: (input) => ipcRenderer.invoke('debate:host', input),
   conclude: () => ipcRenderer.invoke('debate:conclude'),
   refreshBoard: () => ipcRenderer.invoke('debate:refreshBoard'),
@@ -17,8 +18,10 @@ const api: Api = {
   transcribe: (path: string) => ipcRenderer.invoke('stt:transcribe', path),
   reveal: (path: string) => ipcRenderer.invoke('shell:reveal', path),
   detect: () => ipcRenderer.invoke('cli:detect'),
-  check: (cli: Cli) => ipcRenderer.invoke('cli:check', cli),
+  check: (cli: Cli, model?: string) => ipcRenderer.invoke('cli:check', cli, model),
   models: (cli: Cli) => ipcRenderer.invoke('cli:models', cli),
+  keys: () => ipcRenderer.invoke('keys:list'),
+  setKey: (p: ApiProvider, key: string) => ipcRenderer.invoke('keys:set', p, key),
   listSessions: () => ipcRenderer.invoke('sessions:list'),
   loadSession: (id: string) => ipcRenderer.invoke('sessions:load', id),
   deleteSession: (id: string) => ipcRenderer.invoke('sessions:delete', id),

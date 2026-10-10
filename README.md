@@ -2,7 +2,7 @@
 
 One question. Several AI members that disagree on purpose — each one a coding-agent CLI you already pay for (Claude Code, Codex, Gemini CLI, Grok Build). They sit at a table and talk it through in short turns — opening statements, then real back-and-forth, then a forced convergence — and a chair writes the **consortium**: one decision document with the rationale, a plan, and the dissent kept in.
 
-Local-first desktop app (Electron). No API keys, no accounts, no server: the app spawns the CLIs that are already signed in on your machine.
+Local-first desktop app (Electron). No accounts, no server: the app spawns the CLIs that are already signed in on your machine. An optional fifth seat, the **Harness**, runs on an API key instead.
 
 ## Setup
 
@@ -35,6 +35,7 @@ If an already-running development window still shows an older interface, finish 
 2. **Chamber** — a meeting room with real-time 3D agent mascots. Provider colors and clothing identify Anthropic, OpenAI, Google, or xAI; each cap displays the seat’s role and the suit badge shows the actual model, including automatically selected CLI defaults, without thinking or context-budget annotations. Drag a character or use arrow keys to rotate it; double-click or press Home to reset. Use gallery view or spotlight a participant with its expand button. Speaker view follows the active member unless pinned. Conversation and Decision tabs hold the live transcript and clerk’s notes. While a seat prepares, the room shows connection, preparation, reading/searching, tool use, and response states from CLI events, plus elapsed time and the next seat. Raw reasoning and tool logs stay out of these status indicators. A quiet agent is labelled honestly when no update arrives. Add context to join the next turn, or end the session. Choose “Read the decision” when the chair finishes.
 
    The mascots are procedural Three.js meshes rendered locally, with blinking, idle motion, and speaking gestures. They do not use image-generated portraits or remote assets. Reduced-motion settings suppress animation; offscreen/hidden views skip rendering. A text fallback appears when WebGL is unavailable.
+
 3. **Consortium** — the chair's document, with the agreement matrix and the panel. Saved as markdown to `<project>/consortium/<question>-<date>.md` (or the app's data folder when no project is attached).
 
 Members only ever see each other's persona ("The Skeptic"), never which model sits behind a seat. The turn budget drives the phases: the first cycle is openings, then free debate until 60% of the budget, then _converge_ (only the open points, concede where persuaded, no new topics), and the last cycle is final statements. Every turn ends with a small vote block (position, confidence, who it still disagrees with); a full cycle with no disagreements left ends the conversation early. Each member keeps its own CLI session across turns, so it remembers everything it has heard and is only sent the new turns.
@@ -43,7 +44,7 @@ Setup, meeting history, the live room, and the decision document share the charc
 
 Model names come from CLI response metadata, the matching Codex rollout, or Grok’s default-model catalogue. They are saved with each seat; older sessions without recorded model metadata display “Model not recorded.” “Check connections” also resolves the current default into the setup field.
 
-Model-metadata and saved-state tests: `npx tsx --tsconfig tsconfig.web.json --test scripts/model-metadata.test.ts scripts/activity.test.ts`. Reopened sessions left running by an app restart display as stopped unless their engine is still active.
+Model-metadata, saved-state and harness tests: `npx tsx --tsconfig tsconfig.web.json --test scripts/*.test.ts`. Reopened sessions left running by an app restart display as stopped unless their engine is still active.
 
 ## How it talks to the CLIs
 
@@ -78,13 +79,38 @@ Open the renderer at the Vite URL in a normal browser (no Electron) and it runs 
 npm run build:mac
 ```
 
+### The Harness seat
+
+Our own member: a [Deep Agents](https://docs.langchain.com/oss/javascript/deepagents/overview) agent (planning, read-only file tools, subagents) that runs inside the app on an API key. Pick it under **Connection**, then a provider and a model. Its tools are `ls`, `read_file`, `glob` and `grep` on the attached project and files, plus planning (`write_todos`) and subagents (`task`). It has no shell and cannot write.
+
+| Provider   | Model examples                                   | Key                  |
+| ---------- | ------------------------------------------------ | -------------------- |
+| OpenRouter | `z-ai/glm-5.3`, `anthropic/claude-opus-5.5`, any | `OPENROUTER_API_KEY` |
+| OpenAI     | `gpt-6-sol`                                      | `OPENAI_API_KEY`     |
+| Anthropic  | `claude-opus-5-5`                                | `ANTHROPIC_API_KEY`  |
+| Google     | `gemini-3.8-flash`                               | `GEMINI_API_KEY`     |
+| xAI        | `grok-4.7`                                       | `XAI_API_KEY`        |
+
+Add the key under **Settings** (top right of the lobby), or from the seat's **Add key** link: it is encrypted with the macOS keychain into the app's data folder and only ever sent to that provider. The environment variable works too. Cost is the catalogue list price from OpenRouter, so it shows as ≈. The seat only reads the attached project and files; each seat's memory lives in `harness/<thread>.json` in the app's data folder.
+
+### Voices
+
+Turn on **Read turns aloud** in the lobby and each seat speaks its final answer in its own ElevenLabs voice (`elevenlabs/eleven-v4-turbo` through OpenRouter's speech API, so it uses the OpenRouter key from **Settings** or `OPENROUTER_API_KEY`). Pick a voice per seat; two seats never share one. Only the answer is read: thinking, tool activity, the vote block, markdown and `[T3]` citations stay silent. The chair's decision is not read.
+
+OpenRouter returns a clip only once it is fully synthesized (no streaming), so the engine covers the gap two ways:
+
+- While the first seat of a meeting thinks, it plays a pre-recorded line in its voice ("Let me look into it, give me a few seconds."). Later seats need none: they think while the previous one talks. Ten lines per voice are bundled in `resources/voices/`. Regenerate them after changing `FILLERS` in `src/shared/voices.ts`: `npx tsx scripts/voices.ts` (needs `OPENROUTER_API_KEY`; existing files are kept).
+- The answer is synthesized in sentence-sized pieces, two at a time, so the voice starts about two seconds after the text is complete and the rest is ready before it is needed.
+
+The next seat thinks while the previous one is still talking, and the audio never falls more than one turn behind the text. The room highlights whoever is audibly talking; the seat already writing its next answer shows its working state. **Speed** cycles 1×, 1.25×, 1.5× and 2× without changing the voice's pitch (ElevenLabs v4 has no speed setting, so it is playback speed). **Mute** silences playback and lets the meeting run at text pace. Cost is the ElevenLabs list price per character, about $0.02 per thousand characters through OpenRouter. If the key is missing or a request fails, the room says "Voice failed" and the meeting carries on in text. Engine check with voices: `SMOKE_VOICES=1 npx tsx scripts/smoke.ts claude,codex 4`.
+
 Unsigned, unnotarized. When launched from Finder the app asks a login shell for the CLI paths, so nvm / `~/.local/bin` / `~/.grok/bin` installs are found.
 
 ## Notes
 
 - Anthropic's terms allow an individual to use the unmodified `claude` binary with their own subscription; shipping this to other people means each of them signs in to the CLIs themselves — the app must never collect or route anyone's credentials.
 - Gemini CLI refuses headless runs in untrusted folders, so the adapter passes `--skip-trust`; the app only ever runs it in the attached project or an empty scratch directory.
-- Not yet: API-key / OpenRouter members, members addressing a specific member next (turns are round-robin), packaging/signing.
+- Not yet: members addressing a specific member next (turns are round-robin), packaging/signing.
 
 ### Live whiteboard and host controls
 

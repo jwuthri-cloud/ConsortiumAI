@@ -19,16 +19,20 @@ import {
   CLI_META,
   HUMAN,
   type Brief,
+  type Member,
   type DebateEvent,
   type Phase,
   type Session,
   type SessionSummary,
+  type TraceStep,
   type Turn,
   type Vote
 } from '../shared/types'
 import { PERSONAS, makeLabels } from '../shared/personas'
-import { extractVote, stripVote } from '../shared/vote'
+import { extractVote, sameLabel, stance, stripVote } from '../shared/vote'
 import { runMember, killAll, killRun } from './cli'
+import { getKey } from './keys'
+import { filler, readAloud } from './voice'
 import * as P from './prompts'
 import { sources } from '../shared/cite'
 
@@ -45,6 +49,7 @@ let current: {
   host: (input: HostInput) => void
   finish: () => void
   refreshBoard: () => void
+  heard: Map<number, () => void> // turn → resolves when the renderer has played its answer
 } | null = null
 
 export function configure(dir: string): void {
@@ -80,7 +85,12 @@ export function stop(): void {
   if (!current) return
   current.cancelled = true
   current.wake?.()
+  for (const done of current.heard.values()) done()
   killAll()
+}
+
+export function spoken(sessionId: string, turn: number): void {
+  if (current?.id === sessionId) current.heard.get(turn)?.()
 }
 
 function sessionStatus(s: Session): Session['status'] {
@@ -175,18 +185,25 @@ export function latestVotes(turns: Turn[]): Record<string, Vote | null> {
 function appendix(s: Session, votes: Record<string, Vote | null>): string {
   const { brief, labels } = s
   const ids = brief.members.map((m) => m.id)
-  const cell = (a: string, b: string): string => {
-    if (a === b) return '—'
+  // one plain line per member: a grid made one-way backing look like a bug
+  const line = (a: string): string => {
     const v = votes[a]
-    if (!v) return '·'
-    if (v.disagreements.some((d) => d.with === labels[b])) return '✗'
-    if (v.agrees_with.includes(labels[b])) return '✓'
-    return '·'
+    if (!v) return `- **${labels[a]}** left no final vote.`
+    const others = ids.filter((b) => b !== a)
+    const backs = others.filter((b) => stance(v, labels[b]) === 'agree').map((b) => labels[b])
+    const against = others
+      .filter((b) => stance(v, labels[b]) === 'disagree')
+      .map((b) => {
+        const on = v.disagreements.find((d) => sameLabel(d.with, labels[b]))?.on
+        return on ? `${labels[b]} (${on})` : labels[b]
+      })
+    const said = [
+      backs.length && `backs ${backs.join(', ')}`,
+      against.length && `disagrees with ${against.join(', ')}`
+    ].filter(Boolean)
+    return `- **${labels[a]}** ${said.length ? said.join('; ') : 'named no one'}.`
   }
-  const header = `| | ${ids.map((id) => labels[id]).join(' | ')} |\n|---|${ids.map(() => '---').join('|')}|`
-  const rows = ids
-    .map((a) => `| ${labels[a]} | ${ids.map((b) => cell(a, b)).join(' | ')} |`)
-    .join('\n')
+  const rows = ids.map(line).join('\n')
   const panel = brief.members
     .map(
       (m) =>
@@ -197,10 +214,9 @@ function appendix(s: Session, votes: Record<string, Vote | null>): string {
   const cost = memberTurns.reduce((acc, t) => acc + (t.costUsd ?? 0), 0)
   return `---
 
-## Agreement matrix
-Row agrees (✓) or disagrees (✗) with column, from each member's final vote.
+## Final votes
+What each member said about the others in its last vote. Backing is one-way: a member can back another that never named it back.
 
-${header}
 ${rows}
 
 ## Panel
@@ -238,7 +254,8 @@ export function runDebate(
     concluding: false,
     host: () => {},
     finish: () => {},
-    refreshBoard: () => {}
+    refreshBoard: () => {},
+    heard: new Map()
   }
   current = me
   const labels = makeLabels(brief.members)
@@ -402,6 +419,61 @@ export function runDebate(
     save(session)
   }
 
+  // Voices: the next member thinks while the previous one is still talking, and audio never falls more
+  // than one turn behind (the loop waits for the turn before last to finish playing).
+  let audio: Promise<unknown> = Promise.resolve() // fillers and answers reach the player in turn order
+  const played: Promise<void>[] = []
+  const voiceOf = (m: Member): string | undefined =>
+    brief.voices && m.voice && getKey('openrouter') ? m.voice : undefined
+  const voiceError = (e: unknown): void => {
+    if (!me.cancelled)
+      emit({
+        sessionId: id,
+        type: 'voice-error',
+        message: e instanceof Error ? e.message : String(e)
+      })
+  }
+  const sayFiller = (m: Member, n: number, voice: string): void => {
+    audio = audio.then(() => {
+      const data = filler(voice)
+      if (data)
+        emit({
+          sessionId: id,
+          type: 'voice',
+          memberId: m.id,
+          turn: n,
+          format: 'mp3',
+          data,
+          last: false
+        })
+    })
+  }
+  const sayAnswer = (m: Member, n: number, voice: string, text: string): void => {
+    const sent = audio.then(() =>
+      readAloud(voice, text, `${id}:voice`, (data, last) =>
+        emit({ sessionId: id, type: 'voice', memberId: m.id, turn: n, format: 'pcm', data, last })
+      )
+    )
+    audio = sent.catch(voiceError)
+    played.push(
+      sent.then(
+        (bytes) =>
+          new Promise<void>((res) => {
+            if (!bytes) return res()
+            // the renderer acks; the timer covers a closed window. 48,000 bytes = 1 s of audio
+            const t = setTimeout(done, (bytes / 48_000) * 1000 + 15_000)
+            function done(): void {
+              clearTimeout(t)
+              me.heard.delete(n)
+              res()
+            }
+            me.heard.set(n, done)
+          }),
+        () => undefined
+      )
+    )
+  }
+
   const hold = async (): Promise<void> => {
     while (me.paused && !me.cancelled) await new Promise<void>((r) => (me.wake = r))
     if (me.cancelled) throw new Error('stopped')
@@ -411,6 +483,8 @@ export function runDebate(
   ;(async () => {
     try {
       for (let n = first; n <= brief.maxTurns; n++) {
+        await hold()
+        await played.at(-2)
         await hold()
         if (me.concluding) break
         const asked = hostMessages.find(
@@ -428,6 +502,9 @@ export function runDebate(
         const since = cliSessions[m.id] ? transcript.slice(seen[m.id] ?? 0) : transcript
         seen[m.id] = transcript.length
         emit({ sessionId: id, type: 'turn-start', memberId: m.id, turn: n, phase })
+        const voice = voiceOf(m)
+        // only the opening turn needs covering: later seats think while the previous one talks
+        if (voice && n === first) sayFiller(m, n, voice)
         const basePrompt =
           phase === 'open'
             ? P.opening(brief, m, labels, since)
@@ -439,6 +516,7 @@ export function runDebate(
           (session.focus
             ? `\n\nThe host's current focus: ${session.focus}\nPrioritize this question and keep your contribution relevant to it.`
             : '')
+        const trace: TraceStep[] = []
         try {
           const r = await runner(
             m.cli,
@@ -466,7 +544,13 @@ export function runDebate(
               save(session)
               emit({ sessionId: id, type: 'member-model', memberId: m.id, model })
             },
-            (kind) => emit({ sessionId: id, type: 'activity', memberId: m.id, turn: n, kind })
+            (kind) => emit({ sessionId: id, type: 'activity', memberId: m.id, turn: n, kind }),
+            // the human's Trace panel: tool calls and reasoning, never shown to the other members
+            (step) => {
+              if (trace.length >= 200) return // ponytail: a runaway turn's tail isn't worth the session file
+              trace.push(step)
+              emit({ sessionId: id, type: 'trace', memberId: m.id, turn: n, step })
+            }
           )
           cliSessions[m.id] = r.sessionId ?? cliSessions[m.id]
           const t: Turn = {
@@ -475,12 +559,14 @@ export function runDebate(
             label: labels[m.id],
             text: stripVote(r.text),
             vote: extractVote(r.text),
-            costUsd: r.costUsd
+            costUsd: r.costUsd,
+            trace: trace.length ? trace : undefined
           }
           transcript.push(t)
           seen[m.id] = transcript.length
           lastError[m.id] = undefined
           emit({ sessionId: id, type: 'turn-done', turn: t })
+          if (voice) sayAnswer(m, n, voice, r.text)
         } catch (e) {
           if (me.cancelled) throw e
           const message = e instanceof Error ? e.message : String(e)

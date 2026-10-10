@@ -6,13 +6,14 @@ import { CLI_META, HUMAN } from '@shared/types'
 import { PERSONAS } from '@shared/personas'
 import { CITE, spoken, stripCites } from '@shared/cite'
 import { latestVotes, type State, type TurnState } from './state'
+import { sameLabel, stance } from '@shared/vote'
 import Markdown from './Markdown'
 
 type Props = { state: State; onHome: () => void; onChamber: (turn?: number) => void }
 
 export default function Consortium({ state: s, onHome, onChamber }: Props): React.JSX.Element {
   const { markdown, path } = s.consortium!
-  const doc = markdown.split('\n---\n\n## Agreement matrix')[0]
+  const doc = markdown.split(/\n---\n\n## (?:Agreement matrix|Final votes)/)[0]
   const members = s.brief!.members
   const votes = latestVotes(s.turns)
   const brief = s.brief!
@@ -93,13 +94,39 @@ export default function Consortium({ state: s, onHome, onChamber }: Props): Reac
   }
   const sourceCli = members.find((m) => m.id === source?.speaker)?.cli
 
-  const cell = (a: string, b: string): { mark: string; cls: string } => {
-    if (a === b) return { mark: '', cls: 'bg-surface-2' }
-    const v = votes[a]
-    if (!v) return { mark: '·', cls: 'text-ink-3' }
-    if (v.disagreements.some((d) => d.with === s.labels[b])) return { mark: '✗', cls: 'text-red' }
-    if (v.agrees_with.includes(s.labels[b])) return { mark: '✓', cls: 'text-gold' }
-    return { mark: '·', cls: 'text-ink-3' }
+  // one member's last vote, in words: who it backs, who it disagrees with, and on what
+  const said = (a: (typeof members)[number]): React.JSX.Element => {
+    const v = votes[a.id]
+    if (!v) return <span className="vote-line text-ink-3">Left no final vote.</span>
+    const others = members.filter((b) => b.id !== a.id)
+    const backs = others.filter((b) => stance(v, s.labels[b.id]) === 'agree')
+    const against = others.filter((b) => stance(v, s.labels[b.id]) === 'disagree')
+    if (!backs.length && !against.length)
+      return <span className="vote-line text-ink-3">Named no one.</span>
+    const who = (b: (typeof members)[number]): React.JSX.Element => (
+      <span key={b.id} className="vote-name">
+        <i style={{ background: CLI_META[b.cli].color }} />
+        {s.labels[b.id].replace('The ', '')}
+      </span>
+    )
+    return (
+      <>
+        {backs.length > 0 && (
+          <span className="vote-line">
+            <span className="text-gold">✓ Backs</span> {backs.map(who)}
+          </span>
+        )}
+        {against.map((b) => {
+          const on = v.disagreements.find((d) => sameLabel(d.with, s.labels[b.id]))?.on
+          return (
+            <span key={b.id} className="vote-line">
+              <span className="text-red">✗ Disagrees with</span> {who(b)}
+              {on && <span className="text-ink-3">on {on}</span>}
+            </span>
+          )
+        })}
+      </>
+    )
   }
 
   return (
@@ -185,42 +212,21 @@ export default function Consortium({ state: s, onHome, onChamber }: Props): Reac
 
         <aside className="decision-sidebar">
           <section>
-            <h3 className="text-[11px] uppercase tracking-[0.18em] text-ink-3 mb-3">Agreement</h3>
-            <div
-              className="grid gap-px"
-              style={{ gridTemplateColumns: `72px repeat(${members.length}, 1fr)` }}
-            >
-              <span />
-              {members.map((m) => (
-                <span key={m.id} className="flex justify-center">
-                  <span
-                    className="w-2.5 h-2.5 rounded-full"
-                    style={{ background: CLI_META[m.cli].color }}
-                    title={s.labels[m.id]}
-                  />
-                </span>
-              ))}
+            <h3 className="text-[11px] uppercase tracking-[0.18em] text-ink-3 mb-3">Final votes</h3>
+            <ul className="final-votes">
               {members.map((a) => (
-                <div key={a.id} className="contents">
-                  <span className="text-[11px] text-ink-2 truncate pr-1" title={s.labels[a.id]}>
-                    {s.labels[a.id].replace('The ', '')}
+                <li key={a.id}>
+                  <span className="vote-who">
+                    <i style={{ background: CLI_META[a.cli].color }} />
+                    {s.labels[a.id]}
                   </span>
-                  {members.map((b) => {
-                    const c = cell(a.id, b.id)
-                    return (
-                      <span
-                        key={b.id}
-                        className={`h-7 flex items-center justify-center text-[13px] ${c.cls}`}
-                      >
-                        {c.mark}
-                      </span>
-                    )
-                  })}
-                </div>
+                  {said(a)}
+                </li>
               ))}
-            </div>
-            <p className="text-[11px] text-ink-3 mt-2">
-              Row ✓ agrees / ✗ disagrees with column, from the final votes.
+            </ul>
+            <p className="text-[11px] text-ink-3 mt-3">
+              What each member said about the others in its last vote. Backing is one-way: a member
+              can back another that never named it back.
             </p>
           </section>
 

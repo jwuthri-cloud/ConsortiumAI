@@ -1,6 +1,8 @@
 // End-to-end engine check with real CLIs, no Electron:
 //   npx tsx scripts/smoke.ts [claude,codex] [maxTurns]   (SMOKE_PROJECT=/path to attach a project, SMOKE_TASK=... for the question)
-import { configure, runDebate } from '../src/main/debate'
+//   SMOKE_VOICES=1 reads turns aloud through OpenRouter (needs OPENROUTER_API_KEY); playback is simulated in real time.
+import { configure, runDebate, spoken } from '../src/main/debate'
+import { VOICES } from '../src/shared/voices'
 import type { Cli, DebateEvent, Member, PersonaId } from '../src/shared/types'
 
 const clis = (process.argv[2] ?? 'claude,codex').split(',') as Cli[]
@@ -10,8 +12,10 @@ const members: Member[] = clis.map((cli, i) => ({
   id: `m${i}`,
   cli,
   persona: personas[i % personas.length],
-  model: cli === 'claude' ? 'sonnet' : undefined
+  model: cli === 'claude' ? 'sonnet' : undefined,
+  voice: VOICES[i]
 }))
+let playEnd = 0 // when the simulated speaker finishes everything queued so far
 
 configure(process.env.SMOKE_DIR ?? '/tmp/consortium-smoke')
 const t0 = Date.now()
@@ -27,11 +31,21 @@ runDebate(
     projectPath: process.env.SMOKE_PROJECT,
     members,
     chairId: 'm0',
-    maxTurns
+    maxTurns,
+    voices: !!process.env.SMOKE_VOICES
   },
   (e: DebateEvent) => {
     if (e.type === 'delta') {
       deltas++
+      return
+    }
+    if (e.type === 'voice') {
+      const secs = e.format === 'pcm' ? e.data.length / 48_000 : e.data.length / 16_000 // mp3 at 128 kbps
+      playEnd = Math.max(Date.now(), playEnd) + secs * 1000
+      log(
+        `voice turn ${e.turn} ${e.memberId} ${e.format} ${secs.toFixed(1)}s${e.last ? ' (last)' : ''}`
+      )
+      if (e.last) setTimeout(() => spoken(e.sessionId, e.turn), playEnd - Date.now())
       return
     }
     if (e.type === 'turn-start') log(`turn ${e.turn} ${e.phase.padEnd(8)} ${e.memberId} starts`)

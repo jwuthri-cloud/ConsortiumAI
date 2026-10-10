@@ -9,6 +9,7 @@ import {
   type Member,
   type Phase,
   type Session,
+  type TraceStep,
   type Turn,
   type Vote
 } from '@shared/types'
@@ -22,7 +23,8 @@ const DEMO_MODELS = {
   claude: 'claude-opus-4-6',
   codex: 'gpt-6-astra',
   gemini: 'gemini-3.1-pro-preview',
-  grok: 'grok-4.7'
+  grok: 'grok-4.7',
+  harness: 'openrouter:z-ai/glm-5.2'
 }
 
 // Scripted conversation for previewing the renderer in a plain browser (no Electron, no CLIs).
@@ -67,6 +69,7 @@ const demo = (
     team?: Member[]
     usage?: Record<string, Usage>
     attachments?: string[]
+    votes?: Record<string, Pick<Vote, 'agrees_with' | 'disagreements'>> // each member's final vote
   } = {}
 ): Session => {
   const members = extra.team ?? TEAM
@@ -87,7 +90,9 @@ const demo = (
     turns: Array.from({ length: turns }, (_, i) => {
       const m = members[i % members.length]
       const text = [...OPENINGS, ...REPLIES][i % (OPENINGS.length + REPLIES.length)]
-      return { n: i + 1, speaker: m.id, label: labels[m.id], text, vote: null }
+      const v = i >= turns - members.length ? extra.votes?.[m.id] : undefined
+      const vote = v ? { position: text, confidence: 0.8, ...v } : null
+      return { n: i + 1, speaker: m.id, label: labels[m.id], text, vote }
     }),
     shape: extra.leaning
       ? { converging: [{ point: extra.leaning, supporters: [] }], open: [] }
@@ -118,6 +123,19 @@ const DEMO: Session[] = [
   ),
   demo('demo-2', 2, 'Should we ship a customer data export this quarter?', 'done', 22, {
     projectPath: '/Users/you/Repos/acme',
+    // members name each other loosely ("Strategist", "the strategist"); the matrix still reads them
+    votes: {
+      d1: {
+        agrees_with: ['The Engineer', 'The Researcher'],
+        disagreements: [{ with: 'The Skeptic', on: 'waiting for tickets first' }]
+      },
+      d2: { agrees_with: ['Strategist', 'Researcher'], disagreements: [] },
+      d3: { agrees_with: ['the strategist', 'The Engineer'], disagreements: [] },
+      d4: {
+        agrees_with: ['The Engineer'],
+        disagreements: [{ with: 'The Strategist', on: 'timing before the billing rework' }]
+      }
+    },
     usage: {
       d1: { input: 210_000, cached: 160_000, output: 9_800, costUsd: 1.12 },
       chair: { input: 41_000, cached: 0, output: 2_300, costUsd: 0.38 }
@@ -221,13 +239,33 @@ export const mockApi: Api = {
       })
       emit({ sessionId, type: 'turn-start', memberId: m.id, turn: n, phase })
       emit({ sessionId, type: 'activity', memberId: m.id, turn: n, kind: 'thinking' })
+      // what the Trace tab shows: a few illustrative steps per turn
+      const trace: TraceStep[] = []
+      const step = (s: TraceStep): void => {
+        trace.push(s)
+        emit({ sessionId, type: 'trace', memberId: m.id, turn: n, step: s })
+      }
+      step(
+        m.cli === 'claude'
+          ? { kind: 'thinking', tokens: 180 + n * 40 }
+          : {
+              kind: 'thinking',
+              text: 'Weighing the small CSV export against the billing rework: both touch the invoice tables, so order matters more than scope.'
+            }
+      )
       await sleep(900)
       if (run.stopped) return
       if (brief.projectPath) {
         emit({ sessionId, type: 'activity', memberId: m.id, turn: n, kind: 'searching' })
+        step({
+          kind: 'tool',
+          name: m.cli === 'codex' ? 'shell' : 'grep',
+          detail: m.cli === 'codex' ? "rg -n 'export' src/jobs" : '"export" in src/jobs'
+        })
         await sleep(1100)
         if (run.stopped) return
         emit({ sessionId, type: 'activity', memberId: m.id, turn: n, kind: 'reading' })
+        step({ kind: 'tool', name: 'read_file', detail: 'src/jobs/queue.ts:30-60' })
         await sleep(1100)
         if (run.stopped) return
         emit({ sessionId, type: 'activity', memberId: m.id, turn: n, kind: 'reviewing' })
@@ -241,7 +279,7 @@ export const mockApi: Api = {
         await sleep(30)
       }
       if (run.stopped) return
-      const t: Turn = { n, speaker: m.id, label: labels[m.id], text, vote, costUsd: 0.03 }
+      const t: Turn = { n, speaker: m.id, label: labels[m.id], text, vote, costUsd: 0.03, trace }
       emit({ sessionId, type: 'turn-done', turn: t })
       spend(m.id, m.cli, text.length)
       emit({ sessionId, type: 'board-status', status: 'updating' })
@@ -426,6 +464,7 @@ export const mockApi: Api = {
     activeRun.paused = on
     if (!on) activeRun.wake?.()
   },
+  spoken: () => Promise.resolve(), // the demo has no voices
   async interject(text) {
     await mockApi.host({ id: crypto.randomUUID(), kind: 'thought', text })
   },
@@ -471,15 +510,22 @@ export const mockApi: Api = {
       claude: '/usr/local/bin/claude',
       codex: '/usr/local/bin/codex',
       gemini: '/usr/local/bin/gemini',
-      grok: '/usr/local/bin/grok'
+      grok: '/usr/local/bin/grok',
+      harness: 'built-in'
     }
   },
-  async check(cli) {
+  async check(cli, model) {
     await sleep(900)
-    return { ok: true, message: 'OK', model: DEMO_MODELS[cli] }
+    return { ok: true, message: 'OK', model: model || DEMO_MODELS[cli] }
   },
   async models(cli) {
     return [DEMO_MODELS[cli]]
+  },
+  async keys() {
+    return { openrouter: 'saved', openai: 'env', anthropic: null, google: null, xai: null } as const
+  },
+  async setKey() {
+    await sleep(300)
   },
   async listSessions() {
     return DEMO.map(summarize)

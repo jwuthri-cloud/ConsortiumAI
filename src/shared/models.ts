@@ -5,6 +5,8 @@ export function modelName(value?: string): string | undefined {
   if (!value) return undefined
   const name = value
     .trim()
+    .replace(/^[a-z]+:/, '') // harness: "openrouter:anthropic/claude-opus-5.5"
+    .replace(/^[\w.-]+\//, '')
     .replace(/\s*\[[^\]]*\]/g, '')
     .replace(/\s*\((?:thinking|reasoning|effort|budget|context)[^)]*\)/gi, '')
     .replace(/\s+(?:[·|,]\s*)?(?:thinking|reasoning|effort|budget)\b.*$/i, '')

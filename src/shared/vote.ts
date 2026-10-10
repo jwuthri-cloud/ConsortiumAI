@@ -30,6 +30,26 @@ export function extractVote(text: string): Vote | null {
   }
 }
 
+// Members name each other loosely ("Strategist", "the strategist"): compare on the bare words.
+const bare = (s: string): string =>
+  s
+    .toLowerCase()
+    .replace(/^\s*the\s+/, '')
+    .replace(/[^a-z0-9]/g, '')
+
+export const sameLabel = (a: string, b: string): boolean => bare(a) === bare(b)
+
+// Where a member's vote stands on another member, by label; undefined = no vote, or not mentioned.
+export function stance(
+  v: Vote | null | undefined,
+  label: string
+): 'agree' | 'disagree' | undefined {
+  if (!v) return undefined
+  if (v.disagreements.some((d) => sameLabel(d.with, label))) return 'disagree'
+  if (v.agrees_with.some((x) => sameLabel(x, label))) return 'agree'
+  return undefined
+}
+
 // What other members (and the UI) read: the answer without its vote block.
 export function stripVote(text: string): string {
   const blocks = [...text.matchAll(FENCE)]

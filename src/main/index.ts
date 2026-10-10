@@ -2,13 +2,14 @@ import { app, shell, BrowserWindow, ipcMain, dialog } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
-import type { Brief, Cli, DebateEvent } from '../shared/types'
+import type { ApiProvider, Brief, Cli, DebateEvent } from '../shared/types'
 import * as debate from './debate'
 import { transcribe } from './whisper'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename } from 'node:path'
 import { detectBins, checkCli, killAll, listModels } from './cli'
+import { listKeys, setKey } from './keys'
 
 let win: BrowserWindow | null = null
 
@@ -62,6 +63,7 @@ app.whenReady().then(() => {
   ipcMain.handle('debate:stop', () => debate.stop())
   ipcMain.handle('debate:resume', (_, id: string) => debate.resume(id, send))
   ipcMain.handle('debate:pause', (_, on: boolean) => debate.pause(on))
+  ipcMain.handle('debate:spoken', (_, id: string, turn: number) => debate.spoken(id, turn))
   ipcMain.handle('debate:host', (_, input) => debate.host(input))
   ipcMain.handle('debate:conclude', () => debate.conclude())
   ipcMain.handle('debate:refreshBoard', () => debate.refreshBoard())
@@ -82,8 +84,10 @@ app.whenReady().then(() => {
   ipcMain.handle('stt:transcribe', (_, path: string) => transcribe(path))
   ipcMain.handle('shell:reveal', (_, path: string) => shell.showItemInFolder(path))
   ipcMain.handle('cli:detect', () => detectBins())
-  ipcMain.handle('cli:check', (_, cli: Cli) => checkCli(cli))
+  ipcMain.handle('cli:check', (_, cli: Cli, model?: string) => checkCli(cli, model))
   ipcMain.handle('cli:models', (_, cli: Cli) => listModels(cli))
+  ipcMain.handle('keys:list', () => listKeys())
+  ipcMain.handle('keys:set', (_, p: ApiProvider, key: string) => setKey(p, key))
   ipcMain.handle('sessions:list', () => debate.listSessions())
   ipcMain.handle('sessions:load', (_, id: string) => debate.loadSession(id))
   ipcMain.handle('sessions:delete', (_, id: string) => debate.deleteSession(id))

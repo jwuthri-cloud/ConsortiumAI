@@ -2,7 +2,7 @@ import { fmtTokens, fmtUsd, sumUsage, tokens, type Usage } from '@shared/usage'
 import type { State } from './state'
 
 const NOTE =
-  'API list-price equivalent. Your CLI subscriptions are not billed per token; this is what the same calls would cost on the API.'
+  'API list-price equivalent. Your CLI subscriptions are not billed per token; this is what the same calls would cost on the API. Harness seats do bill your API key.'
 
 // Usage arrives when a call finishes. Until then, count what is streaming at ~4 characters a token.
 // ponytail: rough for code and non-English text; it is replaced by the real count within the turn.

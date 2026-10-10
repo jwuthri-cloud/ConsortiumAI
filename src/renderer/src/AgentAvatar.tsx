@@ -1,4 +1,5 @@
 import { memo, useEffect, useRef } from 'react'
+import * as voice from './voice'
 import * as THREE from 'three'
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js'
 import type { Cli, PersonaId } from '@shared/types'
@@ -14,15 +15,18 @@ const HATS: Record<PersonaId, string> = {
 }
 
 export type Presence = 'idle' | 'listening' | 'reading' | 'responding' | 'failed'
-type Props = { cli: Cli; persona: PersonaId; model?: string; presence: Presence }
+// voiceId: the member whose audio drives this mascot's mouth (voices on)
+type Props = { cli: Cli; persona: PersonaId; model?: string; presence: Presence; voiceId?: string }
 
-function AgentAvatar({ cli, persona, model, presence }: Props): React.JSX.Element {
+function AgentAvatar({ cli, persona, model, presence, voiceId }: Props): React.JSX.Element {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const presenceRef = useRef(presence)
+  const voiceRef = useRef(voiceId)
   const provider = PROVIDERS[cli]
   useEffect(() => {
     presenceRef.current = presence
-  }, [presence])
+    voiceRef.current = voiceId
+  }, [presence, voiceId])
 
   useEffect(() => {
     const host = hostRef.current
@@ -262,12 +266,20 @@ function AgentAvatar({ cli, persona, model, presence }: Props): React.JSX.Elemen
       eyes.push(eye)
       box(0.12, 0.025, 0.02, 0.01, capMat, head, side * 0.23, -0.16, 0.457)
     }
+    // built around its own centre so it can open (scale) in place while the seat's voice plays
     const mouthCurve = new THREE.QuadraticBezierCurve3(
-      new THREE.Vector3(-0.11, -0.12, 0.466),
-      new THREE.Vector3(0, -0.23, 0.466),
-      new THREE.Vector3(0.11, -0.12, 0.466)
+      new THREE.Vector3(-0.11, 0.055, 0),
+      new THREE.Vector3(0, -0.055, 0),
+      new THREE.Vector3(0.11, 0.055, 0)
     )
-    mesh(new THREE.TubeGeometry(mouthCurve, 16, 0.013, 6, false), glow, head, 0, 0, 0)
+    const mouth = mesh(
+      new THREE.TubeGeometry(mouthCurve, 16, 0.013, 6, false),
+      glow,
+      head,
+      0,
+      -0.175,
+      0.466
+    )
 
     // A real cap: dome, band, curved visor, top button, and role patch.
     mesh(
@@ -327,6 +339,16 @@ function AgentAvatar({ cli, persona, model, presence }: Props): React.JSX.Elemen
       )
     } else if (cli === 'codex') {
       mesh(new THREE.TorusGeometry(0.07, 0.024, 8, 24), capMat, body, -0.37, 1.12, 0.35)
+    } else if (cli === 'harness') {
+      // a small hexagonal bolt: our own build
+      mesh(
+        new THREE.CylinderGeometry(0.085, 0.085, 0.03, 6),
+        capMat,
+        body,
+        -0.37,
+        1.12,
+        0.35
+      ).rotation.x = Math.PI / 2
     } else {
       for (const angle of [-0.65, 0.65])
         box(0.025, 0.19, 0.025, 0.008, shell, body, -0.37, 1.1, 0.35).rotation.z = angle
@@ -437,11 +459,16 @@ function AgentAvatar({ cli, persona, model, presence }: Props): React.JSX.Elemen
       const t = time / 1000
       const animated = !reducedMotion.matches
       const p = presenceRef.current
-      const talking = p === 'responding' && animated
+      // with voices, whoever is audible gestures; otherwise whoever is writing
+      const audible = voice.talking()
+      const talking = animated && (audible ? audible === voiceRef.current : p === 'responding')
       const reading = p === 'reading'
       const failed = p === 'failed'
       // Poses ease in, so a change of state reads as a gesture rather than a jump.
       const ease = (from: number, to: number): number => from + (to - from) * 0.12
+      const loud = voiceRef.current ? voice.level(voiceRef.current) : 0
+      mouth.scale.y += (1 + loud * 2.4 - mouth.scale.y) * 0.5 // fast: it follows syllables
+      mouth.scale.x += (1 - loud * 0.25 - mouth.scale.x) * 0.5
       rig.rotation.y += (yaw - rig.rotation.y) * 0.15
       rig.rotation.x += (pitch - rig.rotation.x) * 0.15
       body.position.y = animated && !failed ? Math.sin(t * 1.6) * 0.017 : ease(body.position.y, 0)

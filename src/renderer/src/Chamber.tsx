@@ -1,15 +1,17 @@
 import Whiteboard from './Whiteboard'
+import Trace from './Trace'
 import DecisionBoard from './DecisionBoard'
 import { ACTIVITY_LABELS } from '@shared/activity'
 import ActivityStatus from './ActivityStatus'
 import { memberModel } from '@shared/models'
 import Brand from './Brand'
-import { useEffect, useRef, useState, type CSSProperties } from 'react'
+import { useEffect, useRef, useState, useSyncExternalStore, type CSSProperties } from 'react'
 import { HUMAN, type PersonaId } from '@shared/types'
 import { PERSONAS } from '@shared/personas'
 import { lastTurnOf, latestVotes, type State } from './state'
 import Markdown from './Markdown'
 import AgentAvatar, { type Presence } from './AgentAvatar'
+import * as voice from './voice'
 import { PROVIDERS } from './avatarTheme'
 import { AgentUsage, UsageMeter } from './Usage'
 
@@ -35,6 +37,9 @@ type IconName =
   | 'expand'
   | 'pause'
   | 'play'
+  | 'sound'
+  | 'muted'
+  | 'trace'
 function Icon({ name, size = 18 }: { name: IconName; size?: number }): React.JSX.Element {
   const paths: Record<IconName, string> = {
     board: 'M3 4h18v14H3ZM8 22l4-4 4 4M7 8h4m-4 4h7',
@@ -52,7 +57,10 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }): React.JSX
     close: 'm6 6 12 12M6 18 18 6',
     expand: 'M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5',
     pause: 'M9 5v14M15 5v14',
-    play: 'M7 4v16l13-8Z'
+    play: 'M7 4v16l13-8Z',
+    sound: 'M4 9h4l5-4v14l-5-4H4ZM16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12',
+    muted: 'M4 9h4l5-4v14l-5-4H4ZM17 9l5 6m0-6-5 6',
+    trace: 'm4 17 6-5-6-5M12 19h8'
   }
   return (
     <svg
@@ -94,7 +102,7 @@ export default function Chamber({
   const brief = s.brief!
   const members = brief.members
   const [view, setView] = useState<'gallery' | 'speaker' | 'whiteboard'>('gallery')
-  const [panel, setPanel] = useState<'conversation' | 'decision' | null>(
+  const [panel, setPanel] = useState<'conversation' | 'decision' | 'trace' | null>(
     s.focusTurn ? 'conversation' : 'decision'
   )
   const [pinned, setPinned] = useState<string | null>(null)
@@ -104,6 +112,10 @@ export default function Chamber({
   const [sending, setSending] = useState(false)
   const [stopping, setStopping] = useState(false)
   const [pauseRequested, setPaused] = useState(false)
+  const [muted, setMuted] = useState(voice.isMuted)
+  const [rate, setRate] = useState(voice.getRate)
+  // with voices on, the room follows whoever is audible; the next seat may already be writing
+  const audible = useSyncExternalStore(voice.subscribe, voice.talking)
   const [stick, setStick] = useState(!s.focusTurn)
   const feedRef = useRef<HTMLDivElement | null>(null)
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
@@ -129,7 +141,10 @@ export default function Chamber({
                   ? 2
                   : 1
   const activeId =
-    s.speaking ?? s.turns.filter((t) => t.speaker !== HUMAN).at(-1)?.speaker ?? members[0]?.id
+    audible ??
+    s.speaking ??
+    s.turns.filter((t) => t.speaker !== HUMAN).at(-1)?.speaker ??
+    members[0]?.id
   const focusId = pinned ?? activeId
   const liveTurn = lastTurnOf(s.turns, activeId)
   const paused = running && pauseRequested
@@ -282,7 +297,7 @@ export default function Chamber({
       setStopping(false)
     }
   }
-  const togglePanel = (next: 'conversation' | 'decision'): void =>
+  const togglePanel = (next: 'conversation' | 'decision' | 'trace'): void =>
     setPanel(panel === next ? null : next)
 
   return (
@@ -375,13 +390,15 @@ export default function Chamber({
         >
           {members.map((m) => {
             const portrait = PORTRAITS[m.persona]
-            const speaking = s.speaking === m.id && running
+            const working = s.speaking === m.id && running
+            const aloud = audible === m.id
+            const speaking = audible ? aloud : working
             const last = lastTurnOf(s.turns, m.id)
             const vote = votes[m.id]
             const failed = last?.status === 'error'
             const presence: Presence = failed
               ? 'failed'
-              : speaking
+              : working
                 ? s.activity?.kind === 'responding'
                   ? 'responding'
                   : 'reading'
@@ -389,21 +406,23 @@ export default function Chamber({
                   ? 'listening'
                   : 'idle'
             const featured = view === 'speaker' && focusId === m.id
-            const stateText = speaking
-              ? s.activity
-                ? ACTIVITY_LABELS[s.activity.kind]
-                : chairWriting
-                  ? 'Writing'
-                  : 'Preparing'
-              : failed
-                ? 'Response failed'
-                : running
-                  ? 'Listening'
-                  : s.stage === 'done'
-                    ? 'Finished'
-                    : last?.status === 'running'
-                      ? 'Interrupted'
-                      : 'Stopped'
+            const stateText = aloud
+              ? 'Speaking'
+              : working
+                ? s.activity
+                  ? ACTIVITY_LABELS[s.activity.kind]
+                  : chairWriting
+                    ? 'Writing'
+                    : 'Preparing'
+                : failed
+                  ? 'Response failed'
+                  : running
+                    ? 'Listening'
+                    : s.stage === 'done'
+                      ? 'Finished'
+                      : last?.status === 'running'
+                        ? 'Interrupted'
+                        : 'Stopped'
             return (
               <article
                 key={m.id}
@@ -418,6 +437,7 @@ export default function Chamber({
                     persona={m.persona}
                     model={memberModel(m) ?? (running ? 'CONNECTING' : 'NOT RECORDED')}
                     presence={presence}
+                    voiceId={brief.voices && m.voice ? m.id : undefined}
                   />
                 </div>
                 <div className="tile-shade" />
@@ -426,11 +446,13 @@ export default function Chamber({
                     {portrait.role}
                     <small>3D · Drag to rotate</small>
                   </span>
-                  {speaking ? (
+                  {speaking || working ? (
                     <span className="tile-speaking">
                       <span
                         className={
-                          s.activity?.kind === 'responding' ? 'voice-bars' : 'working-dots'
+                          aloud || (!audible && s.activity?.kind === 'responding')
+                            ? 'voice-bars'
+                            : 'working-dots'
                         }
                       >
                         <i />
@@ -456,6 +478,7 @@ export default function Chamber({
                     </div>
                     <div className="tile-model" title={memberModel(m)}>
                       {memberModel(m) ?? (running ? 'Resolving model…' : 'Model not recorded')}
+                      {brief.voices && m.voice && ` · voice ${m.voice}`}
                     </div>
                     <AgentUsage s={s} id={m.id} />
                   </div>
@@ -532,11 +555,13 @@ export default function Chamber({
             </div>
             <div>
               <strong>
-                {s.speaking
-                  ? `${activeName}${chairWriting ? ' · chair' : ' has the floor'}`
-                  : running
-                    ? 'Around the table'
-                    : 'Meeting recap'}
+                {audible
+                  ? `${s.labels[audible]?.replace(/^The /, '')} is speaking`
+                  : s.speaking
+                    ? `${activeName}${chairWriting ? ' · chair' : ' has the floor'}`
+                    : running
+                      ? 'Around the table'
+                      : 'Meeting recap'}
               </strong>
               {s.activity && running ? (
                 <ActivityStatus
@@ -573,6 +598,10 @@ export default function Chamber({
               Decision
               {questions > 0 && <span title="Needs your input">{questions}</span>}
             </button>
+            <button role="tab" aria-selected={panel === 'trace'} onClick={() => setPanel('trace')}>
+              <Icon name="trace" size={15} />
+              Trace
+            </button>
             <button
               className="panel-close"
               onClick={() => setPanel(null)}
@@ -581,7 +610,9 @@ export default function Chamber({
               <Icon name="close" size={15} />
             </button>
           </div>
-          {panel === 'conversation' ? (
+          {panel === 'trace' ? (
+            <Trace turns={s.turns} members={members} running={running} />
+          ) : panel === 'conversation' ? (
             <>
               <div className="panel-intro">
                 <h2>The conversation</h2>
@@ -832,6 +863,39 @@ export default function Chamber({
             </span>
             <span>{paused ? 'Resume' : 'Pause'}</span>
           </button>
+          {brief.voices && (
+            <button
+              className={`meeting-tool ${muted ? 'tool-active' : ''}`}
+              aria-pressed={muted}
+              onClick={() => {
+                voice.setMuted(!muted)
+                setMuted(!muted)
+              }}
+              title={
+                s.voiceError ?? (muted ? 'Voices muted: the meeting runs at text pace' : undefined)
+              }
+            >
+              <span className="tool-icon">
+                <Icon name={muted ? 'muted' : 'sound'} />
+                {s.voiceError && <b>!</b>}
+              </span>
+              <span>{s.voiceError ? 'Voice failed' : muted ? 'Unmute' : 'Mute'}</span>
+            </button>
+          )}
+          {brief.voices && (
+            <button
+              className="meeting-tool"
+              onClick={() => {
+                const r = voice.RATES[(voice.RATES.indexOf(rate as never) + 1) % voice.RATES.length]
+                voice.setRate(r)
+                setRate(r)
+              }}
+              title="Voice speed"
+            >
+              <span className="tool-icon rate-icon">{rate}×</span>
+              <span>Speed</span>
+            </button>
+          )}
           <button className="meeting-tool" onClick={addContext} disabled={!canInterject}>
             <span className="tool-icon">
               <Icon name="chat" />
@@ -860,6 +924,17 @@ export default function Chamber({
               {questions > 0 && <b>{questions}</b>}
             </span>
             <span>Decision board</span>
+          </button>
+          <button
+            className={`meeting-tool ${panel === 'trace' ? 'tool-active' : ''}`}
+            aria-pressed={panel === 'trace'}
+            onClick={() => togglePanel('trace')}
+            title="Tool calls and thinking"
+          >
+            <span className="tool-icon">
+              <Icon name="trace" />
+            </span>
+            <span>Trace</span>
           </button>
           <button
             className={`meeting-tool ${view === 'whiteboard' ? 'tool-active' : ''}`}

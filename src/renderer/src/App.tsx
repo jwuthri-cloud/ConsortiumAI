@@ -1,12 +1,27 @@
-import { useEffect, useReducer } from 'react'
+import { useEffect, useReducer, useRef } from 'react'
 import { initial, reducer } from './state'
+import * as voice from './voice'
 import Convene from './Convene'
 import Chamber from './Chamber'
 import Consortium from './Consortium'
 
 export default function App(): React.JSX.Element {
   const [s, dispatch] = useReducer(reducer, initial)
-  useEffect(() => window.api!.onEvent(dispatch), [])
+  const screen = useRef(s.screen)
+  useEffect(
+    () =>
+      window.api!.onEvent((e) => {
+        // audio goes to the player, not the state; the lobby stays silent (and acks, so nothing waits)
+        if (e.type === 'voice') return voice.play(e, screen.current !== 'convene')
+        if (e.type === 'stopped' || e.type === 'failed') voice.stop()
+        dispatch(e)
+      }),
+    []
+  )
+  useEffect(() => {
+    screen.current = s.screen
+    if (s.screen === 'convene') voice.stop()
+  }, [s.screen])
   if (s.screen === 'convene')
     return (
       <Convene

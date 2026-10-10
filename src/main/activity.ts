@@ -10,8 +10,8 @@ function toolActivity(value: unknown): ActivityKind {
   return 'tool'
 }
 
-// Only coarse protocol signals cross IPC: no reasoning text, tool arguments,
-// commands, file contents, or raw logs appear in the conversation.
+// Coarse status for the seat ("reading", "searching"). The tool calls and reasoning themselves go
+// to the human's Trace panel (trace.ts); none of it reaches another member's prompt.
 export function streamActivity(cli: Cli, raw: unknown): ActivityKind | undefined {
   const event = object(raw)
   if (cli === 'claude') {

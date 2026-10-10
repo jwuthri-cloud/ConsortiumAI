@@ -2,8 +2,14 @@ import Brand, { BrandMark } from './Brand'
 import { PROVIDERS } from './avatarTheme'
 import { useEffect, useRef, useState } from 'react'
 import Library from './Library'
+import Settings from './Settings'
+import ModelPicker from './ModelPicker'
 import {
+  API_PROVIDERS,
   CLI_META,
+  splitModel,
+  type ApiProvider,
+  type KeySource,
   type Brief,
   type Cli,
   type Member,
@@ -13,6 +19,7 @@ import {
 } from '@shared/types'
 import { PERSONAS, PERSONA_IDS } from '@shared/personas'
 import { BOARD_WRITER } from '@shared/whiteboard'
+import { VOICES, freeVoice } from '@shared/voices'
 
 type Seat = Member & { check?: 'checking' | 'ok' | 'error'; message?: string }
 type Props = {
@@ -21,16 +28,47 @@ type Props = {
   onContinue: (session: Session) => void
 }
 
-const ORDER: Cli[] = ['claude', 'codex', 'gemini', 'grok']
-// a new seat's model; other CLIs start on their own default
-const DEFAULT_MODEL: Partial<Record<Cli, string>> = { claude: 'opus' }
+const ORDER: Cli[] = ['claude', 'codex', 'gemini', 'grok', 'harness']
+const PROVIDER_IDS = Object.keys(API_PROVIDERS) as ApiProvider[]
+// a new seat's model; the harness has none, you pick a provider and model
+const DEFAULT_MODEL: Partial<Record<Cli, string>> = {
+  claude: 'claude-opus-5-5',
+  codex: 'gpt-6.1-sol',
+  gemini: 'gemini-3.8-flash',
+  grok: 'grok-4.7'
+}
 const DEFAULT_PERSONA: Record<Cli, PersonaId> = {
   claude: 'strategist',
   codex: 'engineer',
   gemini: 'researcher',
-  grok: 'skeptic'
+  grok: 'skeptic',
+  harness: 'designer'
 }
 let seatSeq = 0
+// Each connection's last check, for as long as the app runs, so the lobby's lights survive a
+// meeting without testing every CLI again.
+type Checked = Pick<Seat, 'check' | 'message' | 'resolvedModel'>
+const checked = new Map<string, Checked>()
+const checkKey = (s: Pick<Seat, 'cli' | 'model'>): string => `${s.cli}|${s.model?.trim() ?? ''}`
+async function testSeat(seat: Seat): Promise<Checked> {
+  try {
+    const r = await window.api!.check(seat.cli, seat.model)
+    const result: Checked = {
+      check: r.ok ? 'ok' : 'error',
+      resolvedModel: r.model,
+      message: r.ok ? undefined : r.message
+    }
+    checked.set(checkKey(seat), result)
+    return result
+  } catch {
+    return { check: 'error', message: 'Connection failed. Try again.' }
+  }
+}
+const ipcError = (e: unknown): string =>
+  (e instanceof Error ? e.message : String(e)).replace(
+    /^Error invoking remote method '[^']+': (Error: )?/,
+    ''
+  )
 
 export default function Convene({ onStart, onOpen, onContinue }: Props): React.JSX.Element {
   const [task, setTask] = useState('')
@@ -40,6 +78,21 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
   const [seats, setSeats] = useState<Seat[]>([])
   const [chairId, setChairId] = useState('')
   const [turns, setTurns] = useState(30)
+  const [voices, setVoices] = useState(() => {
+    try {
+      return localStorage.getItem('voices-on') === '1'
+    } catch {
+      return false
+    }
+  })
+  const toggleVoices = (on: boolean): void => {
+    setVoices(on)
+    try {
+      localStorage.setItem('voices-on', on ? '1' : '0')
+    } catch {
+      /* not remembered */
+    }
+  }
   // null = the board is written by the chair's CLI and model
   const [writer, setWriter] = useState<{ cli: Cli; model: string } | null>({ ...BOARD_WRITER })
   const [installed, setInstalled] = useState<Partial<Record<Cli, string>>>({})
@@ -50,11 +103,6 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
   const [transcribing, setTranscribing] = useState(false)
   const addFiles = (paths: string[]): void =>
     setFiles((f) => [...new Set([...f, ...paths.filter(Boolean)])])
-  const ipcError = (e: unknown): string =>
-    (e instanceof Error ? e.message : String(e)).replace(
-      /^Error invoking remote method '[^']+': (Error: )?/,
-      ''
-    )
   // pasted screenshots have no path on disk: save their bytes first
   const pasteFiles = async (e: React.ClipboardEvent): Promise<void> => {
     const pasted = [...e.clipboardData.files]
@@ -102,6 +150,21 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
   }
 
   const [models, setModels] = useState<Partial<Record<Cli, string[]>>>({})
+  const [keys, setKeys] = useState<Partial<Record<ApiProvider, KeySource>>>({})
+  const refreshKeys = (): Promise<void> => window.api!.keys().then(setKeys, () => undefined)
+  const [settings, setSettings] = useState<{ focus?: ApiProvider } | null>(null)
+  const keysChanged = async (): Promise<void> => {
+    await refreshKeys()
+    // a harness seat that failed for want of a key deserves a fresh light
+    for (const k of checked.keys()) if (k.startsWith('harness|')) checked.delete(k)
+    setSeats((xs) =>
+      xs.map((x) =>
+        x.cli === 'harness' && x.check === 'error'
+          ? { ...x, check: undefined, message: undefined }
+          : x
+      )
+    )
+  }
 
   useEffect(() => {
     void window
@@ -109,16 +172,28 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
       .catch(() => ({}) as Partial<Record<Cli, string>>)
       .then((bins) => {
         setInstalled(bins)
-        // nothing detected = exotic PATH, not proof of absence: seat all four and let "check" tell
-        const clis = ORDER.some((c) => bins[c]) ? ORDER.filter((c) => bins[c]) : ORDER
-        const initial = clis.map((cli) => ({
-          id: `seat-${++seatSeq}`,
-          cli,
-          model: DEFAULT_MODEL[cli],
-          persona: DEFAULT_PERSONA[cli]
-        }))
+        // nothing detected = exotic PATH, not proof of absence: seat all four and let "check" tell.
+        // The harness is always there but needs a key, so it is added by hand.
+        const spawned = ORDER.filter((c) => c !== 'harness')
+        const clis = spawned.some((c) => bins[c]) ? spawned.filter((c) => bins[c]) : spawned
+        const initial: Seat[] = clis.map((cli, i) => {
+          const seat = {
+            id: `seat-${++seatSeq}`,
+            cli,
+            model: DEFAULT_MODEL[cli],
+            persona: DEFAULT_PERSONA[cli],
+            voice: VOICES[i]
+          }
+          // the green/red lights: test each seat once per app launch (a one-word prompt per CLI)
+          return { ...seat, ...(checked.get(checkKey(seat)) ?? { check: 'checking' as const }) }
+        })
         setSeats(initial)
         setChairId(initial[0]?.id ?? '')
+        for (const s of initial)
+          if (s.check === 'checking')
+            void testSeat(s).then((r) =>
+              setSeats((xs) => xs.map((x) => (x.id === s.id ? { ...x, ...r } : x)))
+            )
         // no Claude Code here: the chair writes the board
         if (!clis.includes(BOARD_WRITER.cli)) setWriter(null)
       })
@@ -126,6 +201,7 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
       .api!.listSessions()
       .then(setSessions)
       .catch(() => setProblem('Could not load previous sessions.'))
+    void refreshKeys()
     for (const cli of ORDER)
       void window
         .api!.models(cli)
@@ -142,23 +218,24 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
   const add = (): void => {
     const cli = ORDER.find((c) => !seats.some((x) => x.cli === c)) ?? 'claude'
     const persona = PERSONA_IDS.find((p) => !seats.some((x) => x.persona === p)) ?? 'skeptic'
-    const seat = { id: `seat-${++seatSeq}`, cli, model: DEFAULT_MODEL[cli], persona }
+    const seat = {
+      id: `seat-${++seatSeq}`,
+      cli,
+      model: DEFAULT_MODEL[cli],
+      persona,
+      voice: freeVoice(seats.map((x) => x.voice))
+    }
     setSeats((xs) => [...xs, seat])
     if (!chairId) setChairId(seat.id)
   }
   const check = async (seat: Seat): Promise<void> => {
     patch(seat.id, { check: 'checking', message: undefined })
-    try {
-      const r = await window.api!.check(seat.cli)
-      patch(seat.id, {
-        check: r.ok ? 'ok' : 'error',
-        resolvedModel: r.model,
-        message: r.ok ? undefined : r.message
-      })
-    } catch {
-      patch(seat.id, { check: 'error', message: 'Connection failed. Try again.' })
-    }
+    patch(seat.id, await testSeat(seat))
   }
+  // before a check: red when the CLI is missing or the harness has no key
+  const light = (s: Seat): string =>
+    s.check ??
+    ((s.cli === 'harness' ? keys[splitModel(s.model).provider] : installed[s.cli]) ? '' : 'error')
   // same seats, chair, budget, project and files; the question is pre-selected so typing replaces it
   const rerun = ({ brief }: Session, title: string): void => {
     const ids = Object.fromEntries(brief.members.map((m) => [m.id, `seat-${++seatSeq}`]))
@@ -181,21 +258,32 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
     if (!task.trim()) return setProblem('Write the question first.')
     if (seats.length < 2) return setProblem('A consortium needs at least two seats.')
     if (!seats.some((x) => x.id === chairId)) return setProblem('Pick a chair.')
+    if (seats.some((x) => x.cli === 'harness' && !splitModel(x.model).model))
+      return setProblem('Pick a model for the harness seat.')
     setProblem(null)
+    // every seat speaks with its own voice (older meetings re-run without one get the next free one)
+    const used: string[] = []
+    const voiceFor = (v?: string): string => {
+      const pick = v && !used.includes(v) ? v : freeVoice(used)
+      used.push(pick)
+      return pick
+    }
     onStart({
       task: task.trim(),
       projectPath,
       attachments: files.length ? files : undefined,
-      members: seats.map(({ id, cli, model, persona, resolvedModel }) => ({
+      members: seats.map(({ id, cli, model, persona, resolvedModel, voice }) => ({
         id,
         cli,
         model: model?.trim() || undefined,
         persona,
-        resolvedModel: model?.trim() ? undefined : resolvedModel
+        resolvedModel: model?.trim() ? undefined : resolvedModel,
+        voice: voiceFor(voice)
       })),
       chairId,
       maxTurns: turns,
-      board: writer ? { cli: writer.cli, model: writer.model.trim() || undefined } : undefined
+      board: writer ? { cli: writer.cli, model: writer.model.trim() || undefined } : undefined,
+      voices: voices || undefined
     })
   }
 
@@ -208,6 +296,9 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
         <span className="workspace-status">
           <i /> Ready when you are
         </span>
+        <button className="text-button titlebar-settings" onClick={() => setSettings({})}>
+          Settings
+        </button>
       </header>
       <main className="lobby-content rise">
         <div className="lobby-intro">
@@ -350,7 +441,9 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
                         ? '◎'
                         : s.cli === 'gemini'
                           ? '✦'
-                          : '𝕏'}
+                          : s.cli === 'harness'
+                            ? '⬢'
+                            : '𝕏'}
                   </div>
                   <div className="seat-provider">
                     <strong>{PROVIDERS[s.cli].name}</strong>
@@ -389,15 +482,18 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
                   Connection
                   <select
                     value={s.cli}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      const cli = e.target.value as Cli
+                      const model = DEFAULT_MODEL[cli]
                       patch(s.id, {
-                        cli: e.target.value as Cli,
-                        model: DEFAULT_MODEL[e.target.value as Cli],
+                        cli,
+                        model,
                         resolvedModel: undefined,
                         check: undefined,
-                        message: undefined
+                        message: undefined,
+                        ...checked.get(checkKey({ cli, model }))
                       })
-                    }
+                    }}
                   >
                     {ORDER.map((c) => (
                       <option key={c} value={c}>
@@ -407,21 +503,54 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
                     ))}
                   </select>
                 </label>
-                <label className="field-label">
-                  Model
-                  <input
-                    value={s.model ?? ''}
-                    onChange={(e) =>
-                      patch(s.id, { model: e.target.value, resolvedModel: undefined })
+                {s.cli === 'harness' ? (
+                  <HarnessFields
+                    model={s.model}
+                    keys={keys}
+                    options={models.harness ?? []}
+                    onModel={(model) =>
+                      patch(s.id, {
+                        model,
+                        resolvedModel: undefined,
+                        check: undefined,
+                        message: undefined
+                      })
                     }
-                    placeholder={s.resolvedModel ?? 'Automatic · resolved on connection'}
-                    list={`models-${s.cli}`}
-                    autoComplete="off"
-                    spellCheck={false}
+                    onKeys={(focus) => setSettings({ focus })}
                   />
-                </label>
+                ) : (
+                  <label className="field-label">
+                    Model
+                    <ModelPicker
+                      value={s.model ?? ''}
+                      options={models[s.cli] ?? []}
+                      onChange={(model) => patch(s.id, { model, resolvedModel: undefined })}
+                      placeholder={s.resolvedModel ?? 'Automatic · resolved on connection'}
+                    />
+                  </label>
+                )}
+                {voices && (
+                  <label className="field-label">
+                    Voice
+                    <select
+                      value={s.voice ?? ''}
+                      onChange={(e) => patch(s.id, { voice: e.target.value })}
+                    >
+                      {!s.voice && <option value="">Pick a voice</option>}
+                      {VOICES.map((v) => (
+                        <option
+                          key={v}
+                          value={v}
+                          disabled={seats.some((x) => x.id !== s.id && x.voice === v)}
+                        >
+                          {v[0].toUpperCase() + v.slice(1)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
                 <div className="seat-connection">
-                  <span className={`connection-dot ${s.check ?? ''}`} />
+                  <span className={`connection-dot ${light(s)}`} />
                   <button
                     className="text-button"
                     disabled={s.check === 'checking'}
@@ -433,9 +562,11 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
                         ? 'Connected'
                         : s.check === 'error'
                           ? 'Retry connection'
-                          : installed[s.cli]
-                            ? 'Installed · test connection'
-                            : 'Check connection'}
+                          : s.cli === 'harness'
+                            ? 'Test connection'
+                            : installed[s.cli]
+                              ? 'Installed · test connection'
+                              : 'Not installed · check again'}
                   </button>
                 </div>
                 {s.message && (
@@ -450,6 +581,37 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
             Different roles keep the conversation honest. Your agents know each other by role,
             without seeing the model behind it.
           </p>
+          <div className="board-writer">
+            <p>
+              <strong>Voices</strong>
+              Each seat reads its final answer aloud in its own ElevenLabs voice, through
+              OpenRouter. Thinking and votes stay silent.
+            </p>
+            <label className="voices-toggle">
+              <input
+                type="checkbox"
+                checked={voices}
+                onChange={(e) => toggleVoices(e.target.checked)}
+              />
+              Read turns aloud
+            </label>
+            <div className="key-status">
+              <span
+                className={`connection-dot ${keys.openrouter ? 'ok' : voices ? 'error' : ''}`}
+                aria-hidden="true"
+              />
+              <span>
+                {keys.openrouter
+                  ? 'OpenRouter key ready'
+                  : voices
+                    ? 'Needs an OpenRouter key'
+                    : 'Uses your OpenRouter key'}
+              </span>
+              <button className="text-button" onClick={() => setSettings({ focus: 'openrouter' })}>
+                {keys.openrouter ? 'Change' : 'Add key'}
+              </button>
+            </div>
+          </div>
           <div className="board-writer">
             <p>
               <strong>Whiteboard writer</strong>
@@ -474,14 +636,18 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
             </label>
             <label className="field-label">
               Model
-              <input
+              <ModelPicker
                 value={writer?.model ?? ''}
-                onChange={(e) => writer && setWriter({ ...writer, model: e.target.value })}
+                options={writer ? (models[writer.cli] ?? []) : []}
+                onChange={(model) => writer && setWriter({ ...writer, model })}
                 disabled={!writer}
-                placeholder={writer ? 'CLI default' : "The chair's model"}
-                list={writer ? `models-${writer.cli}` : undefined}
-                autoComplete="off"
-                spellCheck={false}
+                placeholder={
+                  !writer
+                    ? "The chair's model"
+                    : writer.cli === 'harness'
+                      ? 'provider:model'
+                      : 'CLI default'
+                }
               />
             </label>
           </div>
@@ -522,18 +688,76 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
           onProblem={setProblem}
           onDeleted={(id) => setSessions((all) => all.filter((s) => s.id !== id))}
         />
+        <Settings
+          open={!!settings}
+          focus={settings?.focus}
+          keys={keys}
+          onClose={() => setSettings(null)}
+          onChange={keysChanged}
+        />
         <footer className="lobby-footer">
           <span>Several minds. One shared direction.</span>
           <span>Powered by your connected agents</span>
         </footer>
       </main>
-      {ORDER.map((cli) => (
-        <datalist key={cli} id={`models-${cli}`}>
-          {(models[cli] ?? []).map((id) => (
-            <option key={id} value={id} />
-          ))}
-        </datalist>
-      ))}
     </div>
+  )
+}
+
+// The harness seat picks a provider and a model; its key lives in Settings.
+function HarnessFields({
+  model: value,
+  options,
+  keys,
+  onModel,
+  onKeys
+}: {
+  model?: string
+  options: string[] // every harness model, as provider:model
+  keys: Partial<Record<ApiProvider, KeySource>>
+  onModel: (model: string) => void
+  onKeys: (provider: ApiProvider) => void
+}): React.JSX.Element {
+  const { provider, model } = splitModel(value)
+  const { name, env } = API_PROVIDERS[provider]
+  const source = keys[provider]
+  return (
+    <>
+      <label className="field-label">
+        Provider
+        <select value={provider} onChange={(e) => onModel(`${e.target.value}:`)}>
+          {PROVIDER_IDS.map((k) => (
+            <option key={k} value={k}>
+              {API_PROVIDERS[k].name}
+              {keys[k] ? '' : ' (no key)'}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="field-label">
+        Model
+        <ModelPicker
+          value={model}
+          options={options
+            .filter((id) => id.startsWith(`${provider}:`))
+            .map((id) => id.slice(provider.length + 1))}
+          onChange={(m) => onModel(`${provider}:${m}`)}
+          placeholder={provider === 'openrouter' ? 'Search, e.g. glm or opus' : 'Model id'}
+        />
+      </label>
+      <div className="key-status">
+        <span className={`connection-dot ${source ? 'ok' : 'error'}`} aria-hidden="true" />
+        <span>
+          {source === 'saved'
+            ? `${name} key saved`
+            : source === 'env'
+              ? `${name} key from ${env}`
+              : `No ${name} key`}
+        </span>
+        <button className="text-button" onClick={() => onKeys(provider)}>
+          {source ? 'Change' : 'Add key'}
+        </button>
+      </div>
+    </>
   )
 }
