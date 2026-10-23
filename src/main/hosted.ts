@@ -475,7 +475,8 @@ const PRIVACY = `<p><b>Placeholder: replace this page before you publish the app
 export async function serveHosted(): Promise<App> {
   const e = process.env
   const secret = e.CONSORTIUM_SECRET ?? ''
-  const base = (e.PUBLIC_URL ?? '').replace(/\/+$/, '')
+  // Render sets RENDER_EXTERNAL_URL itself, so a Render deploy needs no PUBLIC_URL
+  const base = (e.PUBLIC_URL ?? e.RENDER_EXTERNAL_URL ?? '').replace(/\/+$/, '')
   if (secret.length < 32)
     throw new Error(
       'Set CONSORTIUM_SECRET to 32+ random characters (openssl rand -base64 32): it encrypts the keys and tokens at rest'
