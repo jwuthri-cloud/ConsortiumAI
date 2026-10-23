@@ -288,7 +288,7 @@ const OR_PREFIX: Record<Cli, string> = {
   harness: ''
 }
 const NOT_CHAT =
-  /image|audio|tts|realtime|transcribe|embedding|moderation|dall-e|banana|whisper|sora|veo|search-preview/
+  /image|audio|tts|realtime|transcribe|embedding|moderation|dall-e|banana|whisper|sora|veo|search-preview|guard/
 type Listing = {
   id: string
   pricing?: { prompt?: string; completion?: string; input_cache_read?: string }

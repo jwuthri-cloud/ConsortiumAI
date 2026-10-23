@@ -12,12 +12,15 @@ import {
   DEFAULTS,
   SCOPES,
   explain,
+  fromStore,
   homeView,
   keyed,
+  modelGroups,
   readLink,
   readTable,
   settingsBrief,
-  signLink
+  signLink,
+  tableModal
 } from '../src/main/hosted'
 import { installations, openStore, seal, unseal } from '../src/main/store'
 import { bridge, type Tenancy } from '../src/main/slack'
@@ -38,12 +41,21 @@ test('keys: sealed with AES-GCM, open only with the same secret and workspace', 
   assert.throws(() => unseal([v, iv, tag, flipped.toString('base64url')].join('.'), SECRET, 'T1'))
 })
 
-test("a workspace's settings make a Deep-agent-only brief on OpenRouter", () => {
-  const b = settingsBrief({ ...DEFAULTS, chair: 1, maxTurns: 10 }, 'Ship a CSV export?')
+test("a workspace's settings make a Deep-agent-only brief on OpenRouter, personas as picked", () => {
+  const seats = [
+    { model: 'a/one', persona: 'skeptic' as const },
+    { model: 'b/two', persona: 'customer' as const },
+    { model: 'c/three', persona: 'skeptic' as const }
+  ]
+  const b = settingsBrief({ ...DEFAULTS, seats, chair: 1, maxTurns: 10 }, 'Ship a CSV export?')
   assert.equal(b.task, 'Ship a CSV export?')
   assert.deepEqual(
-    b.members.map((m) => [m.cli, m.model]),
-    DEFAULTS.seats.map((id) => ['harness', `openrouter:${id}`])
+    b.members.map((m) => [m.cli, m.model, m.persona]),
+    [
+      ['harness', 'openrouter:a/one', 'skeptic'],
+      ['harness', 'openrouter:b/two', 'customer'],
+      ['harness', 'openrouter:c/three', 'skeptic']
+    ]
   )
   assert.equal(b.chairId, 'm2')
   assert.equal(b.maxTurns, 10)
@@ -52,36 +64,143 @@ test("a workspace's settings make a Deep-agent-only brief on OpenRouter", () => 
   assert.equal(b.board, undefined) // the chair's seat writes the board
 })
 
-test('the Edit table modal: OpenRouter ids only, checked against the catalogue', () => {
+test('settings saved before personas: model ids get personas in seat order', () => {
+  const old = { seats: ['a/one', 'b/two', 'c/three'], chair: 2, maxTurns: 9 } as unknown as Partial<
+    typeof DEFAULTS
+  >
+  const s = fromStore(old)
+  assert.deepEqual(s.seats, [
+    { model: 'a/one', persona: 'strategist' },
+    { model: 'b/two', persona: 'engineer' },
+    { model: 'c/three', persona: 'researcher' }
+  ])
+  assert.deepEqual([s.chair, s.maxTurns, s.maxMeetings], [2, 9, DEFAULTS.maxMeetings])
+  assert.deepEqual(fromStore(s), s) // new rows read as they are
+  assert.deepEqual(fromStore(undefined), DEFAULTS)
+})
+
+test('the Edit table modal: six seat rows, empty ones dropped, chair among the seats', () => {
   type Values = Parameters<typeof readTable>[0]
-  const values = (seats: string, chair = '0', turns = '12', max = '3', who = 'admins'): Values => ({
-    seats: { seats: { value: seats } },
-    chair: { chair: { selected_option: { value: chair } } },
+  const sel = (value: string): { selected_option: { value: string } } => ({
+    selected_option: { value }
+  })
+  // rows: [persona, model]; 'none' = an empty seat
+  const values = (rows: [string, string][], chair = '0', turns = '12', max = '3'): Values => ({
+    ...Object.fromEntries(
+      rows.map(([persona, model], i) => [`seat${i}`, { persona: sel(persona), model: sel(model) }])
+    ),
+    chair: { chair: sel(chair) },
     turns: { turns: { value: turns } },
     max: { max: { value: max } },
-    who: { who: { selected_option: { value: who } } }
+    who: { who: sel('admins') }
   })
-  const known = new Set(['a/one', 'b/two', 'meta/llama-5'])
-  assert.deepEqual(readTable(values('openrouter:a/one\n\n b/two \nmeta/llama-5:free'), known), {
+  const table = values(
+    [
+      ['skeptic', 'a/one'],
+      ['designer', 'none'],
+      ['skeptic', 'meta/llama-5:free'],
+      ['customer', 'none']
+    ],
+    '2'
+  )
+  assert.deepEqual(readTable(table), {
     table: {
-      seats: ['a/one', 'b/two', 'meta/llama-5:free'],
-      chair: 0,
+      seats: [
+        { model: 'a/one', persona: 'skeptic' },
+        { model: 'meta/llama-5:free', persona: 'skeptic' } // the same persona twice is fine
+      ],
+      chair: 1, // row 3 is the second seat
       maxTurns: 12,
       who: 'admins',
       maxMeetings: 3
     }
   })
-  const errors = (v: Values, k = known): Record<string, string> => {
-    const r = readTable(v, k)
+  const errors = (v: Values): Record<string, string> => {
+    const r = readTable(v)
     return 'errors' in r ? r.errors : {}
   }
-  assert.match(errors(values('a/one')).seats, /2 to 6/)
-  assert.match(errors(values('a/one\nanthropic:claude-opus-5-5')).seats, /anthropic:claude/)
-  assert.match(errors(values('a/one\nc/unknown')).seats, /c\/unknown/)
-  assert.deepEqual(errors(values('a/one\nc/unknown'), new Set()), {}) // no catalogue: shape only
-  assert.match(errors(values('a/one\nb/two', '2')).chair, /only 2 seats/)
-  assert.match(errors(values('a/one\nb/two', '0', '3')).turns, /4 to 100/)
-  assert.match(errors(values('a/one\nb/two', '0', '12', '11')).max, /1 to 10/)
+  const two: [string, string][] = [
+    ['skeptic', 'a/one'],
+    ['engineer', 'b/two']
+  ]
+  assert.match(errors(values([['skeptic', 'a/one']])).chair, /at least two seats/)
+  assert.match(errors(values([...two, ['customer', 'none']], '2')).chair, /Seat 3 is empty/)
+  assert.match(errors(values([two[0], ['engineer', 'not an id']])).chair, /not an id/)
+  assert.match(errors(values(two, '0', '3')).turns, /4 to 100/)
+  assert.match(errors(values(two, '0', '12', '11')).max, /1 to 10/)
+  assert.deepEqual(errors(values(two)), {})
+})
+
+test("the model select: main providers' newest, within Slack's 100, the seats' models always in", () => {
+  // newest first, as OpenRouter lists them: 60 each from three providers, and an unlisted one
+  const catalogue = ['anthropic', 'openai', 'google', 'acme'].flatMap((p) =>
+    Array.from({ length: 60 }, (_, i) => `${p}/m${i}`)
+  )
+  const groups = modelGroups(catalogue, ['openai/m59', 'retired/old-model'])
+  const ids = groups.flatMap((g) => g.options.map((o) => o.value))
+  assert.equal(ids.length, 100)
+  assert.equal(ids[0], 'none')
+  assert.ok(ids.includes('openai/m59') && ids.includes('retired/old-model'))
+  assert.ok(!ids.some((id) => id.startsWith('acme/'))) // not a main provider
+  assert.deepEqual(
+    groups.map((g) => [g.label.text, g.options.length]),
+    [
+      ['No model', 1],
+      ['Anthropic', 33], // taken in turn: the 97 free places go 33, 32, 32
+      ['OpenAI', 33], // its 32 newest and the seat's old one
+      ['Google', 32],
+      ['retired', 1]
+    ]
+  )
+  const anthropic = groups[1].options.map((o) => o.value)
+  assert.deepEqual(anthropic.slice(0, 3), ['anthropic/m0', 'anthropic/m1', 'anthropic/m2']) // newest first
+  // no catalogue (OpenRouter slow): the seats' own models and "— empty —"
+  assert.deepEqual(
+    modelGroups([], ['a/one']).flatMap((g) => g.options.map((o) => o.value)),
+    ['none', 'a/one']
+  )
+})
+
+test("the Edit table modal opens on the table as it is, every select's initial pick among its options", () => {
+  const s = { ...DEFAULTS, chair: 2 }
+  const view = tableModal(s, ['anthropic/claude-opus-5.5', 'openai/gpt-6.1-sol'])
+  const json = JSON.stringify(view)
+  const selects = view.blocks.flatMap((b) =>
+    b.type === 'actions' ? b.elements : b.type === 'input' ? [b.element] : []
+  ) as {
+    type: string
+    action_id: string
+    initial_option?: { value: string }
+    options?: { value: string }[]
+    option_groups?: { options: { value: string }[] }[]
+  }[]
+  const statics = selects.filter((e) => e.type === 'static_select')
+  assert.equal(statics.length, 13) // six seats × persona + model, and the chair
+  for (const e of statics) {
+    const options = e.options ?? e.option_groups!.flatMap((g) => g.options)
+    assert.ok(options.length <= 100)
+    assert.ok(
+      options.some((o) => JSON.stringify(o) === JSON.stringify(e.initial_option)),
+      `${e.action_id}: initial option not among its options`
+    )
+  }
+  const picks = statics.filter((e) => e.action_id !== 'chair').map((e) => e.initial_option!.value)
+  assert.deepEqual(picks, [
+    'strategist',
+    'anthropic/claude-sonnet-5.5', // a seat's model, though not in the catalogue
+    'engineer',
+    'openai/gpt-6.1-sol',
+    'researcher',
+    'google/gemini-3.8-flash',
+    'designer', // the empty rows start on the personas not yet seated
+    'none',
+    'skeptic',
+    'none',
+    'customer',
+    'none'
+  ])
+  assert.equal(statics.at(-1)!.initial_option!.value, '2')
+  assert.ok(json.includes('anthropic/claude-opus-5.5'))
 })
 
 test('the hosted runner: Deep-agent on OpenRouter only, no files, its own key and folder', async () => {
@@ -159,9 +278,15 @@ test('the Connect OpenRouter link is signed and expires', () => {
   assert.equal(readLink(SECRET, `${forged}.${t.split('.')[1]}`, 2000), undefined)
 })
 
-test('the Home tab: buttons for admins only, never the key', () => {
-  const s = { ...DEFAULTS, key: 'v1.sealed', keyHint: 'sk-or-v1-…3f9a' }
+test('the Home tab: the table by persona and model, buttons for admins only, never the key', () => {
+  const seats = [
+    { model: 'anthropic/claude-sonnet-5.5', persona: 'skeptic' as const },
+    { model: 'openai/gpt-6.1-sol', persona: 'skeptic' as const }
+  ]
+  const s = { ...DEFAULTS, seats, chair: 1, key: 'v1.sealed', keyHint: 'sk-or-v1-…3f9a' }
   const text = (admin: boolean): string => JSON.stringify(homeView(s, admin, 'https://x/connect'))
+  assert.ok(text(false).includes('1. The Skeptic · `anthropic/claude-sonnet-5.5`\\n'))
+  assert.ok(text(false).includes('2. The Skeptic 2 · `openai/gpt-6.1-sol` · *chair*'))
   assert.ok(text(true).includes('home_key') && text(true).includes('https://x/connect'))
   assert.ok(!text(false).includes('home_key') && !text(false).includes('https://x/connect'))
   assert.ok(text(false).includes('sk-or-v1-…3f9a') && !text(false).includes('v1.sealed'))
@@ -182,7 +307,7 @@ test("two workspaces' meetings run side by side, each on its own key and in its 
     A: await mkdtemp(join(tmpdir(), 'team-a-')),
     B: await mkdtemp(join(tmpdir(), 'team-b-'))
   }
-  const s = { ...DEFAULTS, seats: ['a/one', 'b/two'], maxTurns: 4 }
+  const s = { ...DEFAULTS, seats: DEFAULTS.seats.slice(0, 2), maxTurns: 4 }
   const done = (['A', 'B'] as const).map(
     (team) =>
       new Promise<DebateEvent>((resolve) =>
@@ -305,7 +430,10 @@ test('the bridge: a workspace reaches only its own meetings, under its own limit
     refuse: async (_team, user) => (user === 'NOPE' ? 'not you' : undefined),
     maxMeetings: async () => 1,
     convene: async (_team, _channel, question) => ({
-      brief: settingsBrief({ ...DEFAULTS, seats: ['a/one', 'b/two'], maxTurns: 4 }, question),
+      brief: settingsBrief(
+        { ...DEFAULTS, seats: DEFAULTS.seats.slice(0, 2), maxTurns: 4 },
+        question
+      ),
       run,
       dir
     })

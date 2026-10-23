@@ -9,7 +9,8 @@ import { listModels, runMember } from './cli'
 import { dataDir } from './paths'
 import { bridge, type Tenancy } from './slack'
 import { derive, installations, openStore, seal, tenantOf, unseal } from './store'
-import { splitModel, type Brief } from '../shared/types'
+import { PERSONAS, PERSONA_IDS, makeLabels } from '../shared/personas'
+import { splitModel, type Brief, type PersonaId } from '../shared/types'
 
 // The Slack app anyone can add to their workspace ("Add to Slack"), hosted: many workspaces in one
 // process, over HTTP, each on its own OpenRouter key. Installs and settings live in the database
@@ -22,6 +23,7 @@ type Values = Record<
   string,
   Record<string, { value?: string | null; selected_option?: { value: string } | null }>
 >
+export type Seat = { model: string; persona: PersonaId } // model: an OpenRouter id
 
 export const SCOPES = [
   'app_mentions:read',
@@ -38,7 +40,7 @@ export const SCOPES = [
 export type Settings = {
   key?: string // the OpenRouter key, sealed; never shown again, never logged
   keyHint?: string // "sk-or-v1-…3f9a", enough to recognise it
-  seats: string[] // OpenRouter model ids, 2–6, in seat order
+  seats: Seat[] // 2–6, in seat order
   chair: number // the seat that writes the decision
   maxTurns: number
   who: 'admins' | 'everyone' // who may convene, steer and press the buttons
@@ -48,7 +50,11 @@ export type Settings = {
 
 // ponytail: a capable, mid-priced trio from three labs; admins change it in the Home tab
 export const DEFAULTS: Settings = {
-  seats: ['anthropic/claude-sonnet-5.5', 'openai/gpt-6.1-sol', 'google/gemini-3.8-flash'],
+  seats: [
+    { model: 'anthropic/claude-sonnet-5.5', persona: 'strategist' },
+    { model: 'openai/gpt-6.1-sol', persona: 'engineer' },
+    { model: 'google/gemini-3.8-flash', persona: 'researcher' }
+  ],
   chair: 0,
   maxTurns: 12,
   who: 'everyone',
@@ -56,11 +62,26 @@ export const DEFAULTS: Settings = {
 }
 const MAX_MEETINGS = 10 // the most a workspace may run at once
 
+// A workspace's row → settings. Rows saved before seats had a persona hold model ids; those seats
+// get the personas toBrief used to hand out, in seat order.
+export function fromStore(row: Partial<Settings> | undefined): Settings {
+  const s = { ...DEFAULTS, ...row }
+  const seats = s.seats as (Seat | string)[]
+  return {
+    ...s,
+    seats: seats.map((x, i) => (typeof x === 'string' ? { model: x, persona: PERSONA_IDS[i] } : x))
+  }
+}
+
 // A workspace's table for a question: Deep-agent seats on OpenRouter, nothing else.
 export function settingsBrief(s: Settings, task: string): Brief {
   return toBrief({
     task,
-    members: s.seats.map((id) => ({ cli: 'harness', model: `openrouter:${id}` })),
+    members: s.seats.map(({ model, persona }) => ({
+      cli: 'harness',
+      model: `openrouter:${model}`,
+      persona
+    })),
     chairId: `m${s.chair + 1}`,
     maxTurns: s.maxTurns
   })
@@ -111,30 +132,35 @@ export async function keyStatus(key: string, ms = 2000): Promise<number> {
 const hint = (key: string): string => `${key.slice(0, 9)}…${key.slice(-4)}`
 const refusedKey = (status: number): boolean => status === 401 || status === 403
 
-// The Edit table modal's answers → settings, or what's wrong by block.
+const ROWS = 6 // the Edit table modal's seat rows; a row with no model is an empty seat
+const EMPTY = 'none' // the model select's "— empty —"
+
+// The Edit table modal's answers → settings, or what's wrong by block. Seat rows are actions
+// blocks (two selects side by side) and Slack shows errors on input blocks only, so the seats'
+// errors go on the chair, right below them.
 export function readTable(
-  values: Values,
-  known: Set<string> // OpenRouter's catalogue; empty = check the shape only
+  values: Values
 ): { table: Omit<Settings, 'key' | 'keyHint' | 'installer'> } | { errors: Record<string, string> } {
   const v = (block: string): Values[string][string] | undefined => values[block]?.[block]
-  const seats = (v('seats')?.value ?? '')
-    .split('\n')
-    .map((x) => x.trim().replace(/^openrouter:/, ''))
-    .filter(Boolean)
-  const chair = Number(v('chair')?.selected_option?.value ?? 0)
+  const rows = Array.from({ length: ROWS }, (_, i) => {
+    const pick = (a: string): string | undefined => values[`seat${i}`]?.[a]?.selected_option?.value
+    const persona = pick('persona') as PersonaId
+    const model = pick('model') ?? EMPTY
+    return model === EMPTY
+      ? undefined
+      : { model, persona: PERSONA_IDS.includes(persona) ? persona : PERSONA_IDS[i] }
+  })
+  const seats = rows.filter((r): r is Seat => !!r)
+  const row = Number(v('chair')?.selected_option?.value ?? 0)
+  const chair = rows.slice(0, row).filter(Boolean).length // its place once empty rows are dropped
   const maxTurns = Number(v('turns')?.value)
   const maxMeetings = Number(v('max')?.value)
   const who = v('who')?.selected_option?.value === 'admins' ? 'admins' : 'everyone'
   const errors: Record<string, string> = {}
-  const bad = seats.find(
-    (id) =>
-      !/^[a-z0-9][\w.-]*\/[\w.:-]+$/i.test(id) || (known.size > 0 && !known.has(id.split(':')[0]))
-  )
-  if (seats.length < 2 || seats.length > 6)
-    errors.seats = '2 to 6 seats, one OpenRouter model id per line.'
-  else if (bad)
-    errors.seats = `${bad} isn't an OpenRouter model id (like anthropic/claude-sonnet-5.5; see openrouter.ai/models).`
-  if (chair >= seats.length) errors.chair = `There are only ${seats.length} seats.`
+  const bad = seats.find(({ model }) => !/^[a-z0-9][\w.-]*\/[\w.:-]+$/i.test(model))
+  if (seats.length < 2) errors.chair = 'Pick a model for at least two seats.'
+  else if (bad) errors.chair = `${bad.model} isn't an OpenRouter model id.`
+  else if (!rows[row]) errors.chair = `Seat ${row + 1} is empty: the chair needs a model.`
   if (!Number.isInteger(maxTurns) || maxTurns < seats.length * 2 || maxTurns > 100)
     errors.turns = `A whole number from ${Math.max(4, seats.length * 2)} to 100.`
   if (!Number.isInteger(maxMeetings) || maxMeetings < 1 || maxMeetings > MAX_MEETINGS)
@@ -144,9 +170,60 @@ export function readTable(
     : { table: { seats, chair, maxTurns, who, maxMeetings } }
 }
 
+const PROVIDERS: Record<string, string> = {
+  anthropic: 'Anthropic',
+  openai: 'OpenAI',
+  google: 'Google',
+  'x-ai': 'xAI',
+  deepseek: 'DeepSeek',
+  mistralai: 'Mistral',
+  qwen: 'Qwen',
+  moonshotai: 'Moonshot AI',
+  'z-ai': 'Z.ai',
+  'meta-llama': 'Meta',
+  minimax: 'MiniMax'
+}
+const MAX_OPTIONS = 100 // Slack's cap on a select's options
+
+// The model select's options, grouped by provider: the main providers' newest models, taken in
+// turn so each gets a share, within Slack's 100 with "— empty —" and the seats' own models
+// (whatever they are) always in. `catalogue`: OpenRouter ids, newest first, as OpenRouter lists them.
+export function modelGroups(
+  catalogue: string[],
+  keep: string[]
+): { label: types.PlainTextElement; options: types.PlainTextOption[] }[] {
+  const picked = new Set(keep)
+  const lists = Object.keys(PROVIDERS).map((p) => catalogue.filter((id) => id.startsWith(`${p}/`)))
+  const longest = Math.max(0, ...lists.map((l) => l.length))
+  for (let r = 0; r < longest; r++)
+    for (const l of lists) if (l[r] && picked.size < MAX_OPTIONS - 1) picked.add(l[r])
+  const rank = (id: string): number => {
+    const i = catalogue.indexOf(id)
+    return i < 0 ? catalogue.length : i
+  }
+  const groups = new Map<string, string[]>(Object.keys(PROVIDERS).map((p) => [p, []]))
+  for (const id of [...picked].sort((a, b) => rank(a) - rank(b))) {
+    const p = id.split('/')[0]
+    groups.set(p, [...(groups.get(p) ?? []), id])
+  }
+  return [
+    { label: plain('No model'), options: [option(EMPTY, '— empty —')] },
+    ...[...groups]
+      .filter(([, ids]) => ids.length)
+      .map(([p, ids]) => ({
+        label: plain(PROVIDERS[p] ?? p),
+        options: ids.map((id) => option(id, id))
+      }))
+  ]
+}
+
 // ---------- the Home tab ----------
 
 const plain = (text: string): types.PlainTextElement => ({ type: 'plain_text', text })
+const option = (value: string, text: string): types.PlainTextOption => ({
+  value,
+  text: plain(text.slice(0, 75)) // Slack's cap on an option's text
+})
 const section = (text: string, accessory?: types.Button): types.KnownBlock => ({
   type: 'section',
   text: { type: 'mrkdwn', text },
@@ -165,8 +242,9 @@ const button = (
 
 // What everyone sees; an admin also gets the buttons. `connect` = the "Connect OpenRouter" link.
 export function homeView(s: Settings, admin: boolean, connect?: string): types.HomeView {
+  const labels = makeLabels(s.seats.map((x, i) => ({ id: String(i), persona: x.persona })))
   const seats = s.seats
-    .map((id, i) => `${i + 1}. \`${id}\`${i === s.chair ? ' · chair' : ''}`)
+    .map((x, i) => `${i + 1}. ${labels[i]} · \`${x.model}\`${i === s.chair ? ' · *chair*' : ''}`)
     .join('\n')
   const keyButtons: types.Button[] = [
     ...(connect
@@ -238,12 +316,41 @@ export const keyModal = (): types.ModalView => ({
   ]
 })
 
-export function tableModal(s: Settings): types.ModalView {
-  const option = (value: string, text: string): types.PlainTextOption => ({
-    value,
-    text: plain(text)
+// `catalogue`: OpenRouter ids, newest first; empty = only the seats' own models to pick from.
+export function tableModal(s: Settings, catalogue: string[]): types.ModalView {
+  const personas = PERSONA_IDS.map((p) => option(p, PERSONAS[p].label))
+  const groups = modelGroups(
+    catalogue,
+    s.seats.map((x) => x.model)
+  )
+  const models = groups.flatMap((g) => g.options)
+  const free = PERSONA_IDS.filter((p) => !s.seats.some((x) => x.persona === p))
+  const rows = Array.from({ length: ROWS }, (_, i): types.KnownBlock[] => {
+    const seat = s.seats[i]
+    const persona = seat?.persona ?? free[i - s.seats.length] ?? PERSONA_IDS[i]
+    return [
+      section(`*Seat ${i + 1}*`),
+      {
+        type: 'actions',
+        block_id: `seat${i}`,
+        elements: [
+          {
+            type: 'static_select',
+            action_id: 'persona',
+            options: personas,
+            initial_option: personas[PERSONA_IDS.indexOf(persona)]
+          },
+          {
+            type: 'static_select',
+            action_id: 'model',
+            option_groups: groups,
+            initial_option: models.find((o) => o.value === (seat?.model ?? EMPTY))
+          }
+        ]
+      }
+    ]
   })
-  const seatOptions = [1, 2, 3, 4, 5, 6].map((n) => option(String(n - 1), `Seat ${n}`))
+  const seatOptions = Array.from({ length: ROWS }, (_, i) => option(String(i), `Seat ${i + 1}`))
   const whoOptions = [
     option('everyone', "Everyone in channels I'm in"),
     option('admins', 'Workspace admins only')
@@ -256,17 +363,15 @@ export function tableModal(s: Settings): types.ModalView {
     close: plain('Cancel'),
     blocks: [
       {
-        type: 'input',
-        block_id: 'seats',
-        label: plain('Seats'),
-        element: {
-          type: 'plain_text_input',
-          action_id: 'seats',
-          multiline: true,
-          initial_value: s.seats.join('\n')
-        },
-        hint: plain('One OpenRouter model id per line, 2 to 6 (openrouter.ai/models).')
+        type: 'context',
+        elements: [
+          {
+            type: 'mrkdwn',
+            text: "Two to six seats: a persona and an OpenRouter model each. Set a seat's model to — empty — to leave it out."
+          }
+        ]
       },
+      ...rows.flat(),
       {
         type: 'input',
         block_id: 'chair',
@@ -381,12 +486,10 @@ export async function serveHosted(): Promise<App> {
     )
   const store = await openStore(e.DATABASE_URL!)
   debate.configure(dataDir())
-  void listModels('harness') // warm the catalogue: the Edit table modal checks seats against it
+  void listModels('harness') // warm the catalogue: the Edit table modal's model selects list it
 
-  const load = async (team: string): Promise<Settings> => ({
-    ...DEFAULTS,
-    ...(await store.get<Partial<Settings>>('settings', team))
-  })
+  const load = async (team: string): Promise<Settings> =>
+    fromStore(await store.get<Partial<Settings>>('settings', team))
   const save = (team: string, s: Settings): Promise<void> => store.put('settings', team, s)
   const teamDir = (team: string): string => {
     if (!/^[A-Z0-9]+$/.test(team)) throw new Error(`not a workspace id: ${team}`)
@@ -404,13 +507,15 @@ export async function serveHosted(): Promise<App> {
   const installStore = installations(store, secret, async (team, i) => {
     if (i.user?.id) await save(team, { ...(await load(team)), installer: i.user.id })
   })
-  const catalogue = (): Promise<Set<string>> =>
+  // ponytail: OpenRouter's list is fetched once per process (cli.ts), so models released since
+  // show up after a restart; a TTL there if the server runs for weeks between deploys
+  const catalogue = (): Promise<string[]> =>
     Promise.race([
-      listModels('harness').then(
-        (ids) => new Set(ids.filter((id) => id.startsWith('openrouter:')).map((id) => id.slice(11)))
+      listModels('harness').then((ids) =>
+        ids.filter((id) => id.startsWith('openrouter:')).map((id) => id.slice(11))
       ),
-      // a view must be answered within 3 s: without the catalogue, check the ids' shape only
-      new Promise<Set<string>>((r) => setTimeout(() => r(new Set()), 1500))
+      // a modal must open within 3 s of the click: without the catalogue, the seats' own models
+      new Promise<string[]>((r) => setTimeout(() => r([]), 1500))
     ])
 
   const tenancy: Tenancy = {
@@ -587,8 +692,14 @@ export async function serveHosted(): Promise<App> {
   app.action<BlockAction>('home_table', async ({ ack, body, client, context }) => {
     await ack()
     const s = await asAdmin(client, tenantOf(context), body.user.id)
-    if (s) await client.views.open({ trigger_id: body.trigger_id, view: tableModal(s) })
+    if (s)
+      await client.views.open({
+        trigger_id: body.trigger_id,
+        view: tableModal(s, await catalogue())
+      })
   })
+  // the seat rows' selects report each pick; the modal's Save reads them all
+  app.action({ block_id: /^seat\d$/ }, async ({ ack }) => ack())
   app.action<BlockAction>('home_forget', async ({ ack, body, client, context }) => {
     await ack()
     const team = tenantOf(context)
@@ -628,9 +739,9 @@ export async function serveHosted(): Promise<App> {
     if (!s)
       return void (await ack({
         response_action: 'errors',
-        errors: { seats: 'Only workspace admins can change the table.' }
+        errors: { chair: 'Only workspace admins can change the table.' }
       }))
-    const r = readTable(view.state.values as Values, await catalogue())
+    const r = readTable(view.state.values as Values)
     if ('errors' in r) return void (await ack({ response_action: 'errors', errors: r.errors }))
     await ack()
     await save(team, { ...s, ...r.table })
