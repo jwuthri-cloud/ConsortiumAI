@@ -53,7 +53,7 @@ test('a raised hand stops the seat preparing its turn; it goes again after the h
     await until(() => calls.length === 2)
     assert.equal(calls[1].key, 'hand-test:b')
 
-    raiseHand(true) // b is preparing turn 2
+    raiseHand('hand-test', true) // b is preparing turn 2
     await until(() => events.some((e) => e.type === 'turn-cancelled'))
     const cancelled = events.find((e) => e.type === 'turn-cancelled')!
     assert.deepEqual(
@@ -69,8 +69,8 @@ test('a raised hand stops the seat preparing its turn; it goes again after the h
     await sleep(30)
     assert.equal(calls.length, 2, 'the meeting holds while the hand is up')
 
-    host({ id: 'h1', kind: 'thought', text: 'Budget is capped at two weeks.' })
-    raiseHand(false)
+    host('hand-test', { id: 'h1', kind: 'thought', text: 'Budget is capped at two weeks.' })
+    raiseHand('hand-test', false)
     await until(() => calls.length === 3)
     assert.equal(calls[2].key, 'hand-test:b', 'the interrupted seat goes again')
     assert.match(calls[2].prompt, /Budget is capped at two weeks/)
@@ -84,11 +84,11 @@ test('a raised hand stops the seat preparing its turn; it goes again after the h
     assert.ok(s.turns.every((t) => t.status !== 'error'))
 
     calls[2].resolve('Two weeks fits a CSV export.')
-    conclude()
+    conclude('hand-test')
     await until(() => calls.length === 4)
     assert.equal(calls[3].key, 'hand-test:chair')
   } finally {
-    stop()
+    stop('hand-test')
     await rm(root, { recursive: true, force: true })
   }
 })

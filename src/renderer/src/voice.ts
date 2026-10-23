@@ -72,6 +72,10 @@ const ack = (e: VoiceEvent): void => void window.api?.spoken(e.sessionId, e.turn
 // A raised hand cuts the room off: everything queued or arriving is dropped (and acked, so the engine
 // doesn't wait for it) until the next turn starts.
 let floor = 0 // clips of turns below this are dropped
+export function reset(): void {
+  stop()
+  floor = 0
+}
 export function cut(): void {
   floor = Infinity
   for (const c of [...queue.map((q) => q.e), ...(playing ? [playing.clip.e] : [])])

@@ -22,7 +22,8 @@ function clip(text: string, max: number): string {
 function said(turns: Turn[], max = 1500, tag = false): string {
   return turns
     .map(
-      (t) => `**${tag && t.speaker !== HUMAN ? `[T${t.n}] ` : ''}${t.label}:** ${clip(t.text, max)}`
+      (t) =>
+        `**${tag && t.speaker !== HUMAN ? `[T${t.n}] ` : ''}${t.label}:** ${t.speaker === HUMAN ? t.text : clip(t.text, max)}`
     )
     .join('\n\n')
 }
@@ -36,10 +37,14 @@ function notes(shape: Shape | null): string {
   return `## Clerk's notes — where the table stands\nConverging:\n${c || '- nothing yet'}\nStill open:\n${o || '- nothing'}\n\n`
 }
 
+// The table is a conversation for a human, not a code review: code and sources by name, never by location.
+export const NO_LOCATIONS =
+  'Never write file paths, line numbers or URLs. Name code by what it is (the function, module or component, and what it does) and a source by what it is (for example "the Electron release notes").'
+
 function projectRule(brief: Brief): string {
   const files = brief.attachments ?? []
   const rule = brief.projectPath
-    ? `A project is attached at ${brief.projectPath}. Inspect its code read-only when a claim depends on it. Start with a targeted search and read only the relevant files; do not conduct a broad audit unless the question calls for one. Reuse evidence already established in the conversation and name what remains unverified. When a claim rests on a file, name it as \`path/to/file:line\` relative to the project. Never create, modify or delete anything.`
+    ? `A project is attached at ${brief.projectPath}. Inspect its code read-only when a claim depends on it. Start with a targeted search and read only the relevant files; do not conduct a broad audit unless the question calls for one. Reuse evidence already established in the conversation and name what remains unverified. Never create, modify or delete anything.`
     : files.length
       ? 'No project is attached. Use your read-only tools only to read the attached files. Never create, modify or delete anything.'
       : 'No project is attached. Do not use tools; reason from the question and what you know.'
@@ -55,6 +60,7 @@ export function intro(brief: Brief, m: Member, labels: Labels): string {
 Your lens: ${PERSONAS[m.persona].lens}
 Never reveal or guess which AI model or company is behind any member, including yourself.
 This is a live conversation, not a report. Members speak in short turns, in order, and react to what was just said. A clerk keeps notes between turns; a chair writes the final decision. The human may speak at any time.
+The human has priority over the agents. Answer their newest question or correction first, explicitly explaining what it changes. Do not continue a superseded argument. Stay tied to the decision and the host's constraints; park tangents, do not repeat established points, and say what evidence or human answer would settle a disagreement. Treat moderator guidance as facilitation, not evidence or permission to erase dissent.
 ${projectRule(brief)}
 
 ## The question
@@ -65,7 +71,7 @@ ${brief.task}
 export function opening(brief: Brief, m: Member, labels: Labels, earlier: Turn[]): string {
   return `${intro(brief, m, labels)}${earlier.length ? `\n## Said so far\n${said(earlier)}\n` : ''}
 ## Your opening — at most 150 words
-Your recommendation and the one or two strongest reasons for it${earlier.length ? '. React to what was said if it matters' : ''}. Speak plainly, first person, no headings, no bullet walls. Give your conclusion directly; omit tool logs, setup narration, and promises about what you will check.
+Your recommendation and the one or two strongest reasons for it${earlier.length ? '. React to what was said if it matters' : ''}. Speak plainly, first person, no headings, no bullet walls. Give your conclusion directly; omit tool logs, setup narration, and promises about what you will check. ${NO_LOCATIONS}
 
 End with a fenced \`\`\`json block and nothing after it:
 ${VOTE}
@@ -93,12 +99,13 @@ export function turn(
 ): string {
   const words = phase === 'decide' ? 80 : 150
   return `Turn ${n} of ${brief.maxTurns}. You are ${labels[m.id]}.
+Address any new human message before responding to the agents. State its effect on your recommendation. Stay on the host's question; add new evidence, resolve a disagreement, or ask one essential question instead of repeating yourself.
 ${notes(shape)}## Since you last spoke
 ${said(since) || '(nobody spoke)'}
 
 ## Your turn — at most ${words} words
 ${PHASE_LINE[phase]}
-Reuse previously verified evidence. Use tools only when a new disputed fact needs checking; keep that check targeted. Give the contribution directly, without tool logs or setup narration.
+Reuse previously verified evidence. Use tools only when a new disputed fact needs checking; keep that check targeted. Give the contribution directly, without tool logs or setup narration. ${NO_LOCATIONS}
 
 End with a fenced \`\`\`json block and nothing after it:
 ${VOTE}
@@ -167,7 +174,8 @@ export function chair(
 ## Unresolved questions
 (Every remaining disagreement, attributed by label and stated faithfully — not smoothed over — then the questions only the human can answer. "None" only if nothing is unresolved.)
 
-Back every claim with its source. Cite the turn it came from with the tags in the transcript: [T3], or [T3, T7] for several. When a claim rests on a project file a member named, cite it as \`path/to/file:line\`. Cite only turns and files that appear in the transcript; never invent one.
+Back every claim with its source. Cite the turn it came from with the tags in the transcript: [T3], or [T3, T7] for several. Cite only turns that appear in the transcript; never invent one. ${NO_LOCATIONS}
+The human's latest corrections take priority over earlier agent conclusions. Reflect their effect on the recommendation and plan. Do not present an earlier vote as endorsement of a decision the human subsequently changed; state what remains unverified or disputed.
 
 ## The question
 ${brief.task}

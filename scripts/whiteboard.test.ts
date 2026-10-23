@@ -81,7 +81,7 @@ test('writer coalesces snapshots, preserves the last good board on error, and ig
   }
 })
 
-test('host targeting takes the next turn; focus persists; conclude while paused delivers queued messages to the chair', async () => {
+test('host targeting interrupts; focus persists; conclude while paused delivers pending messages to the chair', async () => {
   const root = await mkdtemp(join(tmpdir(), 'consortium-host-test-'))
   const brief: Brief = {
     task: 'Export?',
@@ -136,10 +136,12 @@ test('host targeting takes the next turn; focus persists; conclude while paused 
     configure(root)
     runDebate(brief, (e) => events.push(structuredClone(e)), 'host-test', undefined, runner)
     await until(() => calls.length === 1)
-    host({ id: 'ask-c', kind: 'ask', targetId: 'c', text: 'Check demand first.' })
-    host({ id: 'focus', kind: 'focus', text: 'Prioritize accessibility.' })
-    host({ id: 'ask-c', kind: 'ask', targetId: 'c', text: 'Duplicate request.' })
-    assert.throws(() => host({ id: 'invalid', kind: 'ask', targetId: 'missing', text: '?' }))
+    host('host-test', { id: 'ask-c', kind: 'ask', targetId: 'c', text: 'Check demand first.' })
+    host('host-test', { id: 'focus', kind: 'focus', text: 'Prioritize accessibility.' })
+    host('host-test', { id: 'ask-c', kind: 'ask', targetId: 'c', text: 'Duplicate request.' })
+    assert.throws(() =>
+      host('host-test', { id: 'invalid', kind: 'ask', targetId: 'missing', text: '?' })
+    )
     calls[0].resolve({ text: 'A proposal.' })
     await until(() => calls.length === 2)
     assert.equal(calls[1].key, 'host-test:c')
@@ -148,24 +150,25 @@ test('host targeting takes the next turn; focus persists; conclude while paused 
     await until(() => events.some((e) => e.type === 'whiteboard'))
     calls[1].resolve({ text: 'Demand is uncertain.' })
     await until(() => calls.length === 3)
-    assert.equal(calls[2].key, 'host-test:b', 'Resume the normal rotation after a targeted turn')
+    assert.equal(calls[2].key, 'host-test:a', 'The interrupted opening is still owed a turn')
     assert.match(calls[2].prompt, /host's current focus: Prioritize accessibility/)
     assert.match(calls[2].prompt, /"id":"proposal-flow"/)
     assert.match(calls[2].prompt, /"from":"request","to":"download"/)
-    host({ id: 'last', kind: 'thought', text: 'The launch must stay small.' })
-    pause(true)
+    host('host-test', { id: 'last', kind: 'thought', text: 'The launch must stay small.' })
+    pause('host-test', true)
     calls[2].resolve({ text: 'Start with a small prototype.' })
-    await until(() => events.filter((e) => e.type === 'turn-done').length === 3)
+    await until(() => events.filter((e) => e.type === 'turn-cancelled').length === 2)
+    assert.equal(events.filter((e) => e.type === 'turn-done').length, 1)
     assert.equal(calls.length, 3)
-    conclude()
+    conclude('host-test')
     await until(() => calls.length === 4)
     assert.equal(calls[3].key, 'host-test:chair')
     assert.match(calls[3].prompt, /launch must stay small/)
     assert.match(calls[3].prompt, /host asked to conclude now/)
     assert.match(calls[3].prompt, /"id":"proposal-flow"/)
-    assert.throws(() => host({ id: 'late', kind: 'thought', text: 'Too late.' }))
     calls[3].resolve({ text: '# Decision\nRun a small pilot.' })
     await until(() => events.some((e) => e.type === 'consortium'))
+    assert.throws(() => host('host-test', { id: 'late', kind: 'thought', text: 'Too late.' }))
     const saved = loadSession('host-test')!
     assert.equal(saved.status, 'done')
     assert.equal(saved.whiteboard?.visuals?.[0].id, 'proposal-flow')

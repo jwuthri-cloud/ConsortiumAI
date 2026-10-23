@@ -1,0 +1,51 @@
+# The hosted, installable app (README, "Hosted"). Replace consortium.example.com with your server's
+# domain (PUBLIC_URL), then at https://api.slack.com/apps → Create New App → From a manifest.
+display_information:
+  name: Consortium
+  description: A table of AI models that debates your question in a thread and writes the decision.
+  long_description: Ask a question with /consortium or by mentioning @Consortium. A table of AI models, picked by your workspace's admins and run on your own OpenRouter key, debates it live in the thread, keeps a whiteboard canvas of what is agreed and disputed, and writes the decision as a canvas. Reply in the thread to steer the meeting.
+  background_color: '#191a20'
+features:
+  app_home:
+    home_tab_enabled: true
+    messages_tab_enabled: false
+    messages_tab_read_only_enabled: false
+  bot_user:
+    display_name: Consortium
+    always_online: false
+  slash_commands:
+    - command: /consortium
+      url: https://consortium.example.com/slack/events
+      description: Convene the table on a question
+      usage_hint: '<question>'
+      should_escape: false
+oauth_config:
+  redirect_urls:
+    - https://consortium.example.com/slack/oauth_redirect
+  scopes:
+    bot:
+      - app_mentions:read
+      - canvases:write
+      - channels:history
+      - chat:write
+      - chat:write.customize
+      - commands
+      - files:write
+      - groups:history
+      - users:read
+settings:
+  event_subscriptions:
+    request_url: https://consortium.example.com/slack/events
+    bot_events:
+      - app_home_opened
+      - app_mention
+      - app_uninstalled
+      - message.channels
+      - message.groups
+      - tokens_revoked
+  interactivity:
+    is_enabled: true
+    request_url: https://consortium.example.com/slack/events
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false

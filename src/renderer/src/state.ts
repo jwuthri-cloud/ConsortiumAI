@@ -148,6 +148,16 @@ export function reducer(s: State, a: Action): State {
   }
   if (a.sessionId !== s.sessionId) return s
   switch (a.type) {
+    case 'human-priority':
+      return {
+        ...s,
+        converged: false,
+        whiteboard: s.whiteboard ? { ...s.whiteboard, moderation: undefined } : undefined,
+        speaking: undefined,
+        activity: undefined,
+        chair: { text: '', status: 'idle' },
+        turns: s.turns.filter((t) => t.status !== 'running')
+      }
     case 'whiteboard':
       return { ...s, whiteboard: a.board, boardStatus: 'idle', boardError: undefined }
     case 'board-status':

@@ -20,6 +20,7 @@ import {
 } from '@shared/types'
 import { PERSONAS, PERSONA_IDS } from '@shared/personas'
 import { BOARD_WRITER } from '@shared/whiteboard'
+import { DEFAULT_MODEL } from '@shared/models'
 import { VOICES, freeVoice } from '@shared/voices'
 
 type Seat = Member & { check?: 'checking' | 'ok' | 'error'; message?: string }
@@ -31,13 +32,6 @@ type Props = {
 
 const ORDER: Cli[] = ['claude', 'codex', 'gemini', 'grok', 'harness']
 const PROVIDER_IDS = Object.keys(API_PROVIDERS) as ApiProvider[]
-// a new seat's model; the Deep-agent has none, you pick a provider and model
-const DEFAULT_MODEL: Partial<Record<Cli, string>> = {
-  claude: 'claude-opus-5-5',
-  codex: 'gpt-6.1-sol',
-  gemini: 'gemini-3.8-flash',
-  grok: 'grok-4.7'
-}
 const DEFAULT_PERSONA: Record<Cli, PersonaId> = {
   claude: 'strategist',
   codex: 'engineer',
@@ -584,8 +578,8 @@ export default function Convene({ onStart, onOpen, onContinue }: Props): React.J
           </div>
           <div className="board-writer">
             <p>
-              <strong>Whiteboard writer</strong>
-              Keeps the live board of what&apos;s agreed, disputed and waiting on you.
+              <strong>Moderator &amp; whiteboard</strong>
+              Keeps the board current and brings the discussion back on track when it drifts.
             </p>
             <label className="field-label">
               Connection

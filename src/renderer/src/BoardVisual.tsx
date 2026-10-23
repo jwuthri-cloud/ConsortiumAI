@@ -67,7 +67,7 @@ function Diagram({
         <svg
           className="board-diagram"
           viewBox={`0 0 ${width} ${height}`}
-          style={{ minWidth: width * 0.8 * zoom, width: width * zoom }}
+          style={{ minWidth: Math.min(width, 480) * zoom, width: `${100 * zoom}%` }}
           aria-label={visual.title}
           role="group"
         >

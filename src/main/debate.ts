@@ -1,5 +1,6 @@
 import { visualContext } from '../shared/boardVisuals'
 import { createBoardWriter } from './whiteboard'
+import { moderatedSpeaker, moderationContext } from './moderation'
 import type { HostInput, HostMessage } from '../shared/whiteboard'
 import { memberModel, modelName } from '../shared/models'
 import { summarize } from '../shared/summary'
@@ -29,18 +30,18 @@ import {
   type Vote
 } from '../shared/types'
 import { PERSONAS, makeLabels } from '../shared/personas'
-import { extractVote, sameLabel, stance, stripVote } from '../shared/vote'
-import { runMember, killAll, killRun } from './cli'
+import { extractVote, sameLabel, stance, stripVote, withoutLocations } from '../shared/vote'
+import { runMember, killMeeting, killRun } from './cli'
 import { getKey } from './keys'
 import { filler, readAloud } from './voice'
 import * as P from './prompts'
 import { sources } from '../shared/cite'
 
 type Send = (e: DebateEvent) => void
+class HumanInterrupted extends Error {}
 
 let userData = ''
-// ponytail: one debate at a time; a second start stops the first.
-let current: {
+type Running = {
   id: string
   cancelled: boolean
   paused: boolean
@@ -51,62 +52,71 @@ let current: {
   refreshBoard: () => void
   heard: Map<number, () => void> // turn → resolves when the renderer has played its answer
   raise: (on: boolean) => void
-} | null = null
+  interrupt: () => void
+}
+// Meetings run side by side, each keyed by its session id; every control names the one it acts on.
+const meetings = new Map<string, Running>()
+
+function active(id: string): Running {
+  const m = meetings.get(id)
+  if (!m || m.cancelled) throw new Error('There is no active meeting.')
+  return m
+}
 
 export function configure(dir: string): void {
   userData = dir
   mkdirSync(join(userData, 'sessions'), { recursive: true })
 }
 
-export function interject(text: string): void {
-  host({ id: randomUUID(), kind: 'thought', text })
+export function interject(id: string, text: string): void {
+  host(id, { id: randomUUID(), kind: 'thought', text })
 }
 
-export function host(input: HostInput): void {
-  if (!current || current.cancelled) throw new Error('There is no active meeting.')
-  current.host(input)
+export function host(id: string, input: HostInput): void {
+  active(id).host(input)
 }
-export function conclude(): void {
-  if (!current || current.cancelled) throw new Error('There is no active meeting.')
-  current.finish()
+export function conclude(id: string): void {
+  active(id).finish()
 }
-export function refreshBoard(): void {
-  if (!current || current.cancelled) throw new Error('There is no active meeting.')
-  current.refreshBoard()
+export function refreshBoard(id: string): void {
+  active(id).refreshBoard()
 }
 
 // ponytail: pause lands between turns; the member already speaking finishes first.
-export function pause(on: boolean): void {
-  if (!current) return
-  current.paused = on
-  if (!on) current.wake?.()
+export function pause(id: string, on: boolean): void {
+  const m = meetings.get(id)
+  if (!m) return
+  m.paused = on
+  if (!on) m.wake?.()
 }
 
 // The human raises a hand: the meeting holds, and the seat preparing its turn stops and takes it
 // again after the human has spoken, so it hears them. Lowering the hand resumes.
-export function raiseHand(on: boolean): void {
-  if (!current || current.cancelled) throw new Error('There is no active meeting.')
-  current.raise(on)
+export function raiseHand(id: string, on: boolean): void {
+  active(id).raise(on)
 }
 
-export function stop(): void {
-  if (!current) return
-  current.cancelled = true
-  current.wake?.()
-  for (const done of current.heard.values()) done()
-  killAll()
+// Stops one meeting and only its processes; the others keep running.
+export function stop(id: string): void {
+  const m = meetings.get(id)
+  if (!m) return
+  m.cancelled = true
+  m.interrupt()
+  m.wake?.()
+  for (const done of m.heard.values()) done()
+  killMeeting(id)
 }
 
 export function spoken(sessionId: string, turn: number): void {
-  if (current?.id === sessionId) current.heard.get(turn)?.()
+  meetings.get(sessionId)?.heard.get(turn)?.()
 }
 
 function sessionStatus(s: Session): Session['status'] {
-  return s.status === 'running' && current?.id !== s.id ? 'stopped' : s.status
+  return s.status === 'running' && !meetings.has(s.id) ? 'stopped' : s.status
 }
 
-function save(s: Session): void {
-  writeFileSync(join(userData, 'sessions', `${s.id}.json`), JSON.stringify(s))
+function save(s: Session, dir = userData): void {
+  writeFileSync(join(dir, 'sessions', `${s.id}.json`), JSON.stringify(s))
 }
 
 // Meetings saved before their model had a price get one when read back.
@@ -149,7 +159,7 @@ export function loadSession(id: string): Session | null {
 
 // Removes the transcript and its copied attachments; a meeting still in progress is left alone.
 export function deleteSession(id: string): void {
-  if (current?.id === id) throw new Error('Stop this meeting before deleting it.')
+  if (meetings.has(id)) throw new Error('Stop this meeting before deleting it.')
   rmSync(join(userData, 'sessions', `${id}.json`), { force: true })
   rmSync(join(userData, 'attachments', id), { recursive: true, force: true })
 }
@@ -169,7 +179,7 @@ function keepAttachments(id: string, files: string[] = []): string[] {
 
 // Continue an unfinished session from its saved transcript.
 export function resume(id: string, send: Send): void {
-  if (current?.id === id && !current.cancelled) return
+  if (meetings.get(id)?.cancelled === false) return
   const s = loadSession(id)
   if (s && s.status !== 'done') runDebate(s.brief, send, id, s)
 }
@@ -298,18 +308,22 @@ export function phaseOf(n: number, members: number, budget: number): Phase {
 }
 
 // The renderer picks the id so it can attribute events that arrive before the invoke resolves.
+// `dir` keeps this meeting's session and decision (hosted Slack: its workspace's folder).
 export function runDebate(
   brief: Brief,
   send: Send,
   id: string = randomUUID(),
   prior?: Session,
-  run: typeof runMember = runMember
+  run: typeof runMember = runMember,
+  speech = { enabled: () => !!getKey('openrouter'), filler, readAloud },
+  dir = userData
 ): string {
-  stop()
+  stop(id) // the same meeting started again replaces itself; other meetings are untouched
+  mkdirSync(join(dir, 'sessions'), { recursive: true })
   if (!prior && brief.attachments?.length)
     brief = { ...brief, attachments: keepAttachments(id, brief.attachments) }
   const attachDir = brief.attachments?.length ? dirname(brief.attachments[0]) : undefined
-  const me: NonNullable<typeof current> = {
+  const me: Running = {
     id,
     cancelled: false,
     paused: false,
@@ -318,9 +332,10 @@ export function runDebate(
     finish: () => {},
     refreshBoard: () => {},
     heard: new Map(),
-    raise: () => {}
+    raise: () => {},
+    interrupt: () => {}
   }
-  current = me
+  meetings.set(id, me)
   const labels = makeLabels(brief.members)
   const session: Session = prior ?? {
     version: 2,
@@ -349,7 +364,7 @@ export function runDebate(
     ? brief.maxTurns + 1
     : Math.max(0, ...transcript.filter((t) => t.speaker !== HUMAN).map((t) => t.n)) + 1
   const emit = (e: DebateEvent): void => {
-    if (current === me) send(e)
+    if (meetings.get(id) === me) send(e)
   }
   // Every CLI call goes through here, so members, the whiteboard writer and the chair are all counted.
   const spent = (session.usage ??= {})
@@ -365,6 +380,44 @@ export function runDebate(
     }
     return r
   }
+  // Race cancellation against the provider, so a slow shutdown never holds the human's message.
+  // Guard callbacks too: a cancelled process may still flush buffered output.
+  const foreground: typeof runMember = async (cli, args, delta, key, model, activity, trace) => {
+    let interrupted = false
+    let cancel!: () => void
+    const cancelled = new Promise<never>((_, reject) => {
+      cancel = () => {
+        interrupted = true
+        reject(new HumanInterrupted('The human has the floor.'))
+        killRun(key)
+      }
+    })
+    me.interrupt = cancel
+    try {
+      return await Promise.race([
+        runner(
+          cli,
+          args,
+          (text) => {
+            if (!interrupted) delta(text)
+          },
+          key,
+          (value) => {
+            if (!interrupted) model?.(value)
+          },
+          (value) => {
+            if (!interrupted) activity?.(value)
+          },
+          (value) => {
+            if (!interrupted) trace?.(value)
+          }
+        ),
+        cancelled
+      ])
+    } finally {
+      if (me.interrupt === cancel) me.interrupt = () => {}
+    }
+  }
 
   const hostMessages = (session.hostMessages ??= [])
   const requestedTurns = new Set(
@@ -376,6 +429,7 @@ export function runDebate(
       .map((message) => message.turn)
   )
   let rotation = Math.max(0, first - 1 - requestedTurns.size)
+  let usedModerationRevision = session.whiteboard?.revision ?? 0
   let chairStarted = false
   let preparing: Member | undefined // the member whose turn is running
   let yielded: Member | undefined // stopped by a raised hand; it speaks again next
@@ -383,10 +437,14 @@ export function runDebate(
   me.raise = (on) => {
     me.paused = on
     if (!on) return me.wake?.()
+    silence()
     if (preparing && !chairStarted) {
       yielded = preparing
-      killRun(`${id}:${preparing.id}`)
     }
+    me.interrupt()
+    live = undefined
+    board.invalidate()
+    emit({ sessionId: id, type: 'human-priority' })
   }
   let live: { n: number; label: string; text: string } | undefined
   const writer = brief.board ?? { cli: chairMember.cli, model: chairMember.model }
@@ -405,7 +463,7 @@ export function runDebate(
     },
     cancel: () => killRun(`${id}:whiteboard`),
     publish: (whiteboard) => {
-      if (me.cancelled || current !== me) return
+      if (me.cancelled || meetings.get(id) !== me) return
       // parseBoard stamps the default model; record who actually wrote it
       whiteboard.model = modelName(writerModel) ?? CLI_META[writer.cli].name
       session.whiteboard = whiteboard
@@ -414,7 +472,7 @@ export function runDebate(
         open: whiteboard.disputed.map((note) => ({ point: note.text, sides: '' }))
       }
       emit({ sessionId: id, type: 'shape', turn: whiteboard.throughTurn, shape: session.shape })
-      save(session)
+      save(session, dir)
       emit({ sessionId: id, type: 'whiteboard', board: whiteboard })
     },
     status: (status, error) => emit({ sessionId: id, type: 'board-status', status, error })
@@ -424,6 +482,8 @@ export function runDebate(
       board.update(
         {
           task: brief.task,
+          focus: session.focus,
+          members: members.map((m) => ({ id: m.id, label: labels[m.id] })),
           turns: transcript.map((t) => ({ n: t.n, label: t.label, text: t.text })),
           live
         },
@@ -432,7 +492,7 @@ export function runDebate(
   }
   me.refreshBoard = () => updateBoard(true)
   me.host = (input) => {
-    if (chairStarted || me.concluding) throw new Error('The meeting is already concluding.')
+    if (session.status !== 'running') throw new Error('The meeting has ended.')
     if (
       !input ||
       !['thought', 'ask', 'focus'].includes(input.kind) ||
@@ -447,16 +507,61 @@ export function runDebate(
     if (input.kind === 'ask' && !members.some((m) => m.id === input.targetId))
       throw new Error('Choose an agent in this meeting.')
     if (hostMessages.some((m) => m.id === input.id)) return
+    const note = input.boardNote
+    if (
+      note &&
+      (typeof note.id !== 'string' ||
+        note.id.length > 100 ||
+        !Number.isInteger(note.revision) ||
+        note.revision < 1 ||
+        typeof note.text !== 'string' ||
+        note.text.length > 320)
+    )
+      throw new Error('This whiteboard reference is invalid.')
     const message: HostMessage = {
       id: input.id,
       kind: input.kind,
       text: input.text.trim(),
       targetId: input.kind === 'ask' ? input.targetId : undefined,
+      boardNote: note,
+      recorded: true,
       status: 'queued'
     }
     hostMessages.push(message)
-    save(session)
+    if (message.kind === 'focus') session.focus = message.text
+    const n = live?.n ?? Math.max(0, ...transcript.map((t) => t.n))
+    const prefix =
+      message.kind === 'focus'
+        ? 'Focus the discussion on: '
+        : message.kind === 'ask'
+          ? `Question for ${labels[message.targetId!]}: `
+          : ''
+    const turn: Turn = {
+      n,
+      speaker: HUMAN,
+      label: 'The Human',
+      vote: null,
+      text:
+        prefix +
+        (note ? `On whiteboard question “${note.text}” (revision ${note.revision}):\n` : '') +
+        message.text
+    }
+    transcript.push(turn)
+    session.converged = false
+    if (preparing && !chairStarted) yielded = preparing
+    silence()
+    me.interrupt()
+    live = undefined
+    board.invalidate()
+    // Never reuse a redirect based on the discussion before the human spoke.
+    if (session.whiteboard) session.whiteboard = { ...session.whiteboard, moderation: undefined }
+    me.paused = false
+    me.wake?.()
+    save(session, dir)
+    emit({ sessionId: id, type: 'human-priority' })
+    emit({ sessionId: id, type: 'human', turn })
     emit({ sessionId: id, type: 'host-message', message })
+    updateBoard(true)
   }
   me.finish = () => {
     if (me.concluding || chairStarted) return
@@ -469,36 +574,54 @@ export function runDebate(
     for (const message of hostMessages.filter(
       (m) => m.status === 'queued' && (all || m.kind !== 'ask' || m.targetId === memberId)
     )) {
-      const prefix =
-        message.kind === 'focus'
-          ? 'Focus the discussion on: '
-          : message.kind === 'ask'
-            ? `Question for ${labels[message.targetId!]}: `
-            : ''
-      const t: Turn = {
-        n,
-        speaker: HUMAN,
-        label: 'The Human',
-        text: prefix + message.text,
-        vote: null
+      if (!message.recorded) {
+        const turn: Turn = {
+          n,
+          speaker: HUMAN,
+          label: 'The Human',
+          vote: null,
+          text:
+            (message.kind === 'focus'
+              ? 'Focus the discussion on: '
+              : message.kind === 'ask'
+                ? `Question for ${labels[message.targetId!]}: `
+                : '') + message.text
+        }
+        transcript.push(turn)
+        message.recorded = true
+        emit({ sessionId: id, type: 'human', turn })
       }
-      transcript.push(t)
       if (message.kind === 'focus') session.focus = message.text
       message.status = 'delivered'
       message.deliveredTo = labels[memberId]
       message.turn = n
-      emit({ sessionId: id, type: 'human', turn: t })
       emit({ sessionId: id, type: 'host-message', message: { ...message } })
     }
-    save(session)
+    save(session, dir)
   }
 
   // Voices: the next member thinks while the previous one is still talking, and audio never falls more
   // than one turn behind (the loop waits for the turn before last to finish playing).
   let audio: Promise<unknown> = Promise.resolve() // fillers and answers reach the player in turn order
   const played: Promise<void>[] = []
+  let audioEpoch = 0
+  let releaseAudio!: () => void
+  let audioCancelled = new Promise<void>((resolve) => {
+    releaseAudio = resolve
+  })
+  const silence = (): void => {
+    audioEpoch++
+    releaseAudio()
+    audioCancelled = new Promise<void>((resolve) => {
+      releaseAudio = resolve
+    })
+    killRun(`${id}:voice`)
+    for (const done of me.heard.values()) done()
+    played.length = 0
+    audio = Promise.resolve()
+  }
   const voiceOf = (m: Member): string | undefined =>
-    brief.voices && m.voice && getKey('openrouter') ? m.voice : undefined
+    brief.voices && m.voice && speech.enabled() ? m.voice : undefined
   const voiceError = (e: unknown): void => {
     if (!me.cancelled)
       emit({
@@ -508,8 +631,10 @@ export function runDebate(
       })
   }
   const sayFiller = (m: Member, n: number, voice: string): void => {
+    const epoch = audioEpoch
     audio = audio.then(() => {
-      const data = filler(voice)
+      if (epoch !== audioEpoch || me.cancelled) return
+      const data = speech.filler(voice)
       if (data)
         emit({
           sessionId: id,
@@ -523,28 +648,36 @@ export function runDebate(
     })
   }
   const sayAnswer = (m: Member, n: number, voice: string, text: string): void => {
-    const sent = audio.then(() =>
-      readAloud(voice, text, `${id}:voice`, (data, last) =>
-        emit({ sessionId: id, type: 'voice', memberId: m.id, turn: n, format: 'pcm', data, last })
-      )
-    )
-    audio = sent.catch(voiceError)
+    const epoch = audioEpoch
+    const sent = audio.then(() => {
+      if (epoch !== audioEpoch || me.cancelled) return 0
+      return speech.readAloud(voice, text, `${id}:voice`, (data, last) => {
+        if (epoch === audioEpoch && !me.cancelled)
+          emit({ sessionId: id, type: 'voice', memberId: m.id, turn: n, format: 'pcm', data, last })
+      })
+    })
+    audio = sent.catch((e) => {
+      if (epoch === audioEpoch) voiceError(e)
+    })
     played.push(
-      sent.then(
-        (bytes) =>
-          new Promise<void>((res) => {
-            if (!bytes) return res()
-            // the renderer acks; the timer covers a closed window. 48,000 bytes = 1 s of audio
-            const t = setTimeout(done, (bytes / 48_000) * 1000 + 15_000)
-            function done(): void {
-              clearTimeout(t)
-              me.heard.delete(n)
-              res()
-            }
-            me.heard.set(n, done)
-          }),
-        () => undefined
-      )
+      Promise.race([
+        audioCancelled,
+        sent.then(
+          (bytes) =>
+            new Promise<void>((res) => {
+              if (!bytes || epoch !== audioEpoch || me.cancelled) return res()
+              // the renderer acks; the timer covers a closed window. 48,000 bytes = 1 s of audio
+              const t = setTimeout(done, (bytes / 48_000) * 1000 + 15_000)
+              function done(): void {
+                clearTimeout(t)
+                me.heard.delete(n)
+                res()
+              }
+              me.heard.set(n, done)
+            }),
+          () => undefined
+        )
+      ])
     )
   }
 
@@ -566,7 +699,12 @@ export function runDebate(
         )
         const requested = members.find((member) => member.id === asked?.targetId)
         // a member cut off by the raised hand goes again, unless the human asked someone else
-        const m = requested ?? yielded ?? members[rotation++ % N]
+        const moderated =
+          !requested && !yielded
+            ? moderatedSpeaker(members, transcript, session.whiteboard, usedModerationRevision)
+            : undefined
+        const m = requested ?? yielded ?? moderated ?? members[rotation % N]
+        if (moderated) usedModerationRevision = session.whiteboard!.revision
         yielded = undefined
         const phase = transcript.some((t) => t.speaker === m.id)
           ? phaseOf(n, N, brief.maxTurns)
@@ -591,12 +729,13 @@ export function runDebate(
         const prompt =
           basePrompt +
           visualContext(session.whiteboard) +
+          moderationContext(session.whiteboard, n - 1) +
           (session.focus
             ? `\n\nThe host's current focus: ${session.focus}\nPrioritize this question and keep your contribution relevant to it.`
             : '')
         const trace: TraceStep[] = []
         try {
-          const r = await runner(
+          const r = await foreground(
             m.cli,
             {
               prompt,
@@ -619,7 +758,7 @@ export function runDebate(
             `${id}:${m.id}`,
             (model) => {
               m.resolvedModel = model
-              save(session)
+              save(session, dir)
               emit({ sessionId: id, type: 'member-model', memberId: m.id, model })
             },
             (kind) => emit({ sessionId: id, type: 'activity', memberId: m.id, turn: n, kind }),
@@ -635,7 +774,7 @@ export function runDebate(
             n,
             speaker: m.id,
             label: labels[m.id],
-            text: stripVote(r.text),
+            text: withoutLocations(stripVote(r.text)),
             vote: extractVote(r.text),
             costUsd: r.costUsd,
             trace: trace.length ? trace : undefined
@@ -647,10 +786,11 @@ export function runDebate(
           if (voice) sayAnswer(m, n, voice, r.text)
         } catch (e) {
           if (me.cancelled) throw e
-          if (cutOff(m)) {
+          if (e instanceof HumanInterrupted || cutOff(m)) {
             // not an error: the human took the floor. Same turn number, same member, after them.
             preparing = undefined
             seen[m.id] = seenBefore
+            delete cliSessions[m.id] // the cancelled CLI session may remember an unfinished response
             live = undefined
             emit({ sessionId: id, type: 'turn-cancelled', memberId: m.id, turn: n })
             n--
@@ -661,10 +801,11 @@ export function runDebate(
           emit({ sessionId: id, type: 'turn-error', memberId: m.id, turn: n, message })
         }
         preparing = undefined
+        if (!requested && !moderated) rotation++
         if (cutOff(m)) yielded = undefined // it finished before the hand went up
         live = undefined
         updateBoard(true)
-        save(session)
+        save(session, dir)
         if (me.cancelled) throw new Error('stopped')
         if (n % N === 0) {
           // a full cycle after the openings with nobody disagreeing = done talking
@@ -687,65 +828,76 @@ export function runDebate(
           }
         }
       }
-      await hold()
       chairStarted = true
-      drainHuman(Math.max(0, ...transcript.map((t) => t.n)), chairMember.id, true)
-      updateBoard(true)
-      emit({ sessionId: id, type: 'chair-start', memberId: chairMember.id })
+      let r: Awaited<ReturnType<typeof runMember>>
       const votes = latestVotes(transcript)
-      const r = await runner(
-        chairMember.cli,
-        {
-          prompt:
-            P.chair(
-              brief,
-              labels,
-              transcript,
-              votes,
-              lastError,
-              me.concluding
-                ? 'The host asked to conclude now. Base the decision on the discussion so far, preserve uncertainty, and explicitly note any members who have not given a position.'
-                : ''
-            ) + visualContext(session.whiteboard),
-          model: chairMember.model
-        },
-        (t) => emit({ sessionId: id, type: 'delta', memberId: chairMember.id, turn: 0, text: t }),
-        `${id}:chair`,
-        (model) => {
-          chairMember.resolvedModel = model
-          save(session)
-          emit({ sessionId: id, type: 'member-model', memberId: chairMember.id, model })
-        },
-        (kind) => emit({ sessionId: id, type: 'activity', memberId: chairMember.id, turn: 0, kind })
-      )
+      while (true) {
+        await hold()
+        try {
+          drainHuman(Math.max(0, ...transcript.map((t) => t.n)), chairMember.id, true)
+          updateBoard(true)
+          emit({ sessionId: id, type: 'chair-start', memberId: chairMember.id })
+          r = await foreground(
+            chairMember.cli,
+            {
+              prompt:
+                P.chair(
+                  brief,
+                  labels,
+                  transcript,
+                  votes,
+                  lastError,
+                  me.concluding
+                    ? 'The host asked to conclude now. Base the decision on the discussion so far, preserve uncertainty, and explicitly note any members who have not given a position.'
+                    : ''
+                ) + visualContext(session.whiteboard),
+              model: chairMember.model
+            },
+            (t) =>
+              emit({ sessionId: id, type: 'delta', memberId: chairMember.id, turn: 0, text: t }),
+            `${id}:chair`,
+            (model) => {
+              chairMember.resolvedModel = model
+              save(session, dir)
+              emit({ sessionId: id, type: 'member-model', memberId: chairMember.id, model })
+            },
+            (kind) =>
+              emit({ sessionId: id, type: 'activity', memberId: chairMember.id, turn: 0, kind })
+          )
+          break
+        } catch (error) {
+          if (!(error instanceof HumanInterrupted) || me.cancelled) throw error
+          // Regenerate the decision from the updated transcript, without the discarded draft.
+        }
+      }
       if (me.cancelled) throw new Error('stopped')
-      const body = r.text.trim()
+      const body = withoutLocations(r.text.trim())
       const cited = sources(body, transcript)
       const markdown = `${body}\n\n${cited ? `${cited}\n\n` : ''}${appendix(session, votes)}`
-      const dir = brief.projectPath
+      const out = brief.projectPath
         ? join(brief.projectPath, 'consortium')
-        : join(userData, 'consortium')
-      mkdirSync(dir, { recursive: true })
+        : join(dir, 'consortium')
+      mkdirSync(out, { recursive: true })
       const path = join(
-        dir,
+        out,
         `${slug(brief.task)}-${new Date().toISOString().slice(0, 16).replace(/[T:]/g, '-')}.md`
       )
       writeFileSync(path, markdown)
       writeFileSync(path.replace(/\.md$/, '.transcript.md'), fullTranscript(session))
       session.consortium = { markdown, path }
       session.status = 'done'
-      save(session)
+      save(session, dir)
       emit({ sessionId: id, type: 'consortium', markdown, path })
     } catch (e) {
       session.status = me.cancelled ? 'stopped' : 'failed'
-      save(session)
+      save(session, dir)
       if (me.cancelled) emit({ sessionId: id, type: 'stopped' })
       else
         emit({ sessionId: id, type: 'failed', message: e instanceof Error ? e.message : String(e) })
     } finally {
       board.dispose()
       emit({ sessionId: id, type: 'board-status', status: 'idle' })
-      if (current === me) current = null
+      if (meetings.get(id) === me) meetings.delete(id)
     }
   })()
   return id

@@ -50,6 +50,31 @@ export function stance(
   return undefined
 }
 
+// The safety net behind the prompts' "no paths or URLs": a citation in parentheses goes, a link
+// keeps its words, a URL goes, and any path left is cut to its file name.
+// ponytail: patterns only (a slash plus an extension, or name.ext:line); a path spelled without
+// either survives.
+const PATH = String.raw`(?:[\w.@-]+\/)+[\w.@-]+\.[A-Za-z]\w{0,5}(?::\d+(?:-\d+)?)?|[\w.-]+\.[A-Za-z]\w{0,5}:\d+(?:-\d+)?`
+const URL_ = String.raw`https?:\/\/[^\s()<>\]]*[^\s()<>\].,;:!?'"]`
+const CITED = new RegExp(
+  String.raw`[ \t]*\((?:(?:see|in|at|from|cf\.)\s+)?(?:\x60?(?:${PATH}|${URL_})\x60?(?:\s*(?:,|;|and)\s*)?)+\)`,
+  'gi'
+)
+export function withoutLocations(text: string): string {
+  return text
+    .replace(/\[([^\]]+)\]\((?:https?:\/\/|\/|\.)[^)\s]*\)/g, '$1')
+    .replace(CITED, '')
+    .replace(new RegExp(`<?${URL_}>?`, 'g'), '')
+    .replace(new RegExp(PATH, 'g'), (p) =>
+      p
+        .replace(/:\d+(?:-\d+)?$/, '')
+        .split('/')
+        .pop()!
+    )
+    .replace(/[ \t]+([.,;:!?])/g, '$1')
+    .replace(/[ \t]{2,}/g, ' ')
+}
+
 // What other members (and the UI) read: the answer without its vote block.
 export function stripVote(text: string): string {
   const blocks = [...text.matchAll(FENCE)]

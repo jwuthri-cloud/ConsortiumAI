@@ -25,6 +25,10 @@ export type RunArgs = {
   dirs?: string[] // extra read-only folders (attachments); codex's read-only sandbox and grok read them by absolute path
   resume?: string
   costBefore?: number // claude: the resumed session's last running cost (see costTotal)
+  // the Deep-agent only: this run's key (hosted Slack: the workspace's), instead of the keychain or
+  // the environment, and the folder that keeps its memory (default: the data folder)
+  apiKey?: string
+  home?: string
 }
 export type RunResult = {
   text: string
@@ -414,12 +418,37 @@ function kill(child: ChildProcess): void {
   } catch {
     child.kill('SIGTERM')
   }
+  // A provider that ignores SIGTERM must not keep working after the human takes over.
+  const timer = setTimeout(() => {
+    if (child.exitCode !== null || child.signalCode !== null) return
+    try {
+      if (child.pid) process.kill(-child.pid, 'SIGKILL')
+    } catch {
+      child.kill('SIGKILL')
+    }
+  }, 1500)
+  timer.unref()
+  child.once('close', () => clearTimeout(timer))
 }
 
 export function killRun(key: string): void {
   const child = procs.get(key)
   if (child) kill(child)
   aborts.get(key)?.abort()
+}
+
+// Every run of one meeting: its keys are `${meetingId}:…`.
+export function killMeeting(id: string): void {
+  for (const [key, c] of procs)
+    if (key.startsWith(`${id}:`)) {
+      kill(c)
+      procs.delete(key)
+    }
+  for (const [key, c] of aborts)
+    if (key.startsWith(`${id}:`)) {
+      c.abort()
+      aborts.delete(key)
+    }
 }
 
 export function killAll(): void {
@@ -565,7 +594,7 @@ export async function runMember(
     finished = true
     clearTimeout(timer)
     clearInterval(modelTimer)
-    procs.delete(key)
+    if (procs.get(key) === child) procs.delete(key)
   }
 }
 

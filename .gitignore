@@ -7,3 +7,8 @@ out
 
 # decision documents the app writes when this repo is attached as a project
 consortium/
+
+# local secrets (Slack tokens)
+.env
+.env.*
+*.local.yml

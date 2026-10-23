@@ -14,6 +14,7 @@ import AgentAvatar, { type Presence } from './AgentAvatar'
 import * as voice from './voice'
 import { useDictation } from './useDictation'
 import { PROVIDERS } from './avatarTheme'
+import type { HostInput } from '@shared/whiteboard'
 import { AgentUsage, UsageMeter } from './Usage'
 
 type Props = {
@@ -106,10 +107,23 @@ export default function Chamber({
 }: Props): React.JSX.Element {
   const brief = s.brief!
   const members = brief.members
-  const [view, setView] = useState<'gallery' | 'speaker' | 'whiteboard'>('gallery')
-  const [panel, setPanel] = useState<'conversation' | 'decision' | 'trace' | null>(
-    s.focusTurn ? 'conversation' : 'decision'
-  )
+  const [view, setView] = useState<'gallery' | 'speaker' | 'whiteboard'>(() => {
+    try {
+      const saved = localStorage.getItem('meeting-view')
+      if (saved === 'gallery' || saved === 'speaker') return saved
+    } catch {
+      /* use the shared workspace */
+    }
+    return 'whiteboard'
+  })
+  useEffect(() => {
+    try {
+      localStorage.setItem('meeting-view', view)
+    } catch {
+      /* optional preference */
+    }
+  }, [view])
+  const [panel, setPanel] = useState<'conversation' | 'decision' | 'trace' | null>('conversation')
   const [pinned, setPinned] = useState<string | null>(null)
   const [thought, setThought] = useState('')
   const [hostMode, setHostMode] = useState('thought')
@@ -131,7 +145,7 @@ export default function Chamber({
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
   const running = ['open', 'debate', 'converge', 'decide'].includes(s.stage)
   const chairWriting = s.chair.status === 'running'
-  const canInterject = running && !chairWriting && !s.concluding
+  const canInterject = running
   const votes = latestVotes(s.turns)
   const memberTurns = s.turns.filter((t) => t.speaker !== HUMAN).length
   const phase =
@@ -174,22 +188,15 @@ export default function Chamber({
                   ? `Pausing after ${s.labels[s.speaking]?.replace(/^The /, '')} finishes`
                   : 'Paused'
                 : 'Live discussion'
-  const regularTurns = s.turns.filter(
-    (turn) =>
-      turn.speaker !== HUMAN &&
-      !s.hostMessages.some(
-        (message) =>
-          message.kind === 'ask' && message.status === 'delivered' && message.turn === turn.n
-      )
-  ).length
+  // Only a host-directed next speaker is certain; moderation may change the normal rotation.
   const nextMember =
-    !s.concluding && s.activity && s.activity.turn > 0 && s.activity.turn < brief.maxTurns
-      ? (members.find(
+    !s.concluding && s.activity?.turn
+      ? members.find(
           (m) =>
             m.id ===
             s.hostMessages.find((message) => message.status === 'queued' && message.kind === 'ask')
               ?.targetId
-        ) ?? members[regularTurns % members.length])
+        )
       : undefined
   const activeName = s.labels[activeId]?.replace(/^The /, '')
   const caption = !running
@@ -241,7 +248,9 @@ export default function Chamber({
   const discussVisual = (text: string): void => {
     setHostMode('thought')
     setThought(text)
-    setNotice('Add your question or send this to the room. It joins the next turn.')
+    setNotice(
+      'Send to take the floor. The active response stops and the room addresses your message.'
+    )
     setPanel('conversation')
     requestAnimationFrame(() => inputRef.current?.focus())
   }
@@ -283,25 +292,36 @@ export default function Chamber({
     setPanel('conversation')
     requestAnimationFrame(() => inputRef.current?.focus())
   }
-  const interject = async (e: React.FormEvent): Promise<void> => {
-    e.preventDefault()
-    if (!thought.trim() || !canInterject || sending) return
+  const sendMessage = async (input: Omit<HostInput, 'id'>): Promise<void> => {
+    if (!input.text.trim() || !canInterject || sending)
+      throw new Error('The room is not ready. Try again.')
     setSending(true)
     try {
       await window.api!.host({
         id: crypto.randomUUID(),
-        kind: hostMode === 'thought' ? 'thought' : hostMode === 'focus' ? 'focus' : 'ask',
-        targetId: members.some((m) => m.id === hostMode) ? hostMode : undefined,
-        text: thought.trim()
+        ...input,
+        text: input.text.trim()
       })
-      setThought('')
-      setNotice(null)
+      setNotice('You have priority. The room is responding to your message.')
       setStick(true)
-      if (hand) void raiseHand(false) // said your piece: the room carries on
-    } catch {
-      setNotice('Could not send. Please try again.')
+      setHand(false)
+      setPaused(false)
     } finally {
       setSending(false)
+    }
+  }
+  const interject = async (e: React.FormEvent): Promise<void> => {
+    e.preventDefault()
+    if (!thought.trim() || !canInterject || sending) return
+    try {
+      await sendMessage({
+        kind: hostMode === 'thought' ? 'thought' : hostMode === 'focus' ? 'focus' : 'ask',
+        targetId: members.some((m) => m.id === hostMode) ? hostMode : undefined,
+        text: thought
+      })
+      setThought('')
+    } catch {
+      setNotice('Could not send. Your message is kept here; please try again.')
     }
   }
   const togglePause = async (): Promise<void> => {
@@ -570,6 +590,7 @@ export default function Chamber({
             onSource={viewSource}
             onRefresh={() => void refreshBoard()}
             onDiscuss={discussVisual}
+            onSend={sendMessage}
           />
         )}
         {view !== 'whiteboard' && (
@@ -791,7 +812,7 @@ export default function Chamber({
                         </p>
                         <span className={message.status}>
                           {message.status === 'queued'
-                            ? 'Queued · next turn'
+                            ? 'Taking the floor…'
                             : `Delivered to ${message.deliveredTo?.replace(/^The /, '')}`}
                         </span>
                       </div>
@@ -810,7 +831,7 @@ export default function Chamber({
                     <option value="focus">Focus the discussion</option>
                     {members.map((m) => (
                       <option key={m.id} value={m.id}>
-                        Ask {s.labels[m.id].replace(/^The /, '')} next
+                        Ask {s.labels[m.id].replace(/^The /, '')} now
                       </option>
                     ))}
                   </select>
@@ -882,7 +903,7 @@ export default function Chamber({
                         ? 'Listening… press the mic again when you are done.'
                         : hand
                           ? 'The meeting is holding for you. Sending resumes it.'
-                          : 'Your message joins the next turn.'
+                          : 'Send to interrupt. Your message takes priority, including during the final decision.'
                       : 'Every perspective stays in the transcript.')}
                 </p>
               </div>

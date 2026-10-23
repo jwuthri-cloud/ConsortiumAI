@@ -13,6 +13,7 @@ export default function App(): React.JSX.Element {
       window.api!.onEvent((e) => {
         // audio goes to the player, not the state; the lobby stays silent (and acks, so nothing waits)
         if (e.type === 'voice') return voice.play(e, screen.current !== 'convene')
+        if (e.type === 'human-priority') voice.cut()
         if (e.type === 'stopped' || e.type === 'failed') voice.stop()
         if (e.type === 'turn-start') voice.turnStarted(e.turn)
         dispatch(e)
@@ -27,12 +28,14 @@ export default function App(): React.JSX.Element {
     return (
       <Convene
         onStart={(brief) => {
+          voice.reset()
           const sessionId = crypto.randomUUID()
           dispatch({ type: 'convene', brief, sessionId })
           void window.api!.start(brief, sessionId)
         }}
         onOpen={(session) => dispatch({ type: 'open', session })}
         onContinue={(session) => {
+          voice.reset()
           dispatch({ type: 'open', session })
           dispatch({ type: 'resume' })
           void window.api!.resume(session.id)

@@ -10,6 +10,8 @@ import { extractJson } from '../shared/vote'
 
 export type BoardSnapshot = {
   task: string
+  focus?: string
+  members?: { id: string; label: string }[]
   turns: { n: number; label: string; text: string }[]
   live?: { n: number; label: string; text: string }
 }
@@ -50,7 +52,31 @@ export function parseBoard(
         }
       ]
     })
+  const moderation = raw.moderation as Record<string, unknown> | undefined
+  const validModeration =
+    moderation &&
+    ['refocus', 'resolve', 'clarify'].includes(String(moderation.kind)) &&
+    typeof moderation.message === 'string' &&
+    moderation.message.trim()
   return {
+    moderation: validModeration
+      ? {
+          kind: moderation.kind as 'refocus' | 'resolve' | 'clarify',
+          message: (moderation.message as string).trim().slice(0, 500),
+          nextMemberId: snapshot.members?.some((m) => m.id === moderation.nextMemberId)
+            ? (moderation.nextMemberId as string)
+            : undefined,
+          sources: Array.isArray(moderation.sources)
+            ? [
+                ...new Set(
+                  moderation.sources.filter(
+                    (n): n is number => typeof n === 'number' && allowed.has(n)
+                  )
+                )
+              ].slice(0, 4)
+            : []
+        }
+      : undefined,
     recommendation: raw.recommendation.slice(0, 500),
     visuals: parseVisuals(raw.visuals, allowed),
     agreed: notes('agreed'),
@@ -73,6 +99,7 @@ Add a "visuals" array to the JSON. Use only these formats (at most 3 visuals tot
 - {"id":"stable-comparison-id","kind":"comparison","title":"Alternatives","caption":"Uncertainty and criteria","sources":[1,2],"options":["Option A","Option B"],"rows":[{"id":"criterion-id","label":"Criterion","cells":["A's tradeoff","B's tradeoff"]}]}. 2–3 distinct options, 1–5 rows, exactly one cell per option. No unsupported scores or invented metrics. Use “Not discussed” for unknowns.
 - {"id":"stable-plan-id","kind":"sequence","title":"Proposed sequence","caption":"Proposal, not a commitment","sources":[1],"steps":[{"id":"step-id","label":"Short step","detail":"What happens here","status":"proposed|agreed|question","sources":[1]}]}. 2–6 steps, with no invented dates.
 Return ONLY JSON: {"recommendation":"current direction, or No recommendation yet","agreed":[{"id":"stable-id","text":"short note","sources":[1]}],"disputed":[],"questions":[],"actions":[],"visuals":[]}.
+${moderatorPrompt(snapshot)}
 Question: ${snapshot.task}
 Conversation:\n${snapshot.turns.slice(-24).map(turnLine).join('\n')}
 Previous board: ${previous ? JSON.stringify(previous) : 'None'}
@@ -86,10 +113,19 @@ const liveLine = ({ live }: BoardSnapshot): string =>
 
 // A resumed writer session already holds the rules, earlier turns and its last board: send only what's new.
 export function boardUpdatePrompt(snapshot: BoardSnapshot, since: number): string {
-  return `New in the conversation since your last board:
+  return `${moderatorPrompt(snapshot)}
+New in the conversation since your last board:
 ${snapshot.turns.slice(since).map(turnLine).join('\n') || '(no new completed turns)'}
 ${liveLine(snapshot)}
 Update your last board under the same rules. Return ONLY the full JSON in the same format.`
+}
+
+function moderatorPrompt(snapshot: BoardSnapshot): string {
+  return `You also moderate this meeting. Keep it useful and focused on the human's actual decision: ${snapshot.task}
+Latest host focus (takes priority over earlier discussion): ${snapshot.focus || 'The original question.'}
+Eligible speakers: ${JSON.stringify(snapshot.members ?? [])}
+After each update, look for drift, repeated arguments, unanswered human input, and specific unresolved disagreements. Redirect tangents back to the decision; preserve useful dissent. If the discussion is productive, return "moderation": null. Otherwise add "moderation": {"kind":"refocus|resolve|clarify","message":"One short, specific instruction explaining what to settle next and why","nextMemberId":"an eligible speaker id, or omit","sources":[1]}.
+Choose the member best placed to answer or test the contested claim, not whoever spoke last. For a missing human constraint, add a question card and tell the next member what can still be established without inventing an answer. Never claim the human agreed, assign them a commitment, or suppress dissent to manufacture consensus. Human messages override your earlier guidance. Remove answered questions; reflect the answer in the direction and notes. Do not keep issuing a redirect once it has been addressed.`
 }
 
 // One writer at a time. Intermediate snapshots are coalesced, never queued as a
@@ -105,7 +141,11 @@ export function createBoardWriter(options: {
   status: (status: BoardStatus, error?: string) => void
   previous?: Whiteboard
   intervalMs?: number
-}): { update: (snapshot: BoardSnapshot, immediate?: boolean) => void; dispose: () => void } {
+}): {
+  update: (snapshot: BoardSnapshot, immediate?: boolean) => void
+  invalidate: () => void
+  dispose: () => void
+} {
   let previous = options.previous
   let pending: BoardSnapshot | undefined
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -116,6 +156,8 @@ export function createBoardWriter(options: {
   let session: string | undefined
   let sent = 0 // snapshot turns the session has already seen
   let resumed = 0
+  let generation = 0
+  let cancelPending: (() => void) | undefined
   const interval = options.intervalMs ?? 8000
   const schedule = (immediate = false): void => {
     if (disposed || busy || !pending) return
@@ -136,17 +178,27 @@ export function createBoardWriter(options: {
     const snapshot = pending
     pending = undefined
     busy = true
+    const version = generation
     lastStart = Date.now()
     options.status('updating')
-    const timeout = setTimeout(options.cancel, 60000)
+    const cancelled = new Promise<never>((_, reject) => {
+      cancelPending = () => reject(new Error('Whiteboard update interrupted.'))
+    })
+    const timeout = setTimeout(() => {
+      options.cancel()
+      cancelPending?.()
+    }, 60000)
     try {
       // ponytail: a fresh session every 20 updates keeps the resumed history from growing without bound
       const resume = resumed < 20 ? session : undefined
-      const out = await options.generate(
-        resume ? boardUpdatePrompt(snapshot, sent) : boardPrompt(snapshot, previous),
-        resume
-      )
-      if (disposed) return
+      const out = await Promise.race([
+        options.generate(
+          resume ? boardUpdatePrompt(snapshot, sent) : boardPrompt(snapshot, previous),
+          resume
+        ),
+        cancelled
+      ])
+      if (disposed || version !== generation) return
       const result = typeof out === 'string' ? out : out.text
       session = typeof out === 'string' ? undefined : out.sessionId
       resumed = resume && session ? resumed + 1 : 0
@@ -156,13 +208,14 @@ export function createBoardWriter(options: {
       options.status('idle')
     } catch (error) {
       session = undefined // a failed or killed run leaves the session's history uncertain
-      if (!disposed)
+      if (!disposed && version === generation)
         options.status(
           'error',
           error instanceof Error ? error.message.slice(0, 250) : 'Whiteboard update failed.'
         )
     } finally {
       clearTimeout(timeout)
+      cancelPending = undefined
       busy = false
       schedule()
     }
@@ -176,11 +229,26 @@ export function createBoardWriter(options: {
       pending = structuredClone(snapshot)
       schedule(immediate)
     },
+    invalidate() {
+      generation++
+      session = undefined
+      lastStart = 0 // a human correction starts a fresh update without the normal batching delay
+      lastInput = ''
+      pending = undefined
+      if (timer) clearTimeout(timer)
+      if (busy) {
+        options.cancel()
+        cancelPending?.()
+      }
+    },
     dispose() {
       disposed = true
       pending = undefined
       if (timer) clearTimeout(timer)
-      if (busy) options.cancel()
+      if (busy) {
+        options.cancel()
+        cancelPending?.()
+      }
     }
   }
 }

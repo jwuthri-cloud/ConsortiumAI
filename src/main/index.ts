@@ -59,16 +59,28 @@ app.whenReady().then(() => {
   const send = (e: DebateEvent): void => {
     win?.webContents.send('debate:event', e)
   }
-  ipcMain.handle('debate:start', (_, brief: Brief, id: string) => debate.runDebate(brief, send, id))
-  ipcMain.handle('debate:stop', () => debate.stop())
-  ipcMain.handle('debate:resume', (_, id: string) => debate.resume(id, send))
-  ipcMain.handle('debate:pause', (_, on: boolean) => debate.pause(on))
-  ipcMain.handle('debate:raiseHand', (_, on: boolean) => debate.raiseHand(on))
+  // The window shows one meeting: opening another stops it. The engine itself runs many at once.
+  let active = ''
+  const show = (id: string): void => {
+    if (active !== id) debate.stop(active)
+    active = id
+  }
+  ipcMain.handle('debate:start', (_, brief: Brief, id: string) => {
+    show(id)
+    return debate.runDebate(brief, send, id)
+  })
+  ipcMain.handle('debate:stop', () => debate.stop(active))
+  ipcMain.handle('debate:resume', (_, id: string) => {
+    show(id)
+    debate.resume(id, send)
+  })
+  ipcMain.handle('debate:pause', (_, on: boolean) => debate.pause(active, on))
+  ipcMain.handle('debate:raiseHand', (_, on: boolean) => debate.raiseHand(active, on))
   ipcMain.handle('debate:spoken', (_, id: string, turn: number) => debate.spoken(id, turn))
-  ipcMain.handle('debate:host', (_, input) => debate.host(input))
-  ipcMain.handle('debate:conclude', () => debate.conclude())
-  ipcMain.handle('debate:refreshBoard', () => debate.refreshBoard())
-  ipcMain.handle('debate:interject', (_, text: string) => debate.interject(text))
+  ipcMain.handle('debate:host', (_, input) => debate.host(active, input))
+  ipcMain.handle('debate:conclude', () => debate.conclude(active))
+  ipcMain.handle('debate:refreshBoard', () => debate.refreshBoard(active))
+  ipcMain.handle('debate:interject', (_, text: string) => debate.interject(active, text))
   ipcMain.handle('dialog:pickFolder', async () => {
     const r = await dialog.showOpenDialog({ properties: ['openDirectory'] })
     return r.canceled ? null : r.filePaths[0]

@@ -1,4 +1,3 @@
-import { app } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -16,6 +15,7 @@ import type { LLMResult } from '@langchain/core/outputs'
 import { API_PROVIDERS, splitModel, type ActivityKind, type TraceStep } from '../shared/types'
 import { priced, sumUsage, type Usage } from '../shared/usage'
 import { getKey } from './keys'
+import { dataDir } from './paths'
 import { tidy, toolDetail } from './trace'
 import { ReadOnlyFolder, fetchTool, gitTool, searchTool } from './agentTools'
 import { humanError, openrouterPrice, track, type Price, type RunArgs, type RunResult } from './cli'
@@ -39,7 +39,7 @@ export function setupPrompt(mounts: string[], web: boolean, today = new Date()):
       ? `You can read these folders by their absolute paths, read-only: ${mounts.join(', ')}. The git tool reads the project's history (log, blame, show, diff).`
       : 'There are no files to read.',
     web
-      ? 'You have internet access: web_search finds pages, fetch_url reads one. Use it when a claim depends on current facts or on something outside the project, and name the URLs you relied on.'
+      ? 'You have internet access: web_search finds pages, fetch_url reads one. Use it when a claim depends on current facts or on something outside the project, and say which sources you relied on by name, without their URLs.'
       : 'fetch_url reads a public web page; web search needs an OpenRouter key, which is not set.',
     'Secrets (.env files, private keys, credentials) are blocked; never try to reach them or send project contents to a website.'
   ].join('\n')
@@ -81,8 +81,7 @@ function reasoningOf(msg: AIMessageChunk): string {
 
 // ponytail: one JSON file per thread, rewritten each turn; a 40-turn meeting on a small-context model
 // relies on Deep Agents' own summarisation to stay inside the window.
-const threadFile = (thread: string): string =>
-  join(app.getPath('userData'), 'harness', `${thread}.json`)
+const threadFile = (home: string, thread: string): string => join(home, 'harness', `${thread}.json`)
 
 export async function runHarness(
   a: RunArgs,
@@ -96,7 +95,7 @@ export async function runHarness(
   const p = API_PROVIDERS[provider]
   if (!model)
     throw new Error('Pick a model for the Deep-agent, like openrouter:anthropic/claude-opus-5.5')
-  const apiKey = getKey(provider)
+  const apiKey = a.apiKey ?? getKey(provider)
   if (!apiKey) throw new Error(`No ${p.name} API key. Paste one in the seat, or set ${p.env}.`)
   onModel(model)
   onActivity('starting')
@@ -104,7 +103,9 @@ export async function runHarness(
 
   // Each folder is mounted at its real absolute path, so the paths the prompts name work as is.
   const mounts = [a.cwd, ...(a.dirs ?? [])].filter((d): d is string => !!d)
-  const searchKey = getKey('openrouter') // web search runs on OpenRouter whatever the seat's provider
+  // web search runs on OpenRouter whatever the seat's provider; a run's own key is an OpenRouter one
+  const searchKey = a.apiKey ?? getKey('openrouter')
+  const home = a.home ?? dataDir()
   const agent = createDeepAgent({
     // ponytail: every provider through its OpenAI-compatible endpoint; add a native @langchain
     // package when a provider-only knob (Anthropic thinking budget, …) is needed
@@ -142,7 +143,7 @@ export async function runHarness(
   if (a.resume)
     try {
       history = mapStoredMessagesToChatMessages(
-        JSON.parse(readFileSync(threadFile(thread), 'utf8'))
+        JSON.parse(readFileSync(threadFile(home, thread), 'utf8'))
       )
     } catch {
       /* memory file gone: carry on from this turn */
@@ -219,8 +220,11 @@ export async function runHarness(
   const out = (answer && isAIMessage(answer) && answer.text) || text
   if (!out.trim()) throw new Error(`${model} returned no answer`)
   if (messages.length) {
-    mkdirSync(join(app.getPath('userData'), 'harness'), { recursive: true })
-    writeFileSync(threadFile(thread), JSON.stringify(mapChatMessagesToStoredMessages(messages)))
+    mkdirSync(join(home, 'harness'), { recursive: true })
+    writeFileSync(
+      threadFile(home, thread),
+      JSON.stringify(mapChatMessagesToStoredMessages(messages))
+    )
   }
   const known = await price
   const total = sumUsage(calls.map((c) => callUsage(c, known)))

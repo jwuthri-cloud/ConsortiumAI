@@ -1,11 +1,14 @@
-import { app, safeStorage } from 'electron'
+import { safeStorage } from 'electron'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { API_PROVIDERS, type ApiProvider, type KeySource } from '../shared/types'
+import { dataDir } from './paths'
 
 // API keys for the Deep-agent seat, encrypted with the OS keychain (safeStorage), never sent to the renderer.
 // An environment variable (OPENROUTER_API_KEY, …) works too, for `npm run dev` from a shell.
-const file = (): string => join(app.getPath('userData'), 'keys.json')
+const file = (): string => join(dataDir(), 'keys.json')
+// Only Electron can decrypt what Electron saved; the API server reads keys from its environment.
+const keychain = (): boolean => !!process.versions.electron && !!safeStorage
 
 function stored(): Partial<Record<ApiProvider, string>> {
   try {
@@ -16,7 +19,7 @@ function stored(): Partial<Record<ApiProvider, string>> {
 }
 
 export function getKey(p: ApiProvider): string | undefined {
-  const enc = stored()[p]
+  const enc = keychain() ? stored()[p] : undefined
   if (enc)
     try {
       return safeStorage.decryptString(Buffer.from(enc, 'base64'))
@@ -30,7 +33,7 @@ export function setKey(p: ApiProvider, key: string): void {
   if (!(p in API_PROVIDERS)) throw new Error(`Unknown provider ${p}`)
   const all = stored()
   if (key.trim()) {
-    if (!safeStorage.isEncryptionAvailable())
+    if (!keychain() || !safeStorage.isEncryptionAvailable())
       throw new Error(`No keychain to store the key in. Set ${API_PROVIDERS[p].env} instead.`)
     all[p] = safeStorage.encryptString(key.trim()).toString('base64')
   } else delete all[p]
@@ -42,7 +45,7 @@ export function listKeys(): Record<ApiProvider, KeySource> {
   return Object.fromEntries(
     (Object.keys(API_PROVIDERS) as ApiProvider[]).map((p) => [
       p,
-      all[p] ? 'saved' : process.env[API_PROVIDERS[p].env] ? 'env' : null
+      all[p] && keychain() ? 'saved' : process.env[API_PROVIDERS[p].env] ? 'env' : null
     ])
   ) as Record<ApiProvider, KeySource>
 }

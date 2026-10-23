@@ -172,6 +172,10 @@ let activeRun:
       board?: Whiteboard
       members: Brief['members']
       writing?: boolean
+      epoch: number
+      turn: number
+      lastHuman?: string
+      interrupt?: () => void
     }
   | undefined
 const hold = async (run: NonNullable<typeof activeRun>): Promise<void> => {
@@ -187,7 +191,9 @@ export const mockApi: Api = {
       paused: false,
       pending: [],
       concluding: false,
-      members: brief.members
+      members: brief.members,
+      epoch: 0,
+      turn: 0
     }
     activeRun = run
     const labels = makeLabels(brief.members)
@@ -213,120 +219,164 @@ export const mockApi: Api = {
       if (run.stopped || run.concluding) return
       const asked = run.pending.find((message) => message.kind === 'ask')
       const m =
-        brief.members.find((member) => member.id === asked?.targetId) ??
-        brief.members[rotation++ % N]
+        brief.members.find((member) => member.id === asked?.targetId) ?? brief.members[rotation % N]
       for (const message of run.pending.filter(
         (message) => message.kind !== 'ask' || message.targetId === m.id
       )) {
-        const text = message.text
         message.status = 'delivered'
         message.turn = n + 1
         message.deliveredTo = labels[m.id]
         emit({ sessionId, type: 'host-message', message: { ...message } })
         run.pending = run.pending.filter((p) => p.id !== message.id)
-        emit({
-          sessionId,
-          type: 'human',
-          turn: { n: n + 1, speaker: HUMAN, label: 'You', text, vote: null }
-        })
       }
       n++
-      emit({
-        sessionId,
-        type: 'member-model',
-        memberId: m.id,
-        model: modelName(m.model) ?? DEMO_MODELS[m.cli]
+      run.turn = n
+      const epoch = run.epoch
+      let cancel!: () => void
+      const cancelled = new Promise<never>((_, reject) => {
+        cancel = () => reject(new Error('interrupted'))
       })
-      emit({ sessionId, type: 'turn-start', memberId: m.id, turn: n, phase })
-      emit({ sessionId, type: 'activity', memberId: m.id, turn: n, kind: 'thinking' })
-      // what the Trace tab shows: a few illustrative steps per turn
-      const trace: TraceStep[] = []
-      const step = (s: TraceStep): void => {
-        trace.push(s)
-        emit({ sessionId, type: 'trace', memberId: m.id, turn: n, step: s })
-      }
-      step(
-        m.cli === 'claude'
-          ? { kind: 'thinking', tokens: 180 + n * 40 }
-          : {
-              kind: 'thinking',
-              text: 'Weighing the small CSV export against the billing rework: both touch the invoice tables, so order matters more than scope.'
-            }
-      )
-      await sleep(900)
-      if (run.stopped) return
-      if (brief.projectPath) {
-        emit({ sessionId, type: 'activity', memberId: m.id, turn: n, kind: 'searching' })
-        step({
-          kind: 'tool',
-          name: m.cli === 'codex' ? 'shell' : 'grep',
-          detail: m.cli === 'codex' ? "rg -n 'export' src/jobs" : '"export" in src/jobs'
+      run.interrupt = cancel
+      const wait = (ms: number): Promise<void> => Promise.race([sleep(ms), cancelled])
+      const reply = run.lastHuman
+        ? `Your message takes priority: “${run.lastHuman}”. In the live app, the agent now reassesses its answer with this context. This browser preview is scripted.`
+        : text
+      try {
+        emit({
+          sessionId,
+          type: 'member-model',
+          memberId: m.id,
+          model: modelName(m.model) ?? DEMO_MODELS[m.cli]
         })
-        await sleep(1100)
+        emit({ sessionId, type: 'turn-start', memberId: m.id, turn: n, phase })
+        emit({ sessionId, type: 'activity', memberId: m.id, turn: n, kind: 'thinking' })
+        // what the Trace tab shows: a few illustrative steps per turn
+        const trace: TraceStep[] = []
+        const step = (s: TraceStep): void => {
+          trace.push(s)
+          emit({ sessionId, type: 'trace', memberId: m.id, turn: n, step: s })
+        }
+        step(
+          m.cli === 'claude'
+            ? { kind: 'thinking', tokens: 180 + n * 40 }
+            : {
+                kind: 'thinking',
+                text: 'Weighing the small CSV export against the billing rework: both touch the invoice tables, so order matters more than scope.'
+              }
+        )
+        await wait(900)
         if (run.stopped) return
-        emit({ sessionId, type: 'activity', memberId: m.id, turn: n, kind: 'reading' })
-        step({ kind: 'tool', name: 'read_file', detail: 'src/jobs/queue.ts:30-60' })
-        await sleep(1100)
+        if (brief.projectPath) {
+          emit({ sessionId, type: 'activity', memberId: m.id, turn: n, kind: 'searching' })
+          step({
+            kind: 'tool',
+            name: m.cli === 'codex' ? 'shell' : 'grep',
+            detail: m.cli === 'codex' ? "rg -n 'export' src/jobs" : '"export" in src/jobs'
+          })
+          await wait(1100)
+          if (run.stopped) return
+          emit({ sessionId, type: 'activity', memberId: m.id, turn: n, kind: 'reading' })
+          step({ kind: 'tool', name: 'read_file', detail: 'src/jobs/queue.ts:30-60' })
+          await wait(1100)
+          if (run.stopped) return
+          emit({ sessionId, type: 'activity', memberId: m.id, turn: n, kind: 'reviewing' })
+          await wait(900)
+        }
         if (run.stopped) return
-        emit({ sessionId, type: 'activity', memberId: m.id, turn: n, kind: 'reviewing' })
-        await sleep(900)
-      }
-      if (run.stopped) return
-      const words = text.split(' ')
-      for (let i = 0; i < words.length; i++) {
+        const words = reply.split(' ')
+        for (let i = 0; i < words.length; i++) {
+          if (run.stopped) return
+          emit({
+            sessionId,
+            type: 'delta',
+            memberId: m.id,
+            turn: n,
+            text: (i ? ' ' : '') + words[i]
+          })
+          await wait(30)
+        }
         if (run.stopped) return
-        emit({ sessionId, type: 'delta', memberId: m.id, turn: n, text: (i ? ' ' : '') + words[i] })
-        await sleep(30)
-      }
-      if (run.stopped) return
-      const t: Turn = { n, speaker: m.id, label: labels[m.id], text, vote, costUsd: 0.03, trace }
-      emit({ sessionId, type: 'turn-done', turn: t })
-      spend(m.id, m.cli, text.length)
-      emit({ sessionId, type: 'board-status', status: 'updating' })
-      run.board = {
-        visuals: demoVisuals(n),
-        model: (() => {
-          const w = brief.board ?? brief.members.find((x) => x.id === brief.chairId)!
-          return modelName(w.model) ?? DEMO_MODELS[w.cli]
-        })(),
-        revision: n,
-        updatedAt: new Date().toISOString(),
-        throughTurn: n,
-        recommendation:
-          n > 4
-            ? 'A small CSV export first. Keep the API as a separate decision.'
-            : 'Exploring whether a focused data export is worth prioritizing.',
-        agreed:
-          n > 4
-            ? [{ id: 'csv', text: 'Scope the first release to a capped CSV export.', sources: [5] }]
-            : [],
-        disputed:
-          n >= 2
-            ? [
-                {
-                  id: 'timing',
-                  text: 'Export demand versus protecting time for the billing rework.',
+        const t: Turn = {
+          n,
+          speaker: m.id,
+          label: labels[m.id],
+          text: reply,
+          vote,
+          costUsd: 0.03,
+          trace
+        }
+        emit({ sessionId, type: 'turn-done', turn: t })
+        spend(m.id, m.cli, text.length)
+        emit({ sessionId, type: 'board-status', status: 'updating' })
+        if (!asked) rotation++
+        run.board = {
+          moderation:
+            n >= 3
+              ? {
+                  kind: 'resolve',
+                  message:
+                    'Settle the timing against the billing rework before expanding export scope.',
+                  nextMemberId: brief.members[(rotation + 1) % N].id,
                   sources: [1, 2]
                 }
-              ]
-            : [],
-        questions: [
-          {
-            id: 'demand',
-            text: 'Which customers need export, and what evidence supports the priority?',
-            sources: [1]
-          }
-        ],
-        actions: [
-          {
-            id: 'proposal',
-            text: 'Proposal: test a small export behind a feature flag.',
-            sources: [1]
-          }
-        ]
+              : undefined,
+          visuals: demoVisuals(n),
+          model: (() => {
+            const w = brief.board ?? brief.members.find((x) => x.id === brief.chairId)!
+            return modelName(w.model) ?? DEMO_MODELS[w.cli]
+          })(),
+          revision: n,
+          updatedAt: new Date().toISOString(),
+          throughTurn: n,
+          recommendation:
+            n > 4
+              ? 'A small CSV export first. Keep the API as a separate decision.'
+              : 'Exploring whether a focused data export is worth prioritizing.',
+          agreed:
+            n > 4
+              ? [
+                  {
+                    id: 'csv',
+                    text: 'Scope the first release to a capped CSV export.',
+                    sources: [5]
+                  }
+                ]
+              : [],
+          disputed:
+            n >= 2
+              ? [
+                  {
+                    id: 'timing',
+                    text: 'Export demand versus protecting time for the billing rework.',
+                    sources: [1, 2]
+                  }
+                ]
+              : [],
+          questions: [
+            {
+              id: 'demand',
+              text: 'Which customers need export, and what evidence supports the priority?',
+              sources: [1]
+            }
+          ],
+          actions: [
+            {
+              id: 'proposal',
+              text: 'Proposal: test a small export behind a feature flag.',
+              sources: [1]
+            }
+          ]
+        }
+        emit({ sessionId, type: 'whiteboard', board: run.board })
+        emit({ sessionId, type: 'board-status', status: 'idle' })
+      } catch (error) {
+        if (epoch === run.epoch) throw error
+        emit({ sessionId, type: 'turn-cancelled', memberId: m.id, turn: n })
+        n--
+        return speak(phase, text, vote)
+      } finally {
+        if (run.interrupt === cancel) run.interrupt = undefined
       }
-      emit({ sessionId, type: 'whiteboard', board: run.board })
-      emit({ sessionId, type: 'board-status', status: 'idle' })
     }
     for (let i = 0; i < N && !run.concluding; i++)
       await speak('open', OPENINGS[i % OPENINGS.length], {
@@ -415,36 +465,47 @@ export const mockApi: Api = {
     if (run.stopped) return
     run.writing = true
     const chair = brief.chairId
-    for (const message of run.pending.splice(0)) {
-      emit({
-        sessionId,
-        type: 'host-message',
-        message: { ...message, status: 'delivered', deliveredTo: labels[chair] }
-      })
-      emit({
-        sessionId,
-        type: 'human',
-        turn: { n, speaker: HUMAN, label: 'The Human', text: message.text, vote: null }
-      })
-    }
-    emit({ sessionId, type: 'chair-start', memberId: chair })
-    const doc = run.concluding
-      ? `# Early meeting recap\n\n## Recommendation\nThe host ended discussion after ${n} turns. Review the positions heard so far before committing to a release.\n\n## Unresolved questions\nThis preview does not generate a new decision; the Electron app asks the chair to synthesize the actual conversation.\n`
-      : `# Consortium: Customer data export\n\n## Recommendation\nBuild a capped, asynchronous CSV export behind a feature flag, starting right after the billing rework; no JSON API this quarter. Export is a procurement checklist item and a churn driver, and the small version costs days [T1, T3].\n\n## Trade-offs\n- **Gains:** unblocks the two renewals that asked [T2]; the async job reuses the existing queue in \`src/jobs/queue.ts:42\` [T4].\n- **Gives up:** a JSON API that integrators could build on; ${L(1)} argued it is the durable answer [T2].\n- **Rejected:** shipping before the billing rework, because both touch the same invoice tables [T5].\n\n## Next actions\n1. Flagged CSV export, async job, rate limited [T4].\n2. Pilot with the two renewal accounts that asked [T2].\n3. Revisit the JSON API when a named customer needs it [T6].\n\n## Unresolved questions\n- ${L(1)} accepts the CSV only on condition that the billing rework keeps priority [T5].\n- Which cap per export?\n`
-    const words = doc.split(' ')
-    for (let i = 0; i < words.length; i++) {
+    while (true) {
+      const epoch = run.epoch
+      for (const message of run.pending.splice(0)) {
+        emit({
+          sessionId,
+          type: 'host-message',
+          message: { ...message, status: 'delivered', deliveredTo: labels[chair] }
+        })
+      }
+      emit({ sessionId, type: 'chair-start', memberId: chair })
+      const doc = run.concluding
+        ? `# Early meeting recap\n\n## Recommendation\nThe host ended discussion after ${n} turns. Review the positions heard so far before committing to a release.\n\n## Unresolved questions\nThis preview does not generate a new decision; the Electron app asks the chair to synthesize the actual conversation.\n`
+        : `# Consortium: Customer data export\n\n## Recommendation\nBuild a capped, asynchronous CSV export behind a feature flag, starting right after the billing rework; no JSON API this quarter. Export is a procurement checklist item and a churn driver, and the small version costs days [T1, T3].\n\n## Trade-offs\n- **Gains:** unblocks the two renewals that asked [T2]; the async job reuses the existing queue in \`src/jobs/queue.ts:42\` [T4].\n- **Gives up:** a JSON API that integrators could build on; ${L(1)} argued it is the durable answer [T2].\n- **Rejected:** shipping before the billing rework, because both touch the same invoice tables [T5].\n\n## Next actions\n1. Flagged CSV export, async job, rate limited [T4].\n2. Pilot with the two renewal accounts that asked [T2].\n3. Revisit the JSON API when a named customer needs it [T6].\n\n## Unresolved questions\n- ${L(1)} accepts the CSV only on condition that the billing rework keeps priority [T5].\n- Which cap per export?\n`
+      const words = (
+        run.lastHuman
+          ? `# Updated preview decision\n\nYour latest message: ${run.lastHuman}\n\nThe live app regenerates the decision using your correction. This preview is scripted.`
+          : doc
+      ).split(' ')
+      for (let i = 0; i < words.length; i++) {
+        if (run.stopped) return
+        if (epoch !== run.epoch) break
+        emit({
+          sessionId,
+          type: 'delta',
+          memberId: chair,
+          turn: 0,
+          text: (i ? ' ' : '') + words[i]
+        })
+        await sleep(18)
+      }
       if (run.stopped) return
-      emit({ sessionId, type: 'delta', memberId: chair, turn: 0, text: (i ? ' ' : '') + words[i] })
-      await sleep(18)
+      if (epoch !== run.epoch) continue
+      spend('chair', brief.members.find((m) => m.id === chair)!.cli, doc.length)
+      emit({
+        sessionId,
+        type: 'consortium',
+        markdown: words.join(' '),
+        path: '/Users/you/project/consortium/customer-data-export.md'
+      })
+      break
     }
-    if (run.stopped) return
-    spend('chair', brief.members.find((m) => m.id === chair)!.cli, doc.length)
-    emit({
-      sessionId,
-      type: 'consortium',
-      markdown: doc,
-      path: '/Users/you/project/consortium/customer-data-export.md'
-    })
     if (activeRun === run) activeRun = undefined
   },
   async stop() {
@@ -460,7 +521,12 @@ export const mockApi: Api = {
     if (s) void mockApi.start(s.brief, id) // ponytail: replays the script from turn 1
   },
   async raiseHand(on) {
-    await mockApi.pause(on) // ponytail: the demo's scripted turn finishes instead of being redone
+    if (on && activeRun) {
+      activeRun.epoch++
+      activeRun.interrupt?.()
+      emit({ sessionId: activeRun.id, type: 'human-priority' })
+    }
+    await mockApi.pause(on)
   },
   async pause(on) {
     if (!activeRun) return
@@ -472,11 +538,28 @@ export const mockApi: Api = {
     await mockApi.host({ id: crypto.randomUUID(), kind: 'thought', text })
   },
   async host(input) {
-    if (!activeRun || activeRun.concluding || activeRun.writing)
-      throw new Error('This meeting is concluding.')
+    if (!activeRun) throw new Error('This meeting has ended.')
+    const run = activeRun
     const message: HostMessage = { ...input, status: 'queued' }
-    activeRun.pending.push(message)
-    emit({ sessionId: activeRun.id, type: 'host-message', message })
+    run.pending.push(message)
+    run.lastHuman = input.text
+    run.epoch++
+    run.interrupt?.()
+    run.paused = false
+    run.wake?.()
+    emit({ sessionId: run.id, type: 'human-priority' })
+    emit({
+      sessionId: run.id,
+      type: 'human',
+      turn: {
+        n: run.turn,
+        speaker: HUMAN,
+        label: 'You',
+        vote: null,
+        text: (input.boardNote ? `On “${input.boardNote.text}”: ` : '') + input.text
+      }
+    })
+    emit({ sessionId: run.id, type: 'host-message', message })
   },
   async conclude() {
     if (!activeRun) return

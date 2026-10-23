@@ -134,6 +134,7 @@ export type ActivityKind =
   'starting' | 'thinking' | 'reading' | 'searching' | 'tool' | 'reviewing' | 'responding'
 
 export type DebateEvent = { sessionId: string } & (
+  | { type: 'human-priority' }
   | { type: 'whiteboard'; board: Whiteboard }
   | { type: 'board-status'; status: BoardStatus; error?: string }
   | { type: 'host-message'; message: HostMessage }

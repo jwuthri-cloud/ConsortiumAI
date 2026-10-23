@@ -5,7 +5,14 @@ export const BOARD_WRITER = { cli: 'claude', model: 'claude-haiku-5-5' } as cons
 export const BOARD_COLUMNS = ['agreed', 'disputed', 'questions', 'actions'] as const
 export type BoardColumn = (typeof BOARD_COLUMNS)[number]
 export type BoardNote = { id: string; text: string; sources: number[] }
+export type Moderation = {
+  kind: 'refocus' | 'resolve' | 'clarify'
+  message: string
+  nextMemberId?: string
+  sources: number[]
+}
 export type Whiteboard = {
+  moderation?: Moderation
   visuals?: BoardVisual[]
   recommendation: string
   agreed: BoardNote[]
@@ -24,8 +31,10 @@ export type HostInput = {
   kind: 'thought' | 'ask' | 'focus'
   text: string
   targetId?: string
+  boardNote?: { id: string; revision: number; text: string }
 }
 export type HostMessage = HostInput & {
+  recorded?: boolean // human text is already persisted; absent in older queued messages
   status: 'queued' | 'delivered'
   deliveredTo?: string
   turn?: number
