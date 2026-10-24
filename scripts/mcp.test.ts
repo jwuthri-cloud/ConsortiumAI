@@ -430,38 +430,25 @@ test('the Home tab: connections, their state, and Connect buttons for admins onl
 
 test('connecting Datadog or a custom server, and the allowed tools', () => {
   assert.ok(JSON.stringify(connectModal('datadog')).includes('datadoghq.eu'))
-  assert.ok(
-    JSON.stringify(connectModal('datadog', 'https://x/mcp/callback')).includes(
-      'https://x/mcp/callback'
-    )
-  )
-  // no token: Datadog's own sign-in, authorized from the Home tab like Linear
-  assert.deepEqual(readConnect('datadog', { site: { site: sel('datadoghq.eu') } }), {
+  const dd = readConnect('datadog', {
+    site: { site: sel('datadoghq.eu') },
+    api: { api: { value: ' key1 ' } },
+    app: { app: { value: 'key2' } }
+  })
+  assert.deepEqual(dd, {
     conn: {
       id: 'datadog',
       name: 'Datadog',
       url: 'https://mcp.datadoghq.eu/api/unstable/mcp-server/mcp',
-      auth: 'oauth'
+      auth: 'headers'
     },
-    headers: {}
+    headers: { DD_API_KEY: 'key1', DD_APPLICATION_KEY: 'key2' }
   })
-  // a token: sent as a bearer, "Bearer " pasted or not
-  assert.deepEqual(
-    readConnect('datadog', {
-      site: { site: sel('datadoghq.com') },
-      token: { token: { value: ' Bearer ddpat_123 ' } }
-    }),
-    {
-      conn: {
-        id: 'datadog',
-        name: 'Datadog',
-        url: 'https://mcp.datadoghq.com/api/unstable/mcp-server/mcp',
-        auth: 'headers'
-      },
-      headers: { Authorization: 'Bearer ddpat_123' }
-    }
-  )
-  assert.deepEqual(Object.keys((readConnect('datadog', {}) as { errors: object }).errors), ['site'])
+  assert.deepEqual(Object.keys((readConnect('datadog', {}) as { errors: object }).errors).sort(), [
+    'api',
+    'app',
+    'site'
+  ])
   const custom = (name: string, url: string, headers = ''): Values => ({
     name: { name: { value: name } },
     url: { url: { value: url } },
