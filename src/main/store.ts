@@ -107,19 +107,31 @@ export function installations(
       enterpriseId: i.enterprise?.id,
       teamId: i.team?.id
     })
+  // Every Slack request reads its installation before anything answers it, inside Slack's 3 s; an
+  // idle Neon wakes in a second or two, so installs are kept here for a while.
+  // ponytail: per-process cache, fine for one instance; a second instance would need a shared one
+  const cache = new Map<string, { at: number; i: Installation }>()
+  const FRESH = 10 * 60_000
   return {
     storeInstallation: async (i) => {
       const t = id(i as Installation)
       await store.put('installation', t, seal(JSON.stringify(i), secret, t))
+      cache.set(t, { at: Date.now(), i: JSON.parse(JSON.stringify(i)) as Installation }) // as stored
       await onInstall(t, i as Installation)
     },
     fetchInstallation: async (q: InstallationQuery<boolean>) => {
       const t = tenantOf(q)
+      const hit = cache.get(t)
+      if (hit && Date.now() - hit.at < FRESH) return hit.i
       const sealed = await store.get<string>('installation', t)
       if (!sealed) throw new Error(`no installation for ${t}`)
-      return JSON.parse(unseal(sealed, secret, t))
+      const i = JSON.parse(unseal(sealed, secret, t)) as Installation
+      cache.set(t, { at: Date.now(), i })
+      return i
     },
-    deleteInstallation: async (q: InstallationQuery<boolean>) =>
-      store.del('installation', tenantOf(q))
+    deleteInstallation: async (q: InstallationQuery<boolean>) => {
+      cache.delete(tenantOf(q))
+      await store.del('installation', tenantOf(q))
+    }
   }
 }
