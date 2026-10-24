@@ -1584,18 +1584,29 @@ export async function serveHosted(): Promise<App> {
           : preselect(question, repos ?? [], last)
       if (view) {
         // the loading form, opened in time by the caller, becomes the real one (no deadline now)
-        await client.views.update({
-          view_id: view,
-          view: askModal({
-            channel,
-            question: pre?.text,
-            repos,
-            repo,
-            files: reads,
-            install: reinstall,
-            note
+        const fill = (files: boolean): Promise<unknown> =>
+          client.views.update({
+            view_id: view,
+            view: askModal({
+              channel,
+              question: pre?.text,
+              repos,
+              repo,
+              files,
+              install: reinstall,
+              note
+            })
           })
-        })
+        try {
+          await fill(reads)
+        } catch (e) {
+          // Slack has the last word on files:read: the saved scopes can say yes while the app's
+          // settings never asked for it. The form without files, and the reinstall link instead.
+          if (!reads || !/files:read/.test(JSON.stringify((e as { data?: unknown }).data ?? '')))
+            throw e
+          console.error(`slack: ${team} has no files:read after all; the form without files`)
+          await fill(false)
+        }
         return true
       }
       if (!channel) throw new Error('no channel to ask in')

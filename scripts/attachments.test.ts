@@ -885,8 +885,19 @@ test('hosted, end to end: the form on the repository the question names, the pic
   // Slack's Web API, its response_urls, GitHub and OpenRouter: all here
   const slack: [string, Record<string, unknown>][] = []
   const realCall = webApi.WebClient.prototype.apiCall
+  let refuseFiles = false // Slack's answer when the app was never given files:read
   webApi.WebClient.prototype.apiCall = async function (method, options = {}) {
     slack.push([method, options])
+    if (refuseFiles && method === 'views.update' && JSON.stringify(options).includes('file_input'))
+      throw Object.assign(new Error('An API error occurred: invalid_arguments'), {
+        data: {
+          ok: false,
+          error: 'invalid_arguments',
+          response_metadata: {
+            messages: ['[ERROR] file_input block element requires the files:read scope']
+          }
+        }
+      })
     return { ok: true, ts: '1', permalink: 'p', view: { id: 'V1' } }
   }
   const responded: Record<string, unknown>[] = [] // what went to response_urls
@@ -959,6 +970,13 @@ test('hosted, end to end: the form on the repository the question names, the pic
       'connectlyai/connectly-backend'
     )
     assert.equal(view.submit?.text, 'Start')
+
+    // Slack refuses the Files field (no files:read after all): the form still opens, without it
+    refuseFiles = true
+    await command('')
+    const plain = JSON.stringify(last('views.update').view)
+    assert.ok(!plain.includes('file_input') && plain.includes('Reinstall to enable files'))
+    refuseFiles = false
     assert.ok(!slack.some(([m]) => m === 'chat.postMessage')) // nothing started
 
     // repo: still works, silently: the form opens on it, and one it can't read says so, with near names
