@@ -338,11 +338,11 @@ const PRIVACY_BODY = `${header()}
 <h2 id="who">Who runs it</h2>
 <p>Consortium for Slack is built and maintained by <a href="https://github.com/jwuthri-cloud">Julien</a>; the code is open at <a href="https://github.com/jwuthri-cloud/ConsortiumAI">github.com/jwuthri-cloud/ConsortiumAI</a>. The server runs on <a href="https://render.com">Render</a> and the data is stored in a <a href="https://neon.tech">Neon</a> Postgres database, both in the US (Oregon).</p>
 <h2 id="keeps">What this service keeps</h2>
-<p>Per Slack workspace: the installation (its bot token, encrypted), its settings and OpenRouter key (the key encrypted), and each meeting's transcript and decision.</p>
+<p>Per Slack workspace: the installation (its bot token, encrypted), its settings and OpenRouter key (the key encrypted), the tool servers an admin connected (their tokens and keys encrypted), and each meeting's transcript and decision.</p>
 <h2 id="sent">Where questions go</h2>
-<p>Questions, thread replies and the table's answers are sent to OpenRouter and to the model providers the workspace picked, under their terms.</p>
+<p>Questions, thread replies and the table's answers are sent to OpenRouter and to the model providers the workspace picked, under their terms. When the workspace has connected tool servers (Linear, Datadog, …), the seats send them the lookups they make, and what comes back joins the meeting.</p>
 <h2 id="uninstall">Uninstalling</h2>
-<p>Uninstalling the app deletes the workspace's installation, settings, key and transcripts.</p>
+<p>Uninstalling the app deletes the workspace's installation, settings, key, tool connections and transcripts.</p>
 <h2 id="contact">Contact</h2>
 <p>Questions or a request about your data: open an issue at <a href="https://github.com/jwuthri-cloud/ConsortiumAI/issues">github.com/jwuthri-cloud/ConsortiumAI/issues</a>.</p>
 </article>
@@ -575,5 +575,23 @@ export const githubFailed = (why: string): string =>
     label: "Couldn't connect",
     title: 'GitHub didn’t connect.',
     body: `<p>Try again from Consortium's Home tab.</p><p class="detail">${esc(why)}</p>`,
+    actions: slackLinks()
+  })
+
+export const toolConnected = (name: string, team?: string, app?: string): string =>
+  status({
+    tone: 'ok',
+    label: `${name} connected`,
+    title: `${name} is connected.`,
+    body: `<p>The table's seats can now call ${esc(name)}'s read-only tools during meetings in this workspace. The Home tab in Slack shows how many, and which seats use it.</p>`,
+    actions: slackLinks(team, app).map((a) => (a.primary ? { ...a, label: 'Back to Slack' } : a))
+  })
+
+export const toolFailed = (name: string, why: string): string =>
+  status({
+    tone: 'fail',
+    label: "Couldn't connect",
+    title: `${name} didn’t connect.`,
+    body: `<p>Try again from Consortium's Home tab, or connect it as a custom server with an API key.</p><p class="detail">${esc(why)}</p>`,
     actions: slackLinks()
   })

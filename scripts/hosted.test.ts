@@ -26,6 +26,7 @@ import {
   tableModal
 } from '../src/main/hosted'
 import { installations, openStore, seal, unseal } from '../src/main/store'
+import { sealState } from '../src/main/mcp'
 import { bridge, type Tenancy } from '../src/main/slack'
 import type { DebateEvent } from '../src/shared/types'
 
@@ -573,6 +574,25 @@ test("the web pages: landing and privacy, Bolt's OAuth results replaced, nothing
     const [expired, link] = await get(`/openrouter/connect?t=${encodeURIComponent(XSS)}`)
     assert.equal(expired, 400)
     assert.ok(!link.includes('alert(1)'))
+    // MCP sign-ins: a link not signed for it, a server the workspace doesn't sign in to, a state
+    // not ours, and the provider's own error, escaped
+    assert.equal((await get(`/mcp/connect?t=${signLink(SECRET, 'T1', 'U1')}&s=linear`))[0], 400)
+    const t = signLink(SECRET, 'T1', 'U1', Date.now(), 'mcp')
+    assert.equal((await get(`/mcp/connect?t=${t}&s=datadog`))[0], 400)
+    assert.equal((await get(`/mcp/callback?code=c&state=${encodeURIComponent(XSS)}`))[0], 400)
+    const state = sealState(SECRET, {
+      team: 'T1',
+      user: 'U1',
+      server: 'linear',
+      verifier: 'v',
+      client: { client_id: 'c' }
+    })
+    const [denied, deniedPage] = await get(
+      `/mcp/callback?error=${encodeURIComponent(XSS)}&state=${encodeURIComponent(state)}`
+    )
+    assert.equal(denied, 400)
+    assert.match(deniedPage, /Linear didn’t connect/)
+    assert.ok(!deniedPage.includes(XSS))
   } finally {
     await app.stop()
   }

@@ -9,6 +9,7 @@ import { createInterface } from 'node:readline'
 import { tmpdir, homedir } from 'node:os'
 import { mkdirSync, accessSync, readdirSync, readFileSync, constants } from 'node:fs'
 import { join } from 'node:path'
+import type { StructuredToolInterface } from '@langchain/core/tools'
 import type { ActivityKind, ApiProvider, Cli, TraceStep } from '../shared/types'
 
 // Think-only runs (no project attached) get an empty directory, so a CLI that still has read tools finds nothing to read.
@@ -30,6 +31,7 @@ export type RunArgs = {
   apiKey?: string
   home?: string
   images?: string[] // the Deep-agent only: pictures (data URLs) sent with the prompt
+  tools?: StructuredToolInterface[] // the Deep-agent only: the workspace's connected tools (hosted Slack)
 }
 export type RunResult = {
   text: string

@@ -12,6 +12,7 @@ import {
   type StaticSelectAction,
   type types
 } from '@slack/bolt'
+import type { StructuredToolInterface } from '@langchain/core/tools'
 import * as debate from './debate'
 import { toBrief } from './api'
 import { imageModels, listModels, runMember } from './cli'
@@ -37,6 +38,26 @@ import {
   listRepos,
   type Repo
 } from './github'
+import {
+  CATALOG,
+  DATADOG_SITES,
+  LIMITS,
+  beginOAuth,
+  datadogUrl,
+  finishOAuth,
+  headersOf,
+  hide,
+  openState,
+  openToolbox,
+  parseHeaders,
+  probe,
+  publicHttps,
+  refreshed,
+  type Connection,
+  type Open,
+  type Secret,
+  type Toolbox
+} from './mcp'
 import { dataDir } from './paths'
 import { bridge, type Tenancy } from './slack'
 import { derive, installations, openStore, seal, tenantOf, unseal } from './store'
@@ -59,12 +80,15 @@ type Values = Record<
     {
       value?: string | null
       selected_option?: { value: string } | null
+      selected_options?: { value: string }[] | null
       selected_conversation?: string | null
       files?: SlackFile[]
     }
   >
 >
-export type Seat = { model: string; persona: PersonaId } // model: an OpenRouter id
+// model: an OpenRouter id. tools: the connected servers (ids) it may call; unset = all of them,
+// whatever gets connected later (rows saved before tools existed, and the default)
+export type Seat = { model: string; persona: PersonaId; tools?: string[] }
 
 export const SCOPES = [
   'app_mentions:read',
@@ -147,7 +171,19 @@ const inside = (d: string, roots: string[]): boolean =>
 
 // What a meeting's runner may show its seats: the folders convene made for it (`mine`; any other
 // folder is refused), and the attached images for the models that see (`sees`).
-export type Showing = { mine?: string[]; images?: string[]; sees?: (model: string) => boolean }
+// `tools`: a seat's connected tools for one turn, by who calls: m1…m6, chair or whiteboard.
+export type Showing = {
+  mine?: string[]
+  images?: string[]
+  sees?: (model: string) => boolean
+  tools?: (who: string) => StructuredToolInterface[]
+}
+
+// Who a runner call is for → that seat's servers: undefined = all, [] = none (the clerk).
+export function seatTools(s: Settings, who: string): string[] | undefined {
+  const seat = who === 'chair' ? s.seats[s.chair] : s.seats[Number(who.match(/^m(\d+)$/)?.[1]) - 1]
+  return seat ? seat.tools : []
+}
 
 // The runner for one workspace's meetings: its key on every call (whiteboard and chair too), its
 // folder for the agents' memory, and anything but an OpenRouter Deep-agent refused.
@@ -171,8 +207,13 @@ export const keyed =
       !a.resume &&
       !rest[1].endsWith(':whiteboard') &&
       !!o.sees?.(splitModel(a.model).model)
+    const tools = o.tools?.(rest[1].slice(rest[1].indexOf(':') + 1))
     try {
-      return await run(cli, { ...a, apiKey, home, ...(show && { images: o.images }) }, ...rest)
+      return await run(
+        cli,
+        { ...a, apiKey, home, ...(show && { images: o.images }), ...(tools?.length && { tools }) },
+        ...rest
+      )
     } catch (e) {
       throw explain(e)
     }
@@ -320,17 +361,26 @@ const MODEL_ID = /^[a-z0-9][\w.-]*\/[\w.:-]+$/i // an OpenRouter id
 // The Edit table modal's answers → settings, or what's wrong by block. Seat rows are actions
 // blocks (two selects side by side) and Slack shows errors on input blocks only, so the seats'
 // errors go on the chair, right below them.
+// `servers`: the connected servers' ids, the Tools selects' options; a seat with all of them picked
+// gets them all, later ones too.
 export function readTable(
-  values: Values
+  values: Values,
+  servers: string[] = []
 ): { table: Omit<Settings, 'key' | 'keyHint' | 'installer'> } | { errors: Record<string, string> } {
   const v = (block: string): Values[string][string] | undefined => values[block]?.[block]
   const rows = Array.from({ length: ROWS }, (_, i) => {
     const pick = (a: string): string | undefined => values[`seat${i}`]?.[a]?.selected_option?.value
     const persona = pick('persona') as PersonaId
     const model = pick('model') ?? EMPTY
+    const chose = values[`tools${i}`]?.tools?.selected_options?.map((o) => o.value)
+    const tools = chose && !servers.every((id) => chose.includes(id)) ? chose : undefined
     return model === EMPTY
       ? undefined
-      : { model, persona: PERSONA_IDS.includes(persona) ? persona : PERSONA_IDS[i] }
+      : {
+          model,
+          persona: PERSONA_IDS.includes(persona) ? persona : PERSONA_IDS[i],
+          ...(tools && { tools })
+        }
   })
   const seats = rows.filter((r): r is Seat => !!r)
   const row = Number(v('chair')?.selected_option?.value ?? 0)
@@ -426,10 +476,98 @@ const button = (
 
 // The rest of the Home tab: whether the install reads files (else `install`, where to reinstall),
 // and GitHub when this server has it: the account connected, its repositories, admins' link.
+// `tools`: the workspace's MCP connections, and (admins) each OAuth server's sign-in link by id.
 export type HomeMore = {
   files?: boolean
   install?: string
   github?: { connect?: string; account?: string; repos?: number }
+  tools?: { conns: Connection[]; links?: Record<string, string> }
+}
+
+const mrk = (t: string): string =>
+  t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
+
+// The root message's line on the meeting's tools: what the seats can call, and what didn't open.
+export function toolsAttached(box: Pick<Toolbox, 'opened' | 'failed'>): string {
+  return [
+    box.opened.length
+      ? `:hammer_and_wrench: *Tools* ${box.opened.map((o) => `${mrk(o.name)} (${o.tools})`).join(', ')} · read-only, up to ${LIMITS.perTurn} calls a turn`
+      : '',
+    box.failed.length
+      ? `_Tools left out: ${box.failed.map((f) => `${mrk(f.name)} (${mrk(f.why)})`).join('; ')}_`
+      : ''
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
+// A connection's line in the Home tab.
+export function toolStatus(c: Connection): string {
+  if (!c.secret) return ':hourglass_flowing_sand: Not authorized yet'
+  if (c.error) return `:warning: Didn't connect last time: ${mrk(c.error)}`
+  const all = c.tools ?? []
+  const n = all.filter((t) => t.readOnly || c.allow?.includes(t.name)).length
+  const allowed = c.allow?.length ? `, ${c.allow.length} of them allowed by an admin` : ''
+  return `:white_check_mark: ${n} of ${all.length} tools usable${allowed}`
+}
+
+// The servers a seat calls, by name: all connected ones unless it has its own list.
+const seatServers = (seat: Seat, conns: Connection[]): string[] =>
+  conns.filter((c) => !seat.tools || seat.tools.includes(c.id)).map((c) => c.name)
+
+const MAX_CONNECTIONS = 10 // a workspace's MCP servers (the Home tab's blocks are capped at 100)
+
+function toolsBlocks(t: NonNullable<HomeMore['tools']>, admin: boolean): types.KnownBlock[] {
+  const links = t.links ?? {}
+  const rows = t.conns.flatMap((c): types.KnownBlock[] => {
+    const buttons: types.Button[] = [
+      ...(c.auth === 'oauth' && links[c.id]
+        ? [
+            button('mcp_oauth', c.secret ? 'Reconnect' : 'Authorize', {
+              url: links[c.id],
+              ...(!c.secret && { style: 'primary' as const })
+            })
+          ]
+        : []),
+      ...(c.tools?.some((x) => !x.readOnly)
+        ? [button('mcp_allow', 'Allowed tools', { value: c.id })]
+        : []),
+      button('mcp_off', 'Disconnect', {
+        value: c.id,
+        style: 'danger',
+        confirm: {
+          title: plain(`Disconnect ${c.name.slice(0, 80)}?`),
+          text: plain("The table's seats stop calling its tools, and its credentials are deleted."),
+          confirm: plain('Disconnect'),
+          deny: plain('Keep it')
+        }
+      })
+    ]
+    return [
+      section(`*${c.name}* · ${toolStatus(c)}`),
+      ...(admin ? [{ type: 'actions' as const, block_id: `mcp_${c.id}`, elements: buttons }] : [])
+    ]
+  })
+  const add = [
+    ...CATALOG.filter((x) => !t.conns.some((c) => c.id === x.id)).map((x) =>
+      button(`mcp_add_${x.id}`, `Connect ${x.name}`, {
+        value: x.id,
+        ...(x.auth === 'oauth' && links[x.id] && { url: links[x.id] })
+      })
+    ),
+    button('mcp_add_custom', 'Custom MCP server', { value: 'custom' })
+  ]
+  return [
+    { type: 'divider' },
+    section(
+      `*Tools*\n${t.conns.length ? 'Seats can look things up in these services during a meeting, with their read-only tools (and any an admin allows). Each is connected once for the whole workspace; pick which seats use which in *The table → Edit*.' : admin ? 'Connect services like Linear or Datadog, and seats can look things up in them during a meeting, read-only.' : 'No services connected. A workspace admin can connect Linear, Datadog and more here.'}`
+    ),
+    ...rows,
+    ...(admin && t.conns.length < MAX_CONNECTIONS
+      ? [{ type: 'actions' as const, block_id: 'mcp_connect', elements: add }]
+      : [])
+  ]
 }
 
 // What everyone sees; an admin also gets the buttons. `connect` = the "Connect OpenRouter" link.
@@ -440,8 +578,17 @@ export function homeView(
   more: HomeMore = {}
 ): types.HomeView {
   const labels = makeLabels(s.seats.map((x, i) => ({ id: String(i), persona: x.persona })))
+  const conns = more.tools?.conns.filter((c) => c.secret) ?? []
+  const uses = (x: Seat): string => {
+    if (!conns.length) return ''
+    const names = seatServers(x, conns)
+    return ` · :hammer_and_wrench: ${names.length ? names.join(', ') : 'no tools'}`
+  }
   const seats = s.seats
-    .map((x, i) => `${i + 1}. ${labels[i]} · \`${x.model}\`${i === s.chair ? ' · *chair*' : ''}`)
+    .map(
+      (x, i) =>
+        `${i + 1}. ${labels[i]} · \`${x.model}\`${i === s.chair ? ' · *chair*' : ''}${uses(x)}`
+    )
     .join('\n')
   const keyButtons: types.Button[] = [
     ...(connect
@@ -525,6 +672,7 @@ export function homeView(
       ),
       ...(admin ? [{ type: 'actions' as const, elements: keyButtons }] : []),
       ...githubBlocks,
+      ...(more.tools ? toolsBlocks(more.tools, admin) : []),
       { type: 'divider' },
       section(
         `*The table*\n${seats}\nClerk · \`${s.clerk}\` · writes the whiteboard\n\nTurn budget ${s.maxTurns} · up to ${s.maxMeetings} meetings at once · ${s.who === 'admins' ? 'workspace admins' : "everyone in channels I'm in"} can convene`,
@@ -565,7 +713,13 @@ export const keyModal = (): types.ModalView => ({
 })
 
 // `catalogue`: OpenRouter ids, newest first; empty = only the seats' own models to pick from.
-export function tableModal(s: Settings, catalogue: string[]): types.ModalView {
+// `servers`: the connected MCP servers, each seat's Tools select (none: no select).
+export function tableModal(
+  s: Settings,
+  catalogue: string[],
+  servers: { id: string; name: string }[] = []
+): types.ModalView {
+  const serverOptions = servers.map((x) => option(x.id, x.name))
   const personas = PERSONA_IDS.map((p) => option(p, PERSONAS[p].label))
   const groups = modelGroups(catalogue, [...s.seats.map((x) => x.model), s.clerk])
   const models = groups.flatMap((g) => g.options)
@@ -592,7 +746,8 @@ export function tableModal(s: Settings, catalogue: string[]): types.ModalView {
             initial_option: models.find((o) => o.value === (seat?.model ?? EMPTY))
           }
         ]
-      }
+      },
+      ...(serverOptions.length ? [toolsInput(i, serverOptions, seat?.tools)] : [])
     ]
   })
   const seatOptions = Array.from({ length: ROWS }, (_, i) => option(String(i), `Seat ${i + 1}`))
@@ -678,6 +833,191 @@ export function tableModal(s: Settings, catalogue: string[]): types.ModalView {
           min_value: '1',
           max_value: String(MAX_MEETINGS),
           initial_value: String(s.maxMeetings)
+        }
+      }
+    ]
+  }
+}
+
+// A seat's Tools select: its servers picked, or all of them (unset).
+function toolsInput(
+  i: number,
+  options: types.PlainTextOption[],
+  tools?: string[]
+): types.KnownBlock {
+  const initial = options.filter((o) => !tools || tools.includes(o.value ?? ''))
+  return {
+    type: 'input',
+    block_id: `tools${i}`,
+    optional: true,
+    label: plain('Tools'),
+    element: {
+      type: 'multi_static_select',
+      action_id: 'tools',
+      placeholder: plain('No tools'),
+      options,
+      ...(initial.length && { initial_options: initial })
+    }
+  }
+}
+
+// Connecting Datadog (its site and keys) or a custom server (a name, its URL, headers).
+export function connectModal(id: string): types.ModalView {
+  const input = (
+    block_id: string,
+    label: string,
+    hint?: string,
+    extra: Partial<types.PlainTextInput> = {},
+    optional = false
+  ): types.KnownBlock => ({
+    type: 'input',
+    block_id,
+    optional,
+    label: plain(label),
+    element: { type: 'plain_text_input', action_id: block_id, ...extra },
+    ...(hint && { hint: plain(hint) })
+  })
+  const sites = DATADOG_SITES.map((x) => option(x, x))
+  const blocks: types.KnownBlock[] =
+    id === 'datadog'
+      ? [
+          {
+            type: 'input',
+            block_id: 'site',
+            label: plain('Datadog site'),
+            element: {
+              type: 'static_select',
+              action_id: 'site',
+              options: sites,
+              initial_option: sites[0]
+            },
+            hint: plain('Where your Datadog lives: the address you sign in at.')
+          },
+          input('api', 'API key', 'Organization Settings → API Keys.'),
+          input(
+            'app',
+            'Application key',
+            "Organization Settings → Application Keys. Its owner's permissions are what the table can read; an admin must also turn on MCP access."
+          )
+        ]
+      : [
+          input('name', 'Name', 'Shown in the Home tab and before its tools, like "Sourcegraph".', {
+            max_length: 24
+          }),
+          input('url', 'URL', "The server's remote (streamable HTTP) address, https.", {
+            placeholder: plain('https://mcp.example.com/mcp')
+          }),
+          input(
+            'headers',
+            'Headers',
+            'One per line, like Authorization: Bearer <token>. Leave empty for a server you sign in to (OAuth).',
+            { multiline: true },
+            true
+          )
+        ]
+  return {
+    type: 'modal',
+    callback_id: 'mcp_modal',
+    private_metadata: id,
+    title: plain(id === 'datadog' ? 'Connect Datadog' : 'Custom MCP server'),
+    submit: plain('Connect'),
+    close: plain('Cancel'),
+    blocks: [
+      ...blocks,
+      {
+        type: 'context',
+        elements: [
+          {
+            type: 'mrkdwn',
+            text: "Stored encrypted, used only by this workspace's meetings. Seats call only the tools that are marked read-only, unless an admin allows more."
+          }
+        ]
+      }
+    ]
+  }
+}
+
+// The connect form's answers → a connection to try, or what's wrong by block. `taken`: ids in use.
+export function readConnect(
+  id: string,
+  values: Values,
+  taken: string[] = []
+):
+  | { conn: Pick<Connection, 'id' | 'name' | 'url' | 'auth'>; headers: Record<string, string> }
+  | { errors: Record<string, string> } {
+  const v = (block: string): string => (values[block]?.[block]?.value ?? '').trim()
+  if (id === 'datadog') {
+    const site = values.site?.site?.selected_option?.value ?? ''
+    const errors: Record<string, string> = {}
+    if (!v('api')) errors.api = 'Paste an API key.'
+    if (!v('app')) errors.app = 'Paste an application key.'
+    if (!DATADOG_SITES.includes(site)) errors.site = 'Pick a site.'
+    return Object.keys(errors).length
+      ? { errors }
+      : {
+          conn: { id, name: 'Datadog', url: datadogUrl(site), auth: 'headers' },
+          headers: { DD_API_KEY: v('api'), DD_APPLICATION_KEY: v('app') }
+        }
+  }
+  const name = v('name')
+  const slug =
+    name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '') || 'mcp'
+  let cid = slug
+  for (let n = 2; taken.includes(cid) || CATALOG.some((x) => x.id === cid); n++)
+    cid = `${slug}-${n}`
+  const headers = parseHeaders(v('headers'))
+  const errors: Record<string, string> = {}
+  if (!name) errors.name = 'Name it.'
+  try {
+    if (new URL(v('url')).protocol !== 'https:') errors.url = 'An https address.'
+  } catch {
+    errors.url = 'A full address, like https://mcp.example.com/mcp.'
+  }
+  if (typeof headers === 'string') errors.headers = headers
+  return Object.keys(errors).length || typeof headers === 'string'
+    ? { errors }
+    : {
+        conn: {
+          id: cid,
+          name,
+          url: v('url'),
+          auth: Object.keys(headers).length ? 'headers' : 'oauth'
+        },
+        headers
+      }
+}
+
+// An admin's pick of a server's tools that aren't marked read-only, for the seats to call too.
+export function allowModal(c: Connection): types.ModalView {
+  const writes = (c.tools ?? []).filter((t) => !t.readOnly).slice(0, MAX_OPTIONS)
+  const options = writes.map((t) => option(t.name, t.name))
+  const initial = options.filter((o) => c.allow?.includes(o.value ?? ''))
+  const reads = (c.tools ?? []).filter((t) => t.readOnly).length
+  return {
+    type: 'modal',
+    callback_id: 'mcp_allow_modal',
+    private_metadata: c.id,
+    title: plain('Allowed tools'),
+    submit: plain('Save'),
+    close: plain('Cancel'),
+    blocks: [
+      section(
+        `*${c.name}* marks ${reads} of its tools read-only: seats can always call those. These ${writes.length} aren't marked, so they might change something in ${c.name}. Allow only the ones you're sure just read.`
+      ),
+      {
+        type: 'input',
+        block_id: 'allow',
+        optional: true,
+        label: plain('Also allow'),
+        element: {
+          type: 'multi_static_select',
+          action_id: 'allow',
+          placeholder: plain('None'),
+          options,
+          ...(initial.length && { initial_options: initial })
         }
       }
     ]
@@ -968,6 +1308,79 @@ export async function serveHosted(): Promise<App> {
   const visionFor = async (files: SlackFile[]): Promise<string[]> =>
     files.some((f) => kindOf(f) === 'image') ? imageModels() : []
 
+  // MCP servers (mcp.ts): the workspace's list; each secret sealed for that workspace and server
+  const connsOf = async (team: string): Promise<Connection[]> =>
+    (await store.get<Connection[]>('mcp', team)) ?? []
+  // ponytail: read, change, write; an admin's edit and a meeting's update at the same instant: last wins
+  const editConns = async (team: string, f: (l: Connection[]) => Connection[]): Promise<void> =>
+    store.put('mcp', team, f(await connsOf(team)))
+  const putConn = (team: string, c: Connection): Promise<void> =>
+    editConns(team, (l) =>
+      l.some((x) => x.id === c.id) ? l.map((x) => (x.id === c.id ? c : x)) : [...l, c]
+    )
+  // the servers the Edit table offers each seat: the authorized ones
+  const serversOf = async (team: string): Promise<{ id: string; name: string }[]> =>
+    (await connsOf(team)).filter((c) => c.secret).map(({ id, name }) => ({ id, name }))
+  const sealFor = (team: string, id: string, x: Secret): string =>
+    seal(JSON.stringify(x), secret, `${team}:${id}`)
+  const openFor = (team: string, c: Connection): Secret =>
+    JSON.parse(unseal(c.secret ?? '', secret, `${team}:${c.id}`))
+  // A server's credentials for a meeting, an OAuth token about to expire refreshed first. One
+  // refresh per server at a time: Notion's refresh tokens work once, and a reuse revokes the grant.
+  const refreshing = new Map<string, Promise<Secret>>()
+  const credentials = (team: string, c: Connection): Promise<Secret> => {
+    const k = `${team}:${c.id}`
+    const running = refreshing.get(k)
+    if (running) return running
+    const p = (async () => {
+      const now = (await connsOf(team)).find((x) => x.id === c.id) ?? c // another meeting may have refreshed it
+      const sec = openFor(team, now)
+      const g = sec.oauth && (await refreshed(now.url, sec.oauth))
+      if (!g) return sec
+      await editConns(team, (l) =>
+        l.map((x) => (x.id === c.id ? { ...x, secret: sealFor(team, c.id, { oauth: g }) } : x))
+      )
+      return { oauth: g }
+    })().finally(() => refreshing.delete(k))
+    refreshing.set(k, p)
+    return p
+  }
+  // The servers a meeting's seats call, opened; what each listed (or why it didn't open) saved
+  // for the Home tab. Undefined: none to open.
+  const toolboxFor = async (team: string, s: Settings): Promise<Toolbox | undefined> => {
+    const conns = (await connsOf(team)).filter(
+      (c) => c.secret && s.seats.some((x) => !x.tools || x.tools.includes(c.id))
+    )
+    if (!conns.length) return undefined
+    const ready = await Promise.allSettled(conns.map((c) => credentials(team, c)))
+    const open: Open[] = conns.flatMap((c, i) => {
+      const r = ready[i]
+      return r.status === 'fulfilled'
+        ? [{ id: c.id, name: c.name, url: c.url, headers: headersOf(r.value), allow: c.allow }]
+        : []
+    })
+    const box = await openToolbox(open)
+    conns.forEach((c, i) => {
+      const r = ready[i]
+      if (r.status === 'rejected') {
+        console.error(`mcp: ${c.name}'s sign-in didn't refresh: ${msg(r.reason)}`)
+        box.failed.push({
+          id: c.id,
+          name: c.name,
+          why: `sign-in expired: ${msg(r.reason)}`.slice(0, 200)
+        })
+      }
+    })
+    await editConns(team, (l) =>
+      l.map((c) => {
+        const failed = box.failed.find((f) => f.id === c.id)
+        if (box.listed[c.id]) return { ...c, tools: box.listed[c.id], error: undefined }
+        return failed ? { ...c, error: failed.why } : c
+      })
+    )
+    return box
+  }
+
   // GitHub, when this server has its app (README, "Hosted")
   const github = githubApp(e)
   type Link = { installation: number; account: string } // a workspace's GitHub connection
@@ -1059,8 +1472,14 @@ export async function serveHosted(): Promise<App> {
         )
       const folder = join(dataDir(), 'attachments', x.id)
       let work: string | undefined
+      // the seats' tools open while the files and the repository get ready; a failure leaves them out
+      const boxing = toolboxFor(team, s).catch((err) => {
+        console.error(`mcp: no tools for ${team}: ${msg(err)}`)
+        return undefined
+      })
       const done = (): void => {
         for (const d of [folder, work]) if (d) rmSync(d, { recursive: true, force: true })
+        void boxing.then((b) => b?.close())
       }
       try {
         const what = [
@@ -1114,16 +1533,23 @@ export async function serveHosted(): Promise<App> {
           attachments: attachments.length ? attachments : undefined,
           projectPath
         }
+        const box = await boxing
         const run = keyed(key, dir, runMember, {
           mine: [folder, work].filter((d): d is string => !!d),
           images: pixels(got),
-          sees: (m) => vision.includes(m)
+          sees: (m) => vision.includes(m),
+          tools: (who) => box?.forSeat(seatTools(s, who)) ?? []
         })
-        const attached = attachedLine(
-          repo,
-          got.filter((g) => !blind.includes(g)).map((g) => g.name),
-          skipped
-        )
+        const attached = [
+          attachedLine(
+            repo,
+            got.filter((g) => !blind.includes(g)).map((g) => g.name),
+            skipped
+          ),
+          box ? toolsAttached(box) : ''
+        ]
+          .filter(Boolean)
+          .join('\n')
         return { brief, run, dir, question: asked.text, attached, done }
       } catch (err) {
         done()
@@ -1223,7 +1649,7 @@ export async function serveHosted(): Promise<App> {
       return inline(got, skipped)
     },
     forget: async (team) => {
-      for (const kind of ['installation', 'settings', 'github', 'channel-repos'])
+      for (const kind of ['installation', 'settings', 'github', 'channel-repos', 'mcp'])
         await store.del(kind, team)
       rmSync(teamDir(team), { recursive: true, force: true })
     }
@@ -1411,6 +1837,94 @@ export async function serveHosted(): Promise<App> {
           send(res, 502, pages.githubFailed(err instanceof Error ? err.message : String(err)))
         }
       }
+    },
+    {
+      // MCP OAuth (the Home tab's Connect or Authorize): the server's sign-in, then back here
+      path: '/mcp/connect',
+      method: 'GET',
+      handler: async (req, res) => {
+        const q = new URL(req.url ?? '', base).searchParams
+        const who = readLink(secret, q.get('t') ?? '', Date.now(), 'mcp')
+        if (!who) return send(res, 400, pages.expired('Connect'))
+        const id = q.get('s') ?? ''
+        const c =
+          (await connsOf(who.team)).find((x) => x.id === id) ?? CATALOG.find((x) => x.id === id)
+        if (c?.auth !== 'oauth')
+          return send(
+            res,
+            400,
+            pages.toolFailed('That server', "it doesn't connect with a sign-in.")
+          )
+        try {
+          const to = await beginOAuth({
+            url: c.url,
+            redirect: `${base}/mcp/callback`,
+            secret,
+            team: who.team,
+            user: who.user,
+            server: c.id
+          })
+          res.writeHead(302, { location: to }).end()
+        } catch (err) {
+          send(res, 502, pages.toolFailed(c.name, msg(err)))
+        }
+      }
+    },
+    {
+      path: '/mcp/callback',
+      method: 'GET',
+      handler: async (req, res) => {
+        const q = new URL(req.url ?? '', base).searchParams
+        const st = openState(secret, q.get('state') ?? '')
+        if (!st) return send(res, 400, pages.expired('Connect'))
+        const had = (await connsOf(st.team)).find((x) => x.id === st.server)
+        const c = had ?? CATALOG.find((x) => x.id === st.server)
+        if (!c) return send(res, 400, pages.expired('Connect'))
+        const code = q.get('code')
+        if (!code)
+          return send(
+            res,
+            400,
+            pages.toolFailed(
+              c.name,
+              q.get('error_description') ?? q.get('error') ?? 'no sign-in came back.'
+            )
+          )
+        try {
+          const redirect = `${base}/mcp/callback`
+          const grant = await finishOAuth({
+            url: c.url,
+            redirect,
+            code,
+            iss: q.get('iss') ?? undefined,
+            state: st
+          })
+          const sec: Secret = { oauth: grant }
+          let tools: Connection['tools']
+          let error: string | undefined
+          try {
+            tools = await probe({ url: c.url, headers: headersOf(sec) })
+          } catch (err) {
+            error = hide(msg(err), [grant.tokens.access_token]).slice(0, 200)
+          }
+          await putConn(st.team, {
+            ...had,
+            id: c.id,
+            name: c.name,
+            url: c.url,
+            auth: 'oauth',
+            secret: sealFor(st.team, c.id, sec),
+            tools: tools ?? had?.tools,
+            error
+          })
+          const i = await installOf(st.team)
+          if (i?.bot?.token)
+            void publishHome(new webApi.WebClient(i.bot.token), st.team, st.user).catch(() => {})
+          send(res, 200, pages.toolConnected(c.name, st.team, i?.appId))
+        } catch (err) {
+          send(res, 502, pages.toolFailed(c.name, msg(err)))
+        }
+      }
     }
   ]
 
@@ -1448,7 +1962,9 @@ export async function serveHosted(): Promise<App> {
     const connect = admin
       ? `${base}/openrouter/connect?t=${signLink(secret, team, user)}`
       : undefined
-    const [install, link] = await Promise.all([installOf(team), linkOf(team)])
+    const [install, link, conns] = await Promise.all([installOf(team), linkOf(team), connsOf(team)])
+    const mcp = admin ? signLink(secret, team, user, now, 'mcp') : ''
+    const signIns = [...CATALOG, ...conns].filter((c) => c.auth === 'oauth').map((c) => c.id)
     const repos = link
       ? await reposOf(link.installation).then(
           (r) => r.total,
@@ -1464,6 +1980,14 @@ export async function serveHosted(): Promise<App> {
           : undefined,
         account: link?.account,
         repos
+      },
+      tools: {
+        conns,
+        links: admin
+          ? Object.fromEntries(
+              signIns.map((id) => [id, `${base}/mcp/connect?t=${mcp}&s=${encodeURIComponent(id)}`])
+            )
+          : undefined
       }
     }
     await client.views.publish({ user_id: user, view: homeView(s, admin, connect, more) })
@@ -1561,7 +2085,7 @@ export async function serveHosted(): Promise<App> {
     if (s)
       await client.views.open({
         trigger_id: body.trigger_id,
-        view: tableModal(s, await catalogue())
+        view: tableModal(s, await catalogue(), await serversOf(tenantOf(context)))
       })
   })
   // the seat rows' selects report each pick; the modal's Save reads them all
@@ -1607,10 +2131,93 @@ export async function serveHosted(): Promise<App> {
         response_action: 'errors',
         errors: { chair: 'Only workspace admins can change the table.' }
       }))
-    const r = readTable(view.state.values as Values)
+    const servers = (await serversOf(team)).map((x) => x.id)
+    const r = readTable(view.state.values as Values, servers)
     if ('errors' in r) return void (await ack({ response_action: 'errors', errors: r.errors }))
     await ack()
     await save(team, { ...s, ...r.table })
+    await publishHome(client, team, body.user.id)
+  })
+
+  // ---- MCP servers in the Home tab ----
+  app.action('mcp_oauth', async ({ ack }) => ack()) // a link: the browser does the rest
+  app.action<BlockAction>(/^mcp_add_/, async ({ ack, body, action, client, context }) => {
+    await ack()
+    const id = (action as ButtonAction).value ?? ''
+    if (CATALOG.find((x) => x.id === id)?.auth === 'oauth') return // a link too
+    if (await asAdmin(client, tenantOf(context), body.user.id))
+      await client.views.open({ trigger_id: body.trigger_id, view: connectModal(id) })
+  })
+  app.action<BlockAction>('mcp_allow', async ({ ack, body, action, client, context }) => {
+    await ack()
+    const team = tenantOf(context)
+    const c = (await connsOf(team)).find((x) => x.id === (action as ButtonAction).value)
+    if (c && (await asAdmin(client, team, body.user.id)))
+      await client.views.open({ trigger_id: body.trigger_id, view: allowModal(c) })
+  })
+  app.action<BlockAction>('mcp_off', async ({ ack, body, action, client, context }) => {
+    await ack()
+    const team = tenantOf(context)
+    if (!(await asAdmin(client, team, body.user.id))) return
+    const id = (action as ButtonAction).value
+    await editConns(team, (l) => l.filter((x) => x.id !== id))
+    await publishHome(client, team, body.user.id)
+  })
+  app.view('mcp_modal', async ({ ack, body, view, client, context }) => {
+    const team = tenantOf(context)
+    const where = view.private_metadata === 'datadog' ? 'site' : 'url'
+    const no = (why: string): Promise<void> =>
+      ack({ response_action: 'errors', errors: { [where]: why } })
+    if (!(await asAdmin(client, team, body.user.id)))
+      return void (await no('Only workspace admins can connect tools.'))
+    const conns = await connsOf(team)
+    if (conns.length >= MAX_CONNECTIONS)
+      return void (await no(
+        `This workspace has ${MAX_CONNECTIONS} servers connected, the most it can.`
+      ))
+    const r = readConnect(
+      view.private_metadata,
+      view.state.values as Values,
+      conns.map((c) => c.id)
+    )
+    if ('errors' in r) return void (await ack({ response_action: 'errors', errors: r.errors }))
+    try {
+      await publicHttps(r.conn.url)
+    } catch (err) {
+      return void (await no(msg(err)))
+    }
+    await ack()
+    // tried now: its tools, or why not. No headers: a server you sign in to, authorized from the Home tab.
+    const c: Connection = { ...r.conn }
+    if (c.auth === 'headers') {
+      c.secret = sealFor(team, c.id, { headers: r.headers })
+      try {
+        c.tools = await probe({ url: c.url, headers: r.headers })
+      } catch (err) {
+        c.error = hide(msg(err), Object.values(r.headers)).slice(0, 200)
+      }
+    }
+    await putConn(team, c)
+    await publishHome(client, team, body.user.id)
+  })
+  app.view('mcp_allow_modal', async ({ ack, body, view, client, context }) => {
+    const team = tenantOf(context)
+    if (!(await asAdmin(client, team, body.user.id)))
+      return void (await ack({
+        response_action: 'errors',
+        errors: { allow: 'Only workspace admins can change this.' }
+      }))
+    await ack()
+    const picked = ((view.state.values as Values).allow?.allow?.selected_options ?? []).map(
+      (o) => o.value
+    )
+    await editConns(team, (l) =>
+      l.map((c) =>
+        c.id === view.private_metadata
+          ? { ...c, allow: picked.filter((n) => c.tools?.some((t) => t.name === n && !t.readOnly)) }
+          : c
+      )
+    )
     await publishHome(client, team, body.user.id)
   })
 

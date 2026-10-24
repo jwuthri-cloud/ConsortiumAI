@@ -32,6 +32,7 @@
     "@langchain/core": "^1.2.17",
     "@langchain/langgraph": "^1.4.21",
     "@langchain/openai": "^1.6.2",
+    "@modelcontextprotocol/client": "~2.3.1",
     "@slack/bolt": "^5.1.0",
     "@tailwindcss/vite": "^4.3.3",
     "deepagents": "^1.14.2",

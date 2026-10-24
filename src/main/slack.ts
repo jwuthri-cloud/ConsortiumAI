@@ -15,7 +15,7 @@ import { makeLabels } from '../shared/personas'
 import { fmtUsd, sumUsage, type Usage } from '../shared/usage'
 import { sameLabel } from '../shared/vote'
 import type { BoardVisual } from '../shared/boardVisuals'
-import type { Brief, DebateEvent, PersonaId, Turn } from '../shared/types'
+import type { Brief, DebateEvent, PersonaId, TraceStep, Turn } from '../shared/types'
 import type { HostInput, Whiteboard } from '../shared/whiteboard'
 
 // The meeting engine in Slack, without the desktop app: `npm run slack`. One thread per meeting:
@@ -220,6 +220,20 @@ function voteLine(t: Turn): string {
         v.disagreements.map((d) => esc(d.on ? `${d.with} on ${d.on}` : d.with)).join('; ')
     )
   return parts.join(' · ')
+}
+
+// The connected services' tools a turn called (their names hold "__"), for its footer:
+// ":hammer_and_wrench: `linear.list_issues` ×2, `datadog.search_logs`".
+export function toolsLine(trace: TraceStep[] = []): string {
+  const n = new Map<string, number>()
+  for (const s of trace)
+    if (s.kind === 'tool' && s.name.includes('__')) {
+      const name = s.name.replace('__', '.')
+      n.set(name, (n.get(name) ?? 0) + 1)
+    }
+  return n.size
+    ? `:hammer_and_wrench: ${[...n].map(([k, c]) => `\`${k}\`${c > 1 ? ` ×${c}` : ''}`).join(', ')}`
+    : ''
 }
 
 // One member's message in the thread: streaming text and what it is doing, then the clean answer.
@@ -489,7 +503,8 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
         break
       case 'turn-done': {
         const done = m.live.get(`${e.turn.speaker}:${e.turn.n}`)
-        if (done) done.final = { body: e.turn.text, foot: voteLine(e.turn) }
+        const foot = [voteLine(e.turn), toolsLine(e.turn.trace)].filter(Boolean).join(' · ')
+        if (done) done.final = { body: e.turn.text, foot }
         renderTurn(m, `${e.turn.speaker}:${e.turn.n}`, true)
         break
       }
