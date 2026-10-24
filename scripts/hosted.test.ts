@@ -247,20 +247,22 @@ test('the hosted runner: Deep-agent on OpenRouter only, no files, its own key an
     seen.push(a)
     return { text: 'ok' }
   })
-  await run(
-    'harness',
-    { prompt: 'p', model: 'openrouter:a/one', cwd: '/', dirs: ['/etc'] },
-    () => {},
-    'k'
-  )
+  await run('harness', { prompt: 'p', model: 'openrouter:a/one' }, () => {}, 'k')
   assert.deepEqual(seen[0], {
     prompt: 'p',
     model: 'openrouter:a/one',
-    cwd: undefined,
-    dirs: undefined,
     apiKey: 'sk-A',
     home: '/data/teams/T1'
   })
+  await assert.rejects(
+    run(
+      'harness',
+      { prompt: 'p', model: 'openrouter:a/one', cwd: '/', dirs: ['/etc'] },
+      () => {},
+      'k'
+    ),
+    /reads only what was attached in Slack/
+  )
   await assert.rejects(
     run('claude', { prompt: 'p' }, () => {}, 'k'),
     /Only OpenRouter Deep-agent/

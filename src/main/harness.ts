@@ -167,7 +167,20 @@ export async function runHarness(
   }
   try {
     const stream = await agent.stream(
-      { messages: [...history, { role: 'user', content: a.prompt }] },
+      {
+        messages: [
+          ...history,
+          {
+            role: 'user',
+            content: a.images?.length
+              ? [
+                  { type: 'text', text: a.prompt },
+                  ...a.images.map((url) => ({ type: 'image_url', image_url: { url } }))
+                ]
+              : a.prompt
+          }
+        ]
+      },
       {
         streamMode: ['messages', 'values'],
         subgraphs: true,

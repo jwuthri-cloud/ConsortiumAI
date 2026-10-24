@@ -2,6 +2,9 @@
 # single-workspace Socket Mode bridge on Deep-agent seats.
 FROM node:24-slim
 WORKDIR /app
+# git: the table reads a GitHub repository from a shallow clone
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 ENV NODE_ENV=production CONSORTIUM_DATA=/data PORT=3000
 COPY package.json package-lock.json ./
 # no install scripts: they rebuild the desktop app's native modules. The bridge never runs inside

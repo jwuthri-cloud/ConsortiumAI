@@ -1,11 +1,34 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
-import { rmSync } from 'node:fs'
-import type { ServerResponse } from 'node:http'
-import { join } from 'node:path'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import type { IncomingMessage, ServerResponse } from 'node:http'
+import { tmpdir } from 'node:os'
+import { isAbsolute, join, relative, resolve } from 'node:path'
 import { App, webApi, type BlockAction, type CustomRoute, type types } from '@slack/bolt'
 import * as debate from './debate'
 import { toBrief } from './api'
-import { listModels, runMember } from './cli'
+import { imageModels, listModels, runMember } from './cli'
+import {
+  MAX_FILES,
+  attachedLine,
+  gather,
+  inline,
+  kindOf,
+  pixels,
+  withImages,
+  type SlackFile
+} from './files'
+import {
+  MAX_REPO_KB,
+  appManifest,
+  clone,
+  convertManifest,
+  getRepo,
+  githubApp,
+  installationToken,
+  installationsOf,
+  listRepos,
+  type Repo
+} from './github'
 import { dataDir } from './paths'
 import { bridge, type Tenancy } from './slack'
 import { derive, installations, openStore, seal, tenantOf, unseal } from './store'
@@ -16,13 +39,22 @@ import { splitModel, type Brief, type PersonaId } from '../shared/types'
 // The Slack app anyone can add to their workspace ("Add to Slack"), hosted: many workspaces in one
 // process, over HTTP, each on its own OpenRouter key. Installs and settings live in the database
 // (store.ts); a workspace's admins edit its settings in the app's Home tab. Deep-agent seats only
-// (the CLIs are signed in on someone's machine, not shareable), and no files: no project, no
-// attachments, so the agents see nothing of this server's disk.
+// (the CLIs are signed in on someone's machine, not shareable). The agents read only what came
+// with the question: the files attached in Slack and a GitHub repository, each in a folder made
+// for that meeting and deleted when it ends; nothing else of this server's disk.
 
 type Client = App['client']
 type Values = Record<
   string,
-  Record<string, { value?: string | null; selected_option?: { value: string } | null }>
+  Record<
+    string,
+    {
+      value?: string | null
+      selected_option?: { value: string } | null
+      selected_conversation?: string | null
+      files?: SlackFile[]
+    }
+  >
 >
 export type Seat = { model: string; persona: PersonaId } // model: an OpenRouter id
 
@@ -33,6 +65,7 @@ export const SCOPES = [
   'chat:write',
   'chat:write.customize',
   'commands',
+  'files:read', // files attached to a question
   'files:write',
   'groups:history',
   'users:read' // who is an admin: they edit the settings
@@ -97,20 +130,63 @@ export function settingsBrief(s: Settings, task: string): Brief {
   })
 }
 
+// `d` is one of `roots` or inside one
+const inside = (d: string, roots: string[]): boolean =>
+  roots.some((r) => {
+    const rel = relative(r, resolve(d))
+    return !rel.startsWith('..') && !isAbsolute(rel)
+  })
+
+// What a meeting's runner may show its seats: the folders convene made for it (`mine`; any other
+// folder is refused), and the attached images for the models that see (`sees`).
+export type Showing = { mine?: string[]; images?: string[]; sees?: (model: string) => boolean }
+
 // The runner for one workspace's meetings: its key on every call (whiteboard and chair too), its
-// folder for the agents' memory, no files, and anything but an OpenRouter Deep-agent refused.
+// folder for the agents' memory, and anything but an OpenRouter Deep-agent refused.
 // Never process.env: every workspace's meetings run side by side in this one process.
 export const keyed =
-  (apiKey: string, home: string, run: typeof runMember = runMember): typeof runMember =>
+  (
+    apiKey: string,
+    home: string,
+    run: typeof runMember = runMember,
+    o: Showing = {}
+  ): typeof runMember =>
   async (cli, a, ...rest) => {
     if (cli !== 'harness' || splitModel(a.model).provider !== 'openrouter')
       throw new Error('Only OpenRouter Deep-agent seats run on the hosted table.')
+    const foreign = [a.cwd, ...(a.dirs ?? [])].find((d) => d && !inside(d, o.mine ?? []))
+    if (foreign)
+      throw new Error(`The hosted table reads only what was attached in Slack, not ${foreign}.`)
+    // the images go with a seat's first turn (its memory keeps them) and the chair's, never the clerk's
+    const show =
+      !!o.images?.length &&
+      !a.resume &&
+      !rest[1].endsWith(':whiteboard') &&
+      !!o.sees?.(splitModel(a.model).model)
     try {
-      return await run(cli, { ...a, cwd: undefined, dirs: undefined, apiKey, home }, ...rest)
+      return await run(cli, { ...a, apiKey, home, ...(show && { images: o.images }) }, ...rest)
     } catch (e) {
       throw explain(e)
     }
   }
+
+// The scopes an installation lacks: one made before Consortium read files has to be reinstalled.
+export const missingScopes = (
+  i?: { bot?: { scopes?: string[] } },
+  need = ['files:read']
+): string[] => need.filter((x) => !i?.bot?.scopes?.includes(x))
+
+export const reinstallNeeded = (url: string): string =>
+  `Consortium can't read files in this workspace yet: it was installed before it could. Someone allowed to install apps can <${url}|Reinstall to enable files>, then try again.`
+
+// "repo:owner/name question" or "repo:none question": the repository for this one question.
+export function repoPrefix(text: string): { repo?: string | null; text: string } {
+  const [, r, rest] = text.match(/^\s*repo:\s*(none|[\w.-]+\/[\w.-]+)\s+([\s\S]+)$/i) ?? []
+  return r
+    ? { repo: r.toLowerCase() === 'none' ? null : r, text: rest.trim() }
+    : { text: text.trim() }
+}
+const REPO = /^[\w.-]+\/[\w.-]+$/
 
 // OpenRouter's refusals, said so the workspace knows what to do.
 export function explain(e: unknown): unknown {
@@ -253,8 +329,21 @@ const button = (
   ...extra
 })
 
+// The rest of the Home tab: whether the install reads files (else `install`, where to reinstall),
+// and GitHub when this server has it: the account connected, its repositories, admins' link.
+export type HomeMore = {
+  files?: boolean
+  install?: string
+  github?: { connect?: string; account?: string; repos?: number }
+}
+
 // What everyone sees; an admin also gets the buttons. `connect` = the "Connect OpenRouter" link.
-export function homeView(s: Settings, admin: boolean, connect?: string): types.HomeView {
+export function homeView(
+  s: Settings,
+  admin: boolean,
+  connect?: string,
+  more: HomeMore = {}
+): types.HomeView {
   const labels = makeLabels(s.seats.map((x, i) => ({ id: String(i), persona: x.persona })))
   const seats = s.seats
     .map((x, i) => `${i + 1}. ${labels[i]} · \`${x.model}\`${i === s.chair ? ' · *chair*' : ''}`)
@@ -278,18 +367,69 @@ export function homeView(s: Settings, admin: boolean, connect?: string): types.H
         ]
       : [])
   ]
+  const g = more.github
+  const repos =
+    g?.repos === undefined ? '' : ` · ${g.repos} ${g.repos === 1 ? 'repository' : 'repositories'}`
+  const githubBlocks: types.KnownBlock[] = g
+    ? [
+        { type: 'divider' },
+        section(
+          `*GitHub*\n${g.account ? `:white_check_mark: Connected to \`${g.account}\`${repos}. Pick one when you ask, or start with \`repo:owner/name\`; the table reads it, read-only.` : 'Not connected. Connect a GitHub account or org, and the table can read one of its repositories, read-only, when you ask.'}`
+        ),
+        ...(admin && g.connect
+          ? [
+              {
+                type: 'actions' as const,
+                elements: [
+                  button('home_github', g.account ? 'Change repositories' : 'Connect GitHub', {
+                    url: g.connect,
+                    ...(!g.account && { style: 'primary' as const })
+                  }),
+                  ...(g.account
+                    ? [
+                        button('home_github_off', 'Disconnect', {
+                          style: 'danger',
+                          confirm: {
+                            title: plain('Disconnect GitHub?'),
+                            text: plain(
+                              'The table stops reading its repositories. Consortium stays installed on GitHub until you remove it there.'
+                            ),
+                            confirm: plain('Disconnect'),
+                            deny: plain('Keep it')
+                          }
+                        })
+                      ]
+                    : [])
+                ]
+              }
+            ]
+          : [])
+      ]
+    : []
   return {
     type: 'home',
     blocks: [
       { type: 'header', text: plain('Consortium') },
       section(
-        'A table of AI models that debates your question in a thread and writes the decision. Invite me to a channel, then `/consortium <question>` or mention @Consortium there. Reply in the thread to steer the meeting.'
+        'A table of AI models that debates your question in a thread and writes the decision. Invite me to a channel, then `/consortium <question>` or mention @Consortium there. `/consortium` alone opens a form to attach files or a repository. Reply in the thread to steer the meeting.'
       ),
+      {
+        type: 'actions',
+        elements: [button('home_ask', 'New question', { style: 'primary' })]
+      },
+      ...(more.files === false
+        ? [
+            section(
+              `:warning: *Files need a reinstall.* Consortium was installed before it could read files, so it can't read the ones attached to questions. <${more.install}|Reinstall to enable files>`
+            )
+          ]
+        : []),
       { type: 'divider' },
       section(
         `*OpenRouter key*\n${s.key ? `:white_check_mark: Connected (\`${s.keyHint}\`). Meetings here run on it; each one's cost is in its footer.` : ":warning: Not set: meetings can't start until an admin adds one."}`
       ),
       ...(admin ? [{ type: 'actions' as const, elements: keyButtons }] : []),
+      ...githubBlocks,
       { type: 'divider' },
       section(
         `*The table*\n${seats}\nClerk · \`${s.clerk}\` · writes the whiteboard\n\nTurn budget ${s.maxTurns} · up to ${s.maxMeetings} meetings at once · ${s.who === 'admins' ? 'workspace admins' : "everyone in channels I'm in"} can convene`,
@@ -449,24 +589,136 @@ export function tableModal(s: Settings, catalogue: string[]): types.ModalView {
   }
 }
 
+const NONE = 'none' // the repository select's "— none —"
+
+// The form `/consortium` alone (or the Home tab's New question) opens. `repos`: what the repository
+// select lists (unset = no select), `repo` its first pick; `files`: the install reads files (else
+// `install`, the reinstall link); `note`: a line under the repository.
+export function askModal(o: {
+  channel?: string
+  repos?: string[]
+  repo?: string | null
+  files: boolean
+  install: string
+  note?: string
+}): types.ModalView {
+  const list = o.repo && o.repos && !o.repos.includes(o.repo) ? [o.repo, ...o.repos] : o.repos
+  const repos = list && [
+    option(NONE, '— none —'),
+    ...list.slice(0, MAX_OPTIONS - 1).map((r) => option(r, r))
+  ]
+  return {
+    type: 'modal',
+    callback_id: 'ask_modal',
+    title: plain('Ask the table'),
+    submit: plain('Convene'),
+    close: plain('Cancel'),
+    blocks: [
+      {
+        type: 'input',
+        block_id: 'question',
+        label: plain('Question'),
+        element: {
+          type: 'plain_text_input',
+          action_id: 'question',
+          multiline: true,
+          placeholder: plain('What should the table decide?')
+        }
+      },
+      {
+        type: 'input',
+        block_id: 'channel',
+        label: plain('Channel'),
+        element: {
+          type: 'conversations_select',
+          action_id: 'channel',
+          response_url_enabled: true, // where to say what went wrong, even if I'm not in it
+          filter: { include: ['public', 'private'], exclude_bot_users: true },
+          ...(o.channel && { initial_conversation: o.channel })
+        },
+        hint: plain('The meeting runs in a thread there. Invite me to it first.')
+      },
+      ...(repos
+        ? [
+            {
+              type: 'input' as const,
+              block_id: 'repo',
+              optional: true,
+              label: plain('Repository'),
+              element: {
+                type: 'static_select' as const,
+                action_id: 'repo',
+                options: repos,
+                initial_option: repos.find((x) => x.value === (o.repo ?? NONE)) ?? repos[0]
+              },
+              hint: plain('The table reads it, read-only, for this meeting.')
+            }
+          ]
+        : []),
+      ...(o.note
+        ? [{ type: 'context' as const, elements: [{ type: 'mrkdwn' as const, text: o.note }] }]
+        : []),
+      o.files
+        ? {
+            type: 'input',
+            block_id: 'files',
+            optional: true,
+            label: plain('Files'),
+            element: { type: 'file_input', action_id: 'files', max_files: MAX_FILES },
+            hint: plain('Text, code, PDFs and images: up to 20 MB each, images up to 5 MB.')
+          }
+        : section(
+            `*Files*\nConsortium has to be reinstalled before it can read files. <${o.install}|Reinstall to enable files>`
+          )
+    ]
+  }
+}
+
+// The form's answers, or what's missing by block. repo: a full name, null for none, unset when the
+// form had no repository select.
+export function readAsk(
+  values: Values
+):
+  | { question: string; channel: string; repo?: string | null; files: SlackFile[] }
+  | { errors: Record<string, string> } {
+  const question = (values.question?.question?.value ?? '').trim()
+  const channel = values.channel?.channel?.selected_conversation ?? ''
+  const picked = values.repo?.repo?.selected_option?.value
+  const repo = values.repo ? (picked && picked !== NONE ? picked : null) : undefined
+  const errors: Record<string, string> = {}
+  if (!question) errors.question = 'Ask a question.'
+  if (!channel) errors.channel = 'Pick a channel.'
+  return Object.keys(errors).length
+    ? { errors }
+    : { question, channel, repo, files: values.files?.files?.files ?? [] }
+}
+
 // ---------- signed links ----------
 
-// "This admin of this workspace", signed, for an hour: the Connect OpenRouter link carries it.
-export function signLink(secret: string, team: string, user: string, now = Date.now()): string {
+// "This admin of this workspace", signed, for an hour: the Connect OpenRouter link carries it
+// (`use` "link"), the Connect GitHub one too ("github"), each signed with a key of its own.
+export function signLink(
+  secret: string,
+  team: string,
+  user: string,
+  now = Date.now(),
+  use = 'link'
+): string {
   const body = Buffer.from(JSON.stringify({ team, user, exp: now + 3_600_000 })).toString(
     'base64url'
   )
-  return `${body}.${createHmac('sha256', derive(secret, 'link')).update(body).digest('base64url')}`
+  return `${body}.${createHmac('sha256', derive(secret, use)).update(body).digest('base64url')}`
 }
 
 export function readLink(
   secret: string,
   token: string,
-  now = Date.now()
+  now = Date.now(),
+  use = 'link'
 ): { team: string; user: string } | undefined {
   const [body, sig] = token.split('.')
   if (!body || !sig) return undefined
-  const want = createHmac('sha256', derive(secret, 'link')).update(body).digest()
+  const want = createHmac('sha256', derive(secret, use)).update(body).digest()
   const got = Buffer.from(sig, 'base64url')
   if (got.length !== want.length || !timingSafeEqual(got, want)) return undefined
   const p = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'))
@@ -479,6 +731,13 @@ function send(res: ServerResponse, status: number, html: string): void {
   res.writeHead(status, { 'content-type': 'text/html; charset=utf-8' })
   res.end(html)
 }
+
+const GH_COOKIE = 'consortium_gh' // the Connect GitHub link, for the trip through GitHub
+const cookie = (req: IncomingMessage, name: string): string | undefined =>
+  req.headers.cookie
+    ?.split(/;\s*/)
+    .find((c) => c.startsWith(`${name}=`))
+    ?.slice(name.length + 1)
 
 // ---------- the server ----------
 
@@ -533,6 +792,81 @@ export async function serveHosted(): Promise<App> {
       // a modal must open within 3 s of the click: without the catalogue, the seats' own models
       new Promise<string[]>((r) => setTimeout(() => r([]), 1500))
     ])
+  const reinstall = `${base}/slack/install`
+  const installOf = (
+    team: string
+  ): Promise<{ bot?: { token?: string; scopes?: string[] }; appId?: string } | undefined> =>
+    installStore
+      .fetchInstallation({ teamId: team, enterpriseId: undefined, isEnterpriseInstall: false })
+      .catch(() => undefined)
+  const readsFiles = async (team: string): Promise<boolean> =>
+    !missingScopes(await installOf(team)).length
+  // the workspace's OpenRouter key, checked: or what to tell them
+  const liveKey = async (team: string, s: Settings): Promise<string> => {
+    if (!s.key)
+      throw new Error(
+        "this workspace has no OpenRouter key yet. An admin adds one in Consortium's Home tab."
+      )
+    let key: string
+    try {
+      key = unseal(s.key, secret, team)
+    } catch {
+      throw new Error(
+        "the saved OpenRouter key can't be read (was CONSORTIUM_SECRET changed?). An admin can add it again in the Home tab."
+      )
+    }
+    if (refusedKey(await keyStatus(key, 5000)))
+      throw new Error(
+        "OpenRouter refused this workspace's key. An admin can replace it in Consortium's Home tab."
+      )
+    return key
+  }
+  // who writes the images' descriptions: the table's own model that sees, else a cheap Gemini
+  const describerOf = (s: Settings, vision: string[]): string | undefined =>
+    [s.clerk, ...s.seats.map((x) => x.model)].find((m) => vision.includes(m)) ??
+    vision.find((m) => /^google\/gemini-[\d.]+-flash$/.test(m))
+  const visionFor = async (files: SlackFile[]): Promise<string[]> =>
+    files.some((f) => kindOf(f) === 'image') ? imageModels() : []
+
+  // GitHub, when this server has its app (README, "Hosted")
+  const github = githubApp(e)
+  type Link = { installation: number; account: string } // a workspace's GitHub connection
+  const linkOf = async (team: string): Promise<Link | undefined> =>
+    github ? store.get<Link>('github', team) : undefined
+  // ponytail: in memory for 5 minutes; repositories added since show up after that
+  const listed = new Map<number, { at: number; list: Promise<{ total: number; repos: Repo[] }> }>()
+  const reposOf = (installation: number): Promise<{ total: number; repos: Repo[] }> => {
+    const hit = listed.get(installation)
+    if (hit && Date.now() - hit.at < 5 * 60_000) return hit.list
+    const list = installationToken(github!, installation).then(listRepos)
+    list.catch(() => listed.delete(installation))
+    listed.set(installation, { at: Date.now(), list })
+    return list
+  }
+  // the repository each channel asked with last, per workspace
+  const lastRepos = async (team: string): Promise<Record<string, string>> =>
+    (await store.get<Record<string, string>>('channel-repos', team)) ?? {}
+  // the repository, cloned into `work` with a token for it alone: its folder
+  const fetchRepo = async (installation: number, full: string, work: string): Promise<string> => {
+    if (!REPO.test(full)) throw new Error(`${full} isn't a repository name (owner/name).`)
+    let token: string
+    let r: Repo
+    try {
+      token = await installationToken(github!, installation, [full.split('/')[1]])
+      r = await getRepo(token, full)
+    } catch (err) {
+      throw new Error(
+        `${full} isn't among the repositories this workspace's GitHub connection can read; an admin can add it with Change repositories in the Home tab (${err instanceof Error ? err.message : err}).`
+      )
+    }
+    if (r.size > MAX_REPO_KB)
+      throw new Error(
+        `${full} is about ${Math.round(r.size / 1024)} MB; the table reads repositories up to 300 MB.`
+      )
+    const into = join(work, r.name)
+    await clone(token, `https://github.com/${r.full_name}.git`, into)
+    return into
+  }
 
   const tenancy: Tenancy = {
     refuse: async (team, user, client) => {
@@ -541,30 +875,140 @@ export async function serveHosted(): Promise<App> {
       return 'Only workspace admins can use Consortium here. An admin can open it to everyone in its Home tab.'
     },
     maxMeetings: async (team) => (await load(team)).maxMeetings,
-    convene: async (team, _channel, question) => {
+    // The brief with what came with the question: the files, saved in the folder the engine keeps
+    // the meeting's attachments in, and the repository, cloned into a temporary folder. Both go
+    // when the meeting ends (done).
+    convene: async (team, channel, question, x) => {
       const s = await load(team)
-      if (!s.key)
+      const key = await liveKey(team, s)
+      const asked = repoPrefix(question)
+      const files = x.files ?? []
+      if (files.length && !(await readsFiles(team))) throw new Error(reinstallNeeded(reinstall))
+      const link = await linkOf(team)
+      const named = x.repo !== undefined ? x.repo : asked.repo // undefined: the channel's usual
+      let repo =
+        named !== undefined ? named : link ? ((await lastRepos(team))[channel] ?? null) : null
+      if (repo && !link)
         throw new Error(
-          "this workspace has no OpenRouter key yet. An admin adds one in Consortium's Home tab."
+          github
+            ? "this workspace hasn't connected GitHub. An admin connects it in Consortium's Home tab."
+            : "this server isn't set up to read GitHub repositories."
         )
-      let key: string
-      try {
-        key = unseal(s.key, secret, team)
-      } catch {
-        throw new Error(
-          "the saved OpenRouter key can't be read (was CONSORTIUM_SECRET changed?). An admin can add it again in the Home tab."
-        )
+      const folder = join(dataDir(), 'attachments', x.id)
+      let work: string | undefined
+      const done = (): void => {
+        for (const d of [folder, work]) if (d) rmSync(d, { recursive: true, force: true })
       }
-      if (refusedKey(await keyStatus(key, 5000)))
-        throw new Error(
-          "OpenRouter refused this workspace's key. An admin can replace it in Consortium's Home tab."
+      try {
+        const what = [
+          repo && `\`${repo}\``,
+          files.length && `${files.length} file${files.length > 1 ? 's' : ''}`
+        ].filter(Boolean)
+        if (what.length)
+          await x.say(`:hourglass_flowing_sand: Getting ${what.join(' and ')} ready…`)
+        const vision = await visionFor(files)
+        const { got, skipped } = files.length
+          ? await gather(files, {
+              token: x.client.token ?? '',
+              key,
+              reader: s.clerk,
+              describer: describerOf(s, vision),
+              question: asked.text
+            })
+          : { got: [], skipped: [] }
+        const attachments = got
+          .filter((g) => g.text !== undefined)
+          .map((g) => {
+            mkdirSync(folder, { recursive: true })
+            writeFileSync(join(folder, g.file!), g.text!)
+            return join(folder, g.file!)
+          })
+        // an image no seat sees and no model could describe reaches no one
+        const blind = got.filter(
+          (g) => g.image && !g.description && !s.seats.some((x) => vision.includes(x.model))
         )
-      const dir = teamDir(team)
-      return { brief: settingsBrief(s, question), run: keyed(key, dir), dir }
+        skipped.push(...blind.map((g) => `${g.name} (no model at this table could see it)`))
+        let projectPath: string | undefined
+        if (repo && link) {
+          work = mkdtempSync(join(tmpdir(), 'consortium-'))
+          try {
+            projectPath = await fetchRepo(link.installation, repo, work)
+          } catch (err) {
+            if (named !== undefined) throw err
+            // the channel's usual repository is gone: ask without it rather than not at all
+            skipped.push(`${repo} (${err instanceof Error ? err.message : err})`)
+            repo = null
+          }
+        }
+        if (named !== undefined)
+          await store.put('channel-repos', team, {
+            ...(await lastRepos(team)),
+            [channel]: named ?? undefined
+          })
+        const dir = teamDir(team)
+        const brief: Brief = {
+          ...settingsBrief(s, withImages(asked.text, got)),
+          attachments: attachments.length ? attachments : undefined,
+          projectPath
+        }
+        const run = keyed(key, dir, runMember, {
+          mine: [folder, work].filter((d): d is string => !!d),
+          images: pixels(got),
+          sees: (m) => vision.includes(m)
+        })
+        const attached = attachedLine(
+          repo,
+          got.filter((g) => !blind.includes(g)).map((g) => g.name),
+          skipped
+        )
+        return { brief, run, dir, question: asked.text, attached, done }
+      } catch (err) {
+        done()
+        throw err
+      }
+    },
+    ask: async ({ team, client, channel, trigger }) => {
+      const [link, last, files] = await Promise.all([
+        linkOf(team),
+        channel ? lastRepos(team).then((r) => r[channel]) : undefined,
+        readsFiles(team)
+      ])
+      let repos: string[] | undefined
+      let note: string | undefined
+      if (github && !link)
+        note = "Connect GitHub in Consortium's Home tab, and the table can read a repository."
+      if (link) {
+        // the form must open within 3 s of the command
+        const names = await Promise.race([
+          reposOf(link.installation).then((r) => r.repos.map((x) => x.full_name)),
+          new Promise<undefined>((r) => setTimeout(r, 1500))
+        ]).catch(() => undefined)
+        repos = names ?? (last ? [last] : [])
+        if (!names)
+          note = 'The repository list is still loading: run /consortium again to see it all.'
+      }
+      await client.views.open({
+        trigger_id: trigger,
+        view: askModal({ channel, repos, repo: last, files, install: reinstall, note })
+      })
+    },
+    attach: async (team, client, files, question) => {
+      if (!(await readsFiles(team))) throw new Error(reinstallNeeded(reinstall))
+      const s = await load(team)
+      const key = await liveKey(team, s)
+      const vision = await visionFor(files)
+      const { got, skipped } = await gather(files, {
+        token: client.token ?? '',
+        key,
+        reader: s.clerk,
+        describer: describerOf(s, vision),
+        question
+      })
+      return inline(got, skipped)
     },
     forget: async (team) => {
-      await store.del('installation', team)
-      await store.del('settings', team)
+      for (const kind of ['installation', 'settings', 'github', 'channel-repos'])
+        await store.del(kind, team)
       rmSync(teamDir(team), { recursive: true, force: true })
     }
   }
@@ -640,6 +1084,117 @@ export async function serveHosted(): Promise<App> {
           send(res, 502, pages.connectFailed(err instanceof Error ? err.message : String(err)))
         }
       }
+    },
+    {
+      // creating the GitHub App, once, through GitHub's app-manifest flow
+      path: '/github/setup',
+      method: 'GET',
+      handler: (_req, res) => {
+        if (github) return send(res, 200, pages.githubReady(github.slug))
+        const state = signLink(secret, 'setup', 'setup', Date.now(), 'github-setup')
+        send(
+          res,
+          200,
+          pages.githubSetup(
+            JSON.stringify(appManifest(base)),
+            `https://github.com/settings/apps/new?state=${state}`
+          )
+        )
+      }
+    },
+    {
+      path: '/github/created',
+      method: 'GET',
+      handler: async (req, res) => {
+        if (github) return send(res, 200, pages.githubReady(github.slug))
+        const q = new URL(req.url ?? '', base).searchParams
+        const code = q.get('code')
+        if (!code || !readLink(secret, q.get('state') ?? '', Date.now(), 'github-setup'))
+          return send(
+            res,
+            400,
+            pages.githubFailed('This setup link expired: open /github/setup again.')
+          )
+        try {
+          const created = await convertManifest(code)
+          // the private key and client secret, shown this once
+          res.writeHead(200, {
+            'content-type': 'text/html; charset=utf-8',
+            'cache-control': 'no-store'
+          })
+          res.end(pages.githubCreated(created))
+        } catch (err) {
+          send(res, 502, pages.githubFailed(err instanceof Error ? err.message : String(err)))
+        }
+      }
+    },
+    {
+      // the Home tab's Connect GitHub: keep the signed link in a cookie for the trip through GitHub
+      path: '/github/connect',
+      method: 'GET',
+      handler: (req, res) => {
+        const t = new URL(req.url ?? '', base).searchParams.get('t') ?? ''
+        if (!github || !readLink(secret, t, Date.now(), 'github'))
+          return send(res, 400, pages.expired('Connect GitHub'))
+        res
+          .writeHead(302, {
+            location: `https://github.com/apps/${github.slug}/installations/new?state=${encodeURIComponent(t)}`,
+            'set-cookie': `${GH_COOKIE}=${t}; Path=/github; Max-Age=3600; HttpOnly; Secure; SameSite=Lax`
+          })
+          .end()
+      }
+    },
+    {
+      // Back from GitHub. installation_id can be forged, so the installation counts only if the
+      // person who signed in to GitHub can reach it (GitHub's advice for the setup URL).
+      path: '/github/callback',
+      method: 'GET',
+      handler: async (req, res) => {
+        const q = new URL(req.url ?? '', base).searchParams
+        const now = Date.now()
+        const who = [q.get('state'), cookie(req, GH_COOKIE)]
+          .map((t) => (t ? readLink(secret, t, now, 'github') : undefined))
+          .find(Boolean)
+        if (!github || !who) return send(res, 400, pages.expired('Connect GitHub'))
+        if (q.get('setup_action') === 'request') return send(res, 200, pages.githubRequested())
+        const inst =
+          Number(q.get('installation_id') ?? q.get('state')?.match(/^i(\d+)$/)?.[1]) || undefined
+        const code = q.get('code')
+        if (!code) {
+          // installed without signing in: sign in, and come back here with the installation
+          const to = new URL('https://github.com/login/oauth/authorize')
+          to.searchParams.set('client_id', github.clientId)
+          to.searchParams.set('redirect_uri', `${base}/github/callback`)
+          to.searchParams.set('state', `i${inst ?? ''}`)
+          return void res.writeHead(302, { location: to.href }).end()
+        }
+        try {
+          const theirs = await installationsOf(github, code)
+          const pick = inst
+            ? theirs.find((i) => i.id === inst)
+            : theirs.length === 1
+              ? theirs[0]
+              : undefined
+          if (!pick)
+            throw new Error(
+              inst
+                ? "your GitHub account can't reach that installation."
+                : "GitHub didn't say which installation; press Connect GitHub again."
+            )
+          await store.put('github', who.team, { installation: pick.id, account: pick.account })
+          listed.delete(pick.id)
+          const i = await installOf(who.team)
+          if (i?.bot?.token)
+            void publishHome(new webApi.WebClient(i.bot.token), who.team, who.user).catch(() => {})
+          res.setHeader(
+            'set-cookie',
+            `${GH_COOKIE}=; Path=/github; Max-Age=0; HttpOnly; Secure; SameSite=Lax`
+          )
+          send(res, 200, pages.githubConnected(pick.account, who.team, i?.appId))
+        } catch (err) {
+          send(res, 502, pages.githubFailed(err instanceof Error ? err.message : String(err)))
+        }
+      }
     }
   ]
 
@@ -668,15 +1223,34 @@ export async function serveHosted(): Promise<App> {
     },
     customRoutes: routes
   })
-  bridge(app, tenancy)
+  const { start } = bridge(app, tenancy)
 
   async function publishHome(client: Client, team: string, user: string): Promise<void> {
     const s = await load(team)
     const admin = await isAdmin(client, user, s)
+    const now = Date.now()
     const connect = admin
       ? `${base}/openrouter/connect?t=${signLink(secret, team, user)}`
       : undefined
-    await client.views.publish({ user_id: user, view: homeView(s, admin, connect) })
+    const [install, link] = await Promise.all([installOf(team), linkOf(team)])
+    const repos = link
+      ? await reposOf(link.installation).then(
+          (r) => r.total,
+          () => undefined
+        )
+      : undefined
+    const more: HomeMore = {
+      files: !missingScopes(install).length,
+      install: reinstall,
+      github: github && {
+        connect: admin
+          ? `${base}/github/connect?t=${signLink(secret, team, user, now, 'github')}`
+          : undefined,
+        account: link?.account,
+        repos
+      }
+    }
+    await client.views.publish({ user_id: user, view: homeView(s, admin, connect, more) })
   }
   // an admin's settings action: the settings, or nothing for anyone else
   const asAdmin = async (
@@ -692,6 +1266,48 @@ export async function serveHosted(): Promise<App> {
     if (event.tab === 'home') await publishHome(client, tenantOf(context), event.user)
   })
   app.action('home_connect', async ({ ack }) => ack()) // a link: the browser does the rest
+  app.action('home_github', async ({ ack }) => ack()) // a link too
+  app.action<BlockAction>('home_github_off', async ({ ack, body, client, context }) => {
+    await ack()
+    const team = tenantOf(context)
+    if (!(await asAdmin(client, team, body.user.id))) return
+    await store.del('github', team)
+    await publishHome(client, team, body.user.id)
+  })
+  app.action<BlockAction>('home_ask', async ({ ack, body, client, context }) => {
+    await ack()
+    const team = tenantOf(context)
+    const user = body.user.id
+    const no = await tenancy.refuse(team, user, client)
+    if (no)
+      return void (await client.views.open({
+        trigger_id: body.trigger_id,
+        view: {
+          type: 'modal',
+          title: plain('Consortium'),
+          close: plain('OK'),
+          blocks: [section(no)]
+        }
+      }))
+    await tenancy.ask!({ team, client, user, trigger: body.trigger_id })
+  })
+  // the repository select reports each pick; Convene reads it
+  app.action({ block_id: 'repo' }, async ({ ack }) => ack())
+  app.view('ask_modal', async ({ ack, body, view, client, context, respond }) => {
+    const r = readAsk(view.state.values as Values)
+    if ('errors' in r) return void (await ack({ response_action: 'errors', errors: r.errors }))
+    await ack()
+    const user = body.user.id
+    // the channel select's response_url reaches them there, even where I'm not invited yet
+    const say = (text: string): Promise<unknown> =>
+      respond
+        ? respond({ response_type: 'ephemeral', text })
+        : client.chat.postMessage({ channel: user, text })
+    await start(tenantOf(context), client, r.channel, user, r.question, say, {
+      files: r.files,
+      repo: r.repo
+    })
+  })
   app.action<BlockAction>('home_key', async ({ ack, body, client, context }) => {
     await ack()
     if (await asAdmin(client, tenantOf(context), body.user.id))

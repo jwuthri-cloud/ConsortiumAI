@@ -103,7 +103,14 @@ export async function runGit(cwd: string, args: string[]): Promise<string> {
       timeout: 20_000,
       maxBuffer: 16 << 20,
       // GIT_OPTIONAL_LOCKS=0: status won't refresh (write) the index
-      env: { ...process.env, GIT_PAGER: 'cat', GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0' }
+      env: {
+        ...process.env,
+        GIT_PAGER: 'cat',
+        GIT_TERMINAL_PROMPT: '0',
+        GIT_OPTIONAL_LOCKS: '0',
+        // a partial clone (hosted Slack) would fetch a missing blob from the network
+        GIT_NO_LAZY_FETCH: '1'
+      }
     })
     return clip(stdout || stderr || '(no output)')
   } catch (e) {

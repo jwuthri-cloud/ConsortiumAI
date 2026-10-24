@@ -169,6 +169,7 @@ export function deleteSession(id: string): void {
 function keepAttachments(id: string, files: string[] = []): string[] {
   const dir = join(userData, 'attachments', id)
   return files.filter(existsSync).map((f) => {
+    if (dirname(f) === dir) return f // already there (hosted Slack downloads straight in)
     mkdirSync(dir, { recursive: true })
     let to = join(dir, basename(f))
     for (let i = 2; existsSync(to); i++) to = join(dir, `${i}-${basename(f)}`)

@@ -7,6 +7,7 @@ import { ENDED, SILENT, toBrief } from './api'
 import { killAll, type runMember } from './cli'
 import { dataDir } from './paths'
 import { tenantOf } from './store'
+import type { SlackFile } from './files'
 import { ACTIVITY_LABELS } from '../shared/activity'
 import { spoken } from '../shared/cite'
 import { memberModel, modelName } from '../shared/models'
@@ -111,6 +112,7 @@ export type BoardView = {
   state: 'running' | 'paused' | 'decided' | 'stopped' | 'failed'
   note?: string // mrkdwn under the footer: the decision's link, or why it failed
   canvas?: string // the whiteboard canvas's URL; without one the root carries the whole board
+  attached?: string // mrkdwn: the repository and files the table reads, and what was left out
 }
 
 const footer = (v: BoardView): string =>
@@ -127,7 +129,8 @@ export function boardBlocks(v: BoardView): Block[] {
     {
       type: 'header',
       text: { type: 'plain_text', text: cut(oneLine(v.question), 150) }
-    }
+    },
+    ...(v.attached ? [context(v.attached)] : [])
   ]
   const b = v.board
   if (b?.recommendation) blocks.push(section('Recommendation', esc(b.recommendation)))
@@ -258,6 +261,7 @@ type Meeting = {
   // updates; each meeting has its own queue, so a slow one never holds up the others.
   chain: Promise<unknown>
   timers: Map<string, NodeJS.Timeout>
+  done?: () => void // once it has ended: what convene set up for it goes
 }
 
 function config(): SlackConfig {
@@ -281,10 +285,36 @@ function config(): SlackConfig {
 export type Tenancy = {
   refuse(team: string, user: string, client: Client): Promise<string | undefined> // why not, or undefined
   maxMeetings(team: string): Promise<number>
-  convene(team: string, channel: string, question: string): Promise<Convened> // throws what to tell them
+  convene(team: string, channel: string, question: string, x: Extra): Promise<Convened> // throws what to tell them
   forget?(team: string): Promise<void> // the app was uninstalled there
+  // `/consortium` with nothing after it: a form to ask with (hosted)
+  ask?(o: {
+    team: string
+    client: Client
+    user: string
+    channel?: string
+    trigger: string
+  }): Promise<void>
+  // files posted in a meeting's thread, as text for the host's message (hosted); throws what to tell them
+  attach?(team: string, client: Client, files: SlackFile[], question: string): Promise<string>
 }
-export type Convened = { brief: Brief; run?: typeof runMember; dir?: string }
+// What came with the question: the meeting's id (picked before it starts), the files attached,
+// and the repository: a full name, null for none, unset for the channel's usual.
+export type Extra = {
+  id: string
+  client: Client
+  files?: SlackFile[]
+  repo?: string | null
+  say(text: string): Promise<unknown>
+}
+export type Convened = {
+  brief: Brief
+  run?: typeof runMember
+  dir?: string
+  question?: string // what the root message shows (default: the brief's task)
+  attached?: string // see BoardView
+  done?: () => void // called once the meeting has ended, or didn't start
+}
 
 // One workspace: slack.json, re-read on each use.
 const local = (run?: typeof runMember): Tenancy => ({
@@ -307,8 +337,18 @@ export function serve({ run }: { run?: typeof runMember } = {}): App {
   return app
 }
 
-// Meetings in threads, for whichever workspaces `app` serves.
-export function bridge(app: App, t: Tenancy): void {
+export type Start = (
+  team: string,
+  client: Client,
+  channel: string,
+  user: string,
+  text: string,
+  say: (text: string) => Promise<unknown>,
+  more?: Pick<Extra, 'files' | 'repo'>
+) => Promise<void>
+
+// Meetings in threads, for whichever workspaces `app` serves. Returns how to start one.
+export function bridge(app: App, t: Tenancy): { start: Start } {
   const meetings = new Map<string, Meeting>() // `${team}:${root message ts}` → meeting
   const starting = new Map<string, number>() // per workspace: meetings between their command and their root message
   const slot = (team: string, ts: string): string => `${team}:${ts}`
@@ -494,7 +534,10 @@ export function bridge(app: App, t: Tenancy): void {
         render(m, true)
         break
     }
-    if (ENDED.has(e.type)) meetings.delete(slot(m.team, m.ts))
+    if (ENDED.has(e.type)) {
+      meetings.delete(slot(m.team, m.ts))
+      m.done?.()
+    }
   }
 
   // The live whiteboard as a canvas the channel can read. Without canvases (a plan without them,
@@ -551,14 +594,7 @@ export function bridge(app: App, t: Tenancy): void {
     }
   }
 
-  async function start(
-    team: string,
-    client: Client,
-    channel: string,
-    user: string,
-    text: string,
-    say: (text: string) => Promise<unknown>
-  ): Promise<void> {
+  const start: Start = async (team, client, channel, user, text, say, more = {}) => {
     const no = await t.refuse(team, user, client)
     if (no) return void (await say(no))
     const max = await t.maxMeetings(team)
@@ -571,15 +607,16 @@ export function bridge(app: App, t: Tenancy): void {
     if (!question) return void (await say('Usage: `/consortium [preset:] <question>`'))
     starting.set(team, (starting.get(team) ?? 0) + 1) // counted before the first await, so starts at once can't pass the limit
     try {
+      const id = randomUUID()
       let c: Convened
       try {
-        c = await t.convene(team, channel, question)
+        c = await t.convene(team, channel, question, { id, client, say, ...more })
       } catch (e) {
         return void (await say(`Can't convene: ${e instanceof Error ? e.message : e}`))
       }
       const { brief, run, dir } = c
       const m: Meeting = {
-        id: randomUUID(),
+        id,
         team,
         client,
         channel,
@@ -589,25 +626,28 @@ export function bridge(app: App, t: Tenancy): void {
         personas: Object.fromEntries(brief.members.map((x) => [x.id, x.persona])),
         models: Object.fromEntries(brief.members.map((x) => [x.id, memberModel(x)])),
         view: {
-          question: brief.task,
+          question: c.question ?? brief.task,
           phase: 'open',
           turn: 0,
           maxTurns: brief.maxTurns,
-          state: 'running'
+          state: 'running',
+          attached: c.attached
         },
         live: new Map(),
         chain: Promise.resolve(),
-        timers: new Map()
+        timers: new Map(),
+        done: c.done
       }
       try {
         const root = await client.chat.postMessage({
           channel,
-          text: brief.task,
+          text: m.view.question,
           blocks: boardBlocks(m.view)
         })
         m.ts = root.ts!
         m.link = (await client.chat.getPermalink({ channel, message_ts: m.ts })).permalink ?? ''
       } catch (e) {
+        c.done?.()
         return void (await say(
           `Can't post here (${slackError(e)}); invite me to the channel first.`
         ))
@@ -626,14 +666,15 @@ export function bridge(app: App, t: Tenancy): void {
 
   app.command('/consortium', async ({ command, ack, respond, client, context }) => {
     await ack()
-    await start(
-      tenantOf(context),
-      client,
-      command.channel_id,
-      command.user_id,
-      command.text,
-      (text) => respond({ response_type: 'ephemeral', text })
-    )
+    const team = tenantOf(context)
+    const say = (text: string): Promise<unknown> => respond({ response_type: 'ephemeral', text })
+    if (t.ask && !unmention(command.text)) {
+      const no = await t.refuse(team, command.user_id, client)
+      if (no) return void (await say(no))
+      const o = { team, client, user: command.user_id, channel: command.channel_id }
+      return t.ask({ ...o, trigger: command.trigger_id })
+    }
+    await start(team, client, command.channel_id, command.user_id, command.text, say)
   })
 
   app.event('app_mention', async ({ event, client, context }) => {
@@ -646,12 +687,15 @@ export function bridge(app: App, t: Tenancy): void {
       event.channel,
       event.user,
       event.text,
-      ephemeral(client, event.channel, event.user, event.thread_ts)
+      ephemeral(client, event.channel, event.user, event.thread_ts),
+      { files: event.files }
     )
   })
 
   app.message(async ({ message, client, context }) => {
-    if (message.subtype !== undefined || message.bot_id || !message.thread_ts) return
+    // a file posted in the thread comes as file_share
+    if (message.subtype !== undefined && message.subtype !== 'file_share') return
+    if (('bot_id' in message && message.bot_id) || !message.thread_ts) return
     const team = tenantOf(context)
     const m = meetings.get(slot(team, message.thread_ts))
     if (!m) return
@@ -659,6 +703,13 @@ export function bridge(app: App, t: Tenancy): void {
     const no = await t.refuse(team, message.user, client)
     if (no) return void (await say(no))
     const steer = parseSteer(message.text ?? '', m.labels)
+    if (message.files?.length && t.attach)
+      try {
+        const files = await t.attach(team, client, message.files, m.view.question)
+        steer.text = [steer.text, files].filter(Boolean).join('\n\n')
+      } catch (e) {
+        await say(`Can't add the files: ${e instanceof Error ? e.message : e}`)
+      }
     if (!steer.text) return
     try {
       debate.host(m.id, { id: randomUUID(), ...steer })
@@ -709,6 +760,7 @@ export function bridge(app: App, t: Tenancy): void {
   const quit = async (): Promise<void> => {
     const all = [...meetings.values()]
     for (const m of all) debate.stop(m.id)
+    for (const m of all) m.done?.()
     killAll()
     await Promise.all(
       all.map((m) => {
@@ -722,6 +774,7 @@ export function bridge(app: App, t: Tenancy): void {
   }
   process.on('SIGINT', quit)
   process.on('SIGTERM', quit)
+  return { start }
 }
 
 // Hosted (many workspaces, "Add to Slack", HTTP) when its settings are there; else Socket Mode.

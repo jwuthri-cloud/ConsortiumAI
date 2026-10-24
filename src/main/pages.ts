@@ -383,6 +383,8 @@ const STATUS_CSS = `
 .fail .arc{stroke:var(--violet)}
 .fail .you{fill:none;stroke:var(--violet);stroke-width:1.2;stroke-dasharray:1.6 1.6}
 @media (prefers-reduced-motion:reduce){.ok .arc{stroke-dashoffset:0}}
+.card form{margin-top:2rem}
+.card pre{font:400 .75rem/1.5 var(--mono);color:var(--ink);background:var(--raised);border:1px solid var(--outline);border-radius:10px;padding:1rem;margin:1.5rem 0 0;overflow:auto;white-space:pre}
 `
 
 type Action = { href: string; label: string; primary?: boolean }
@@ -489,11 +491,89 @@ export const connectFailed = (why: string): string =>
     actions: slackLinks()
   })
 
-export const expired = (): string =>
+// `button`: the Home tab button to press again
+export const expired = (button = 'Connect OpenRouter'): string =>
   status({
     tone: 'fail',
     label: 'Link expired',
     title: 'This link has expired.',
-    body: "<p>Open Consortium's <b>Home</b> tab in Slack and press <b>Connect OpenRouter</b> again.</p>",
+    body: `<p>Open Consortium's <b>Home</b> tab in Slack and press <b>${esc(button)}</b> again.</p>`,
+    actions: slackLinks()
+  })
+
+// ---------- GitHub ----------
+
+// /github/setup: one button that posts the app's manifest to GitHub
+export const githubSetup = (manifest: string, action: string): string =>
+  status({
+    tone: 'ok',
+    label: 'GitHub',
+    title: 'Create the GitHub App.',
+    body: `<p>One GitHub App lets each workspace connect its own GitHub account or organization so the table can read a repository: <b>Contents</b> and <b>Metadata</b>, read-only, nothing else. You create it once, under your account; anyone can then install it on theirs.</p><form method="post" action="${esc(action)}"><input type="hidden" name="manifest" value="${esc(manifest)}"><button class="btn btn-primary" type="submit">Create it on GitHub</button></form><p class="detail">If GitHub says the name is taken, pick another there. Afterwards this server shows the five values to set in its environment, once.</p>`,
+    actions: []
+  })
+
+export const githubReady = (slug: string): string =>
+  status({
+    tone: 'ok',
+    label: 'GitHub',
+    title: 'GitHub is set up.',
+    body: `<p>This server uses the GitHub App <b>${esc(slug)}</b>. A workspace admin connects it in Consortium's <b>Home</b> tab with <b>Connect GitHub</b>.</p>`,
+    actions: [
+      {
+        href: `https://github.com/apps/${encodeURIComponent(slug)}`,
+        label: 'Open the app on GitHub'
+      }
+    ]
+  })
+
+export const githubCreated = (a: {
+  id: number
+  slug: string
+  pem: string
+  client_id: string
+  client_secret: string
+  html_url: string
+}): string =>
+  status({
+    tone: 'ok',
+    label: 'GitHub App created',
+    title: 'Set these on the server.',
+    body: `<p>Shown this once. In Render: the service → <b>Environment</b> → add each one (paste the private key as is, line breaks included), then save; Render redeploys. Keep the key and the client secret to yourself.</p><pre>${esc(
+      [
+        `GITHUB_APP_ID=${a.id}`,
+        `GITHUB_APP_SLUG=${a.slug}`,
+        `GITHUB_APP_CLIENT_ID=${a.client_id}`,
+        `GITHUB_APP_CLIENT_SECRET=${a.client_secret}`,
+        `GITHUB_APP_PRIVATE_KEY=${a.pem.trim()}`
+      ].join('\n')
+    )}</pre>`,
+    actions: [{ href: a.html_url, label: 'Open the app on GitHub' }]
+  })
+
+export const githubConnected = (account: string, team?: string, app?: string): string =>
+  status({
+    tone: 'ok',
+    label: 'GitHub connected',
+    title: 'GitHub is connected.',
+    body: `<p>The table can read the repositories you gave Consortium on <b>${esc(account)}</b>, read-only, when someone asks with one. Change which ones on GitHub any time.</p>`,
+    actions: slackLinks(team, app).map((a) => (a.primary ? { ...a, label: 'Back to Slack' } : a))
+  })
+
+export const githubRequested = (): string =>
+  status({
+    tone: 'ok',
+    label: 'Waiting for approval',
+    title: 'An owner has to approve it.',
+    body: "<p>GitHub asked an owner of that organization to approve Consortium. Once they have, press <b>Connect GitHub</b> in Consortium's Home tab again.</p>",
+    actions: slackLinks()
+  })
+
+export const githubFailed = (why: string): string =>
+  status({
+    tone: 'fail',
+    label: "Couldn't connect",
+    title: 'GitHub didn’t connect.',
+    body: `<p>Try again from Consortium's Home tab.</p><p class="detail">${esc(why)}</p>`,
     actions: slackLinks()
   })

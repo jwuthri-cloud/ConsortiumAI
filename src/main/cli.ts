@@ -29,6 +29,7 @@ export type RunArgs = {
   // the environment, and the folder that keeps its memory (default: the data folder)
   apiKey?: string
   home?: string
+  images?: string[] // the Deep-agent only: pictures (data URLs) sent with the prompt
 }
 export type RunResult = {
   text: string
@@ -292,6 +293,7 @@ const NOT_CHAT =
 type Listing = {
   id: string
   pricing?: { prompt?: string; completion?: string; input_cache_read?: string }
+  architecture?: { input_modalities?: string[] }
 }
 let openrouter: Promise<Listing[]> | null = null
 function openrouterCatalog(): Promise<Listing[]> {
@@ -304,6 +306,12 @@ function openrouterCatalog(): Promise<Listing[]> {
     })
   return openrouter
 }
+
+// OpenRouter ids of the models that take images, newest first.
+export const imageModels = async (): Promise<string[]> =>
+  (await openrouterCatalog())
+    .filter((m) => m.architecture?.input_modalities?.includes('image'))
+    .map((m) => m.id)
 
 export type Price = { prompt: number; completion: number; cacheRead?: number } // $ per token
 const norm = (id: string): string => id.toLowerCase().replace(/\./g, '-')
