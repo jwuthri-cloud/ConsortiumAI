@@ -232,7 +232,7 @@ Routes: `/` (the landing page with **Add to Slack**), `/slack/install` and `/sla
 
 ### Deploy it
 
-**Render:** New → Blueprint → this repo. [`render.yaml`](render.yaml) creates the web service (Docker, Starter plan: a free one sleeps and misses Slack's 3-second limit) with a 1 GB disk holding one SQLite file (about $0.25/month, snapshotted daily; no Postgres needed for one instance), generates `CONSORTIUM_SECRET`, and asks for the three Slack values. `PUBLIC_URL` is optional there: the server uses Render's own `RENDER_EXTERNAL_URL`.
+**Render:** New → Blueprint → this repo. [`render.yaml`](render.yaml) creates the web service (Docker, Starter plan: a free one sleeps and misses Slack's 3-second limit) and generates `CONSORTIUM_SECRET`; it asks for the three Slack values and `DATABASE_URL`, a Postgres connection string from outside Render (a free [Neon](https://neon.tech) database is enough). `PUBLIC_URL` is optional there: the server uses Render's own `RENDER_EXTERNAL_URL`.
 
 **Railway:** New Project → Deploy from GitHub repo (it builds the [`Dockerfile`](Dockerfile)) → add a Postgres database (it sets `DATABASE_URL`; reference it in the service) → set the variables above → Settings → Networking → Generate Domain, and use it as `PUBLIC_URL`. To keep transcripts, add a volume at `/data` (the image runs as `node`; if the volume isn't writable, set `RAILWAY_RUN_UID=0`).
 

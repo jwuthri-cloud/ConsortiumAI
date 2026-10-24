@@ -11,7 +11,7 @@ RUN npm ci --omit=dev --ignore-scripts && npm install -g tsx@4.23.15 && npm cach
   && mkdir -p /data && chown node /data
 COPY tsconfig*.json ./
 COPY src ./src
-# ponytail: runs as root, because a mounted disk (Render, Railway) at /data is root-owned and node could not write it
+USER node
 VOLUME /data
 EXPOSE 3000
 CMD ["tsx", "src/main/slack.ts"]
