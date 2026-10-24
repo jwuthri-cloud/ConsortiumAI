@@ -294,6 +294,35 @@ function config(): SlackConfig {
   }
 }
 
+// Slack allows 3 s from a command or a click to the form it opens, and the database or GitHub can
+// take longer: the form opens at once as this, then fills in (views.update has no deadline).
+export const LOADING_VIEW: types.ModalView = {
+  type: 'modal',
+  title: { type: 'plain_text', text: 'Ask the table' },
+  close: { type: 'plain_text', text: 'Cancel' },
+  blocks: [
+    {
+      type: 'section',
+      text: { type: 'mrkdwn', text: ':hourglass_flowing_sand: Getting the table ready…' }
+    }
+  ]
+}
+export const noticeView = (text: string): types.ModalView => ({
+  type: 'modal',
+  title: { type: 'plain_text', text: 'Consortium' },
+  close: { type: 'plain_text', text: 'OK' },
+  blocks: [{ type: 'section', text: { type: 'mrkdwn', text: cut(text, SECTION) } }]
+})
+// the open form's id, or undefined when Slack refused (the 3 s were already gone)
+export async function openLoading(client: Client, trigger: string): Promise<string | undefined> {
+  try {
+    return (await client.views.open({ trigger_id: trigger, view: LOADING_VIEW })).view?.id
+  } catch (e) {
+    console.error('slack: the form did not open:', slackError(e))
+    return undefined
+  }
+}
+
 // What differs between one workspace (slack.json, Socket Mode) and many (hosted.ts): who may use
 // the table, how many meetings it holds at once, and the brief, runner and folder for a question.
 export type Tenancy = {
@@ -301,15 +330,15 @@ export type Tenancy = {
   maxMeetings(team: string): Promise<number>
   convene(team: string, channel: string, question: string, x: Extra): Promise<Convened> // throws what to tell them
   forget?(team: string): Promise<void> // the app was uninstalled there
-  // Before a question starts (hosted): a form to ask with (`trigger`: `/consortium`, the Home tab)
-  // or, for a mention, a message to pick the repository with. `question` unset: `/consortium`
-  // alone, always the form. false: start it at once.
+  // Before a question starts (hosted): the form to ask with, filled into `view` (the loading form
+  // `/consortium` and the Home tab open at once), or, for a mention, a message to pick the
+  // repository with. false: start it at once (a mention only).
   ask?(o: {
     team: string
     client: Client
     user: string
     channel?: string
-    trigger?: string
+    view?: string
     question?: string
     files?: SlackFile[]
     thread?: string
@@ -699,11 +728,23 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
   app.command('/consortium', async ({ command, ack, respond, client, context }) => {
     await ack()
     const team = tenantOf(context)
-    const say = (text: string): Promise<unknown> => respond({ response_type: 'ephemeral', text })
     const { user_id: user, channel_id: channel, trigger_id: trigger } = command
+    // hosted: the form opens before any database or GitHub call, well inside Slack's 3 s
+    const view = t.ask ? await openLoading(client, trigger) : undefined
+    const say = (text: string): Promise<unknown> =>
+      view
+        ? client.views.update({ view_id: view, view: noticeView(text) })
+        : respond({ response_type: 'ephemeral', text })
     const question = unmention(command.text)
-    const o = { team, client, user, channel, trigger, ...(question && { question }) }
-    if (await asked(o, say)) return
+    const o = { team, client, user, channel, ...(view && { view }), ...(question && { question }) }
+    try {
+      if (await asked(o, say)) return
+    } catch (e) {
+      console.error('slack: no form:', slackError(e))
+      return void (await say(
+        "Couldn't open the form (the server was waking up). Run /consortium again."
+      ))
+    }
     await start(team, client, channel, user, command.text, say)
   })
 

@@ -667,7 +667,7 @@ test('the bridge: what convene set up goes when the meeting ends, or never start
     })
 
   await command('') // nothing after the command: the form
-  assert.deepEqual(asked, [{ team: 'T1', client, user: 'U1', channel: 'C1', trigger: 'TR' }])
+  assert.deepEqual(asked, [{ team: 'T1', client, user: 'U1', channel: 'C1' }])
   assert.deepEqual(said, [])
 
   // a repository to pick: the form with the question, or the mention's picker; nothing starts yet
@@ -887,7 +887,7 @@ test('hosted, end to end: the form on the repository the question names, the pic
   const realCall = webApi.WebClient.prototype.apiCall
   webApi.WebClient.prototype.apiCall = async function (method, options = {}) {
     slack.push([method, options])
-    return { ok: true, ts: '1', permalink: 'p' }
+    return { ok: true, ts: '1', permalink: 'p', view: { id: 'V1' } }
   }
   const responded: Record<string, unknown>[] = [] // what went to response_urls
   const hook = 'https://hooks.slack.test'
@@ -945,7 +945,9 @@ test('hosted, end to end: the form on the repository the question names, the pic
   try {
     // /consortium <question>: the form, filled in, on the repository the question names
     await command('why does backend retry webhooks twice?')
-    const view = last('views.open').view as types.ModalView
+    // the loading form opens at once (Slack's 3 s), then becomes the real one
+    assert.equal((last('views.open').view as types.ModalView).blocks.length, 1)
+    const view = last('views.update').view as types.ModalView
     const input = (id: string): types.InputBlock =>
       view.blocks.find((b) => b.block_id === id) as types.InputBlock
     assert.equal(
@@ -959,12 +961,17 @@ test('hosted, end to end: the form on the repository the question names, the pic
     assert.equal(view.submit?.text, 'Start')
     assert.ok(!slack.some(([m]) => m === 'chat.postMessage')) // nothing started
 
-    // repo: still works, silently; a repository it can't read gets plain words and near names
+    // repo: still works, silently: the form opens on it, and one it can't read says so, with near names
     await command('repo:connectlyai/backend why does backend retry webhooks twice?')
-    const refusal = String(responded.at(-1)?.text)
+    const prefixed = last('views.update').view as types.ModalView
+    const repoBlock = prefixed.blocks.find((b) => b.block_id === 'repo') as types.InputBlock
+    assert.equal(
+      (repoBlock.element as types.StaticSelect).initial_option?.value,
+      'connectlyai/backend'
+    )
     assert.match(
-      refusal,
-      /^Can't convene: `connectlyai\/backend` isn't one of the repositories Consortium can read in this workspace\. Did you mean `connectly-backend` or `backend\.claude`\? An admin can add repositories in Consortium's Home tab → Change repositories\.$/
+      JSON.stringify(prefixed.blocks),
+      /`connectlyai\/backend` isn't one of the repositories Consortium can read in this workspace\. Did you mean `connectly-backend` or `backend\.claude`\?/
     )
 
     // a mention: the picker, only for them, on the same repository; nothing starts yet

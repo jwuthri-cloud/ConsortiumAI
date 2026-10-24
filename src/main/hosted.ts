@@ -59,7 +59,7 @@ import {
   type Toolbox
 } from './mcp'
 import { dataDir } from './paths'
-import { bridge, type Tenancy } from './slack'
+import { bridge, noticeView, openLoading, type Tenancy } from './slack'
 import { derive, installations, openStore, seal, tenantOf, unseal } from './store'
 import * as pages from './pages'
 import { PERSONAS, PERSONA_IDS, makeLabels } from '../shared/personas'
@@ -1556,10 +1556,11 @@ export async function serveHosted(): Promise<App> {
         throw err
       }
     },
-    ask: async ({ team, client, user, channel, trigger, question, files, thread }) => {
+    ask: async ({ team, client, user, channel, view, question, files, thread }) => {
       const link = await linkOf(team)
-      // a question with no repository to pick, or one picked with repo:, starts at once
-      if (question !== undefined && (!link || repoPrefix(question).repo !== undefined)) return false
+      const pre = question === undefined ? undefined : repoPrefix(question)
+      // a mention with no repository to pick, or one picked with repo:, starts at once
+      if (!view && pre && (!link || pre.repo !== undefined)) return false
       const [last, reads] = await Promise.all([
         channel ? lastRepos(team).then((r) => r[channel]) : undefined,
         readsFiles(team)
@@ -1569,43 +1570,35 @@ export async function serveHosted(): Promise<App> {
       if (github && !link)
         note = "Connect GitHub in Consortium's Home tab, and the table can read a repository."
       if (link) {
-        // a form must open within 3 s of the command; a mention's picker can wait for the list
-        const names = await (
-          trigger
-            ? Promise.race([
-                namesOf(link.installation),
-                new Promise<undefined>((r) => setTimeout(r, 1500))
-              ])
-            : namesOf(link.installation)
-        ).catch(() => undefined)
+        const names = await namesOf(link.installation).catch(() => undefined)
         repos = names ?? (last ? [last] : [])
         if (!names)
-          note = 'The repository list is still loading: run /consortium again to see it all.'
+          note =
+            "GitHub didn't answer with the repository list: run /consortium again to see it all."
+        else if (pre?.repo && !names.includes(pre.repo)) note = unreadable(pre.repo, names)
       }
-      const repo = link ? preselect(question, repos ?? [], last) : null
-      if (trigger)
-        try {
-          await client.views.open({
-            trigger_id: trigger,
-            view: askModal({
-              channel,
-              question,
-              repos,
-              repo,
-              files: reads,
-              install: reinstall,
-              note
-            })
+      const repo = !link
+        ? null
+        : pre?.repo !== undefined
+          ? pre.repo
+          : preselect(question, repos ?? [], last)
+      if (view) {
+        // the loading form, opened in time by the caller, becomes the real one (no deadline now)
+        await client.views.update({
+          view_id: view,
+          view: askModal({
+            channel,
+            question: pre?.text,
+            repos,
+            repo,
+            files: reads,
+            install: reinstall,
+            note
           })
-          return true
-        } catch (err) {
-          // past Slack's 3 s for the form (a cold database): the question gets the picker instead
-          if (question === undefined || !channel) throw err
-          console.error(
-            'slack: no form, the picker instead:',
-            err instanceof Error ? err.message : err
-          )
-        }
+        })
+        return true
+      }
+      if (!channel) throw new Error('no channel to ask in')
       const now = Date.now()
       for (const [k, p] of picks) if (p.exp < now) picks.delete(k)
       const id = randomBytes(12).toString('base64url')
@@ -2018,18 +2011,12 @@ export async function serveHosted(): Promise<App> {
     await ack()
     const team = tenantOf(context)
     const user = body.user.id
+    // the form opens first, inside Slack's 3 s; the checks and the repository list fill it in
+    const view = await openLoading(client, body.trigger_id)
+    if (!view) return
     const no = await tenancy.refuse(team, user, client)
-    if (no)
-      return void (await client.views.open({
-        trigger_id: body.trigger_id,
-        view: {
-          type: 'modal',
-          title: plain('Consortium'),
-          close: plain('OK'),
-          blocks: [section(no)]
-        }
-      }))
-    await tenancy.ask!({ team, client, user, trigger: body.trigger_id })
+    if (no) return void (await client.views.update({ view_id: view, view: noticeView(no) }))
+    await tenancy.ask!({ team, client, user, view })
   })
   // the repository select reports each pick; Start reads it
   app.action({ block_id: 'repo' }, async ({ ack }) => ack())
