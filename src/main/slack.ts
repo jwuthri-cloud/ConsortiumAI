@@ -740,9 +740,13 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
     try {
       if (await asked(o, say)) return
     } catch (e) {
-      console.error('slack: no form:', slackError(e))
+      // Slack's own words for a form it refuses (response_metadata.messages), so it can be fixed
+      const detail = (e as { data?: { response_metadata?: { messages?: string[] } } })?.data
+        ?.response_metadata?.messages
+      const why = [slackError(e), ...(detail ?? [])].join(' · ')
+      console.error('slack: no form:', why)
       return void (await say(
-        "Couldn't open the form (the server was waking up). Run /consortium again."
+        `Couldn't open the form: \`${cut(why, 600)}\`. Run /consortium again.`
       ))
     }
     await start(team, client, channel, user, command.text, say)
