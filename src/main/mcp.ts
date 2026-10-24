@@ -32,7 +32,8 @@ export type Catalog = {
 }
 
 // Each one's remote MCP server, from its docs (2026-10). All five take MCP OAuth with dynamic
-// client registration; Datadog's needs its admin to allow the redirect URL first, so it goes on keys.
+// client registration. Datadog's lives on each site's host, so its Connect opens a form (site, then
+// a sign-in or a token), and its org admin allow-lists our redirect URL once.
 export const CATALOG: Catalog[] = [
   {
     id: 'linear',

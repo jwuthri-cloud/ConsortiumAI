@@ -861,8 +861,9 @@ function toolsInput(
   }
 }
 
-// Connecting Datadog (its site and keys) or a custom server (a name, its URL, headers).
-export function connectModal(id: string): types.ModalView {
+// Connecting Datadog (its site; then a sign-in, or a token) or a custom server (a name, its URL,
+// headers). `callback`: the OAuth redirect a Datadog admin allow-lists once.
+export function connectModal(id: string, callback = '/mcp/callback'): types.ModalView {
   const input = (
     block_id: string,
     label: string,
@@ -893,12 +894,22 @@ export function connectModal(id: string): types.ModalView {
             },
             hint: plain('Where your Datadog lives: the address you sign in at.')
           },
-          input('api', 'API key', 'Organization Settings → API Keys.'),
           input(
-            'app',
-            'Application key',
-            "Organization Settings → Application Keys. Its owner's permissions are what the table can read; an admin must also turn on MCP access."
-          )
+            'token',
+            'Access token (optional)',
+            'Leave empty to sign in with your Datadog account, like Linear. Or paste a personal or service access token: the table reads what its owner can.',
+            {},
+            true
+          ),
+          {
+            type: 'context',
+            elements: [
+              {
+                type: 'mrkdwn',
+                text: `Once per Datadog org, an admin turns on *MCP Access* and adds \`${callback}\` under *Organization Settings → MCP OAuth Redirect URLs*.`
+              }
+            ]
+          }
         ]
       : [
           input('name', 'Name', 'Shown in the Home tab and before its tools, like "Sourcegraph".', {
@@ -949,14 +960,14 @@ export function readConnect(
   if (id === 'datadog') {
     const site = values.site?.site?.selected_option?.value ?? ''
     const errors: Record<string, string> = {}
-    if (!v('api')) errors.api = 'Paste an API key.'
-    if (!v('app')) errors.app = 'Paste an application key.'
     if (!DATADOG_SITES.includes(site)) errors.site = 'Pick a site.'
+    // no token: a server you sign in to, authorized from the Home tab like Linear
+    const token = v('token').replace(/^Bearer\s+/i, '')
     return Object.keys(errors).length
       ? { errors }
       : {
-          conn: { id, name: 'Datadog', url: datadogUrl(site), auth: 'headers' },
-          headers: { DD_API_KEY: v('api'), DD_APPLICATION_KEY: v('app') }
+          conn: { id, name: 'Datadog', url: datadogUrl(site), auth: token ? 'headers' : 'oauth' },
+          headers: token ? { Authorization: `Bearer ${token}` } : {}
         }
   }
   const name = v('name')
@@ -2144,7 +2155,10 @@ export async function serveHosted(): Promise<App> {
     const id = (action as ButtonAction).value ?? ''
     if (CATALOG.find((x) => x.id === id)?.auth === 'oauth') return // a link too
     if (await asAdmin(client, tenantOf(context), body.user.id))
-      await client.views.open({ trigger_id: body.trigger_id, view: connectModal(id) })
+      await client.views.open({
+        trigger_id: body.trigger_id,
+        view: connectModal(id, `${base}/mcp/callback`)
+      })
   })
   app.action<BlockAction>('mcp_allow', async ({ ack, body, action, client, context }) => {
     await ack()
