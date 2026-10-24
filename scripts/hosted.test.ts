@@ -17,6 +17,7 @@ import {
   homeView,
   keyed,
   modelGroups,
+  newestHaiku,
   readLink,
   readTable,
   serveHosted,
@@ -49,7 +50,10 @@ test("a workspace's settings make a Deep-agent-only brief on OpenRouter, persona
     { model: 'b/two', persona: 'customer' as const },
     { model: 'c/three', persona: 'skeptic' as const }
   ]
-  const b = settingsBrief({ ...DEFAULTS, seats, chair: 1, maxTurns: 10 }, 'Ship a CSV export?')
+  const b = settingsBrief(
+    { ...DEFAULTS, seats, chair: 1, clerk: 'd/small', maxTurns: 10 },
+    'Ship a CSV export?'
+  )
   assert.equal(b.task, 'Ship a CSV export?')
   assert.deepEqual(
     b.members.map((m) => [m.cli, m.model, m.persona]),
@@ -63,7 +67,7 @@ test("a workspace's settings make a Deep-agent-only brief on OpenRouter, persona
   assert.equal(b.maxTurns, 10)
   assert.equal(b.projectPath, undefined)
   assert.equal(b.attachments, undefined)
-  assert.equal(b.board, undefined) // the chair's seat writes the board
+  assert.deepEqual(b.board, { cli: 'harness', model: 'openrouter:d/small' }) // the clerk, on the key
 })
 
 test('settings saved before personas: model ids get personas in seat order', () => {
@@ -77,8 +81,24 @@ test('settings saved before personas: model ids get personas in seat order', () 
     { model: 'c/three', persona: 'researcher' }
   ])
   assert.deepEqual([s.chair, s.maxTurns, s.maxMeetings], [2, 9, DEFAULTS.maxMeetings])
+  assert.equal(s.clerk, 'anthropic/claude-haiku-5.5') // saved before the clerk: the default Haiku
+  assert.equal(fromStore(old, 'anthropic/claude-haiku-6').clerk, 'anthropic/claude-haiku-6')
   assert.deepEqual(fromStore(s), s) // new rows read as they are
+  assert.equal(fromStore({ ...s, clerk: 'a/one' }, 'anthropic/claude-haiku-6').clerk, 'a/one')
   assert.deepEqual(fromStore(undefined), DEFAULTS)
+})
+
+test("the clerk's default: the newest Haiku in OpenRouter's catalogue, else a known one", () => {
+  const catalogue = [
+    'anthropic/claude-opus-6',
+    'anthropic/claude-haiku-6-preview',
+    'anthropic/claude-haiku-5.5',
+    'anthropic/claude-haiku-4.5',
+    'anthropic/claude-3.5-haiku'
+  ]
+  assert.equal(newestHaiku(catalogue), 'anthropic/claude-haiku-5.5')
+  assert.equal(newestHaiku([]), DEFAULTS.clerk)
+  assert.equal(newestHaiku(['a/one'], 'anthropic/claude-haiku-6'), 'anthropic/claude-haiku-6')
 })
 
 test('the Edit table modal: six seat rows, empty ones dropped, chair among the seats', () => {
@@ -87,11 +107,18 @@ test('the Edit table modal: six seat rows, empty ones dropped, chair among the s
     selected_option: { value }
   })
   // rows: [persona, model]; 'none' = an empty seat
-  const values = (rows: [string, string][], chair = '0', turns = '12', max = '3'): Values => ({
+  const values = (
+    rows: [string, string][],
+    chair = '0',
+    turns = '12',
+    max = '3',
+    clerk = 'anthropic/claude-haiku-5.5'
+  ): Values => ({
     ...Object.fromEntries(
       rows.map(([persona, model], i) => [`seat${i}`, { persona: sel(persona), model: sel(model) }])
     ),
     chair: { chair: sel(chair) },
+    clerk: { clerk: sel(clerk) },
     turns: { turns: { value: turns } },
     max: { max: { value: max } },
     who: { who: sel('admins') }
@@ -112,6 +139,7 @@ test('the Edit table modal: six seat rows, empty ones dropped, chair among the s
         { model: 'meta/llama-5:free', persona: 'skeptic' } // the same persona twice is fine
       ],
       chair: 1, // row 3 is the second seat
+      clerk: 'anthropic/claude-haiku-5.5',
       maxTurns: 12,
       who: 'admins',
       maxMeetings: 3
@@ -130,6 +158,7 @@ test('the Edit table modal: six seat rows, empty ones dropped, chair among the s
   assert.match(errors(values([two[0], ['engineer', 'not an id']])).chair, /not an id/)
   assert.match(errors(values(two, '0', '3')).turns, /4 to 100/)
   assert.match(errors(values(two, '0', '12', '11')).max, /1 to 10/)
+  assert.match(errors(values(two, '0', '12', '3', 'none')).clerk, /model for the clerk/)
   assert.deepEqual(errors(values(two)), {})
 })
 
@@ -164,8 +193,8 @@ test("the model select: main providers' newest, within Slack's 100, the seats' m
 })
 
 test("the Edit table modal opens on the table as it is, every select's initial pick among its options", () => {
-  const s = { ...DEFAULTS, chair: 2 }
-  const view = tableModal(s, ['anthropic/claude-opus-5.5', 'openai/gpt-6.1-sol'])
+  const s = { ...DEFAULTS, chair: 2, clerk: 'anthropic/claude-haiku-5.5' }
+  const view = tableModal(s, ['anthropic/claude-opus-5.5', 'openai/gpt-6.1-sol']) // no Haiku listed
   const json = JSON.stringify(view)
   const selects = view.blocks.flatMap((b) =>
     b.type === 'actions' ? b.elements : b.type === 'input' ? [b.element] : []
@@ -177,7 +206,7 @@ test("the Edit table modal opens on the table as it is, every select's initial p
     option_groups?: { options: { value: string }[] }[]
   }[]
   const statics = selects.filter((e) => e.type === 'static_select')
-  assert.equal(statics.length, 13) // six seats × persona + model, and the chair
+  assert.equal(statics.length, 14) // six seats × persona + model, the chair and the clerk
   for (const e of statics) {
     const options = e.options ?? e.option_groups!.flatMap((g) => g.options)
     assert.ok(options.length <= 100)
@@ -186,7 +215,9 @@ test("the Edit table modal opens on the table as it is, every select's initial p
       `${e.action_id}: initial option not among its options`
     )
   }
-  const picks = statics.filter((e) => e.action_id !== 'chair').map((e) => e.initial_option!.value)
+  const picks = statics
+    .filter((e) => !['chair', 'clerk'].includes(e.action_id))
+    .map((e) => e.initial_option!.value)
   assert.deepEqual(picks, [
     'strategist',
     'anthropic/claude-sonnet-5.5', // a seat's model, though not in the catalogue
@@ -201,7 +232,12 @@ test("the Edit table modal opens on the table as it is, every select's initial p
     'customer',
     'none'
   ])
-  assert.equal(statics.at(-1)!.initial_option!.value, '2')
+  const [chair, clerk] = statics.slice(-2) // the clerk right under the chair
+  assert.equal(chair.initial_option!.value, '2')
+  assert.equal(clerk.action_id, 'clerk')
+  assert.equal(clerk.initial_option!.value, 'anthropic/claude-haiku-5.5') // kept, though not listed
+  const clerkOptions = clerk.option_groups!.flatMap((g) => g.options.map((o) => o.value))
+  assert.ok(!clerkOptions.includes('none') && clerkOptions.includes('openai/gpt-6.1-sol'))
   assert.ok(json.includes('anthropic/claude-opus-5.5'))
 })
 
@@ -289,6 +325,7 @@ test('the Home tab: the table by persona and model, buttons for admins only, nev
   const text = (admin: boolean): string => JSON.stringify(homeView(s, admin, 'https://x/connect'))
   assert.ok(text(false).includes('1. The Skeptic · `anthropic/claude-sonnet-5.5`\\n'))
   assert.ok(text(false).includes('2. The Skeptic 2 · `openai/gpt-6.1-sol` · *chair*'))
+  assert.ok(text(false).includes('Clerk · `anthropic/claude-haiku-5.5`'))
   assert.ok(text(true).includes('home_key') && text(true).includes('https://x/connect'))
   assert.ok(!text(false).includes('home_key') && !text(false).includes('https://x/connect'))
   assert.ok(text(false).includes('sk-or-v1-…3f9a') && !text(false).includes('v1.sealed'))

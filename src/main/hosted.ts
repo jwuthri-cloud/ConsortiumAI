@@ -43,11 +43,18 @@ export type Settings = {
   keyHint?: string // "sk-or-v1-…3f9a", enough to recognise it
   seats: Seat[] // 2–6, in seat order
   chair: number // the seat that writes the decision
+  clerk: string // the OpenRouter id that writes the live whiteboard
   maxTurns: number
   who: 'admins' | 'everyone' // who may convene, steer and press the buttons
   maxMeetings: number // running at once in this workspace
   installer?: string // who installed it: an admin here whatever Slack says
 }
+
+// The clerk when OpenRouter's catalogue can't be had: Anthropic's newest Haiku, small and cheap.
+const HAIKU = 'anthropic/claude-haiku-5.5'
+// The newest Haiku in a catalogue (OpenRouter ids, newest first), or `fallback`.
+export const newestHaiku = (catalogue: string[], fallback = HAIKU): string =>
+  catalogue.find((id) => /^anthropic\/claude-haiku-[\d.]+$/.test(id)) ?? fallback
 
 // ponytail: a capable, mid-priced trio from three labs; admins change it in the Home tab
 export const DEFAULTS: Settings = {
@@ -57,6 +64,7 @@ export const DEFAULTS: Settings = {
     { model: 'google/gemini-3.8-flash', persona: 'researcher' }
   ],
   chair: 0,
+  clerk: HAIKU,
   maxTurns: 12,
   who: 'everyone',
   maxMeetings: 3
@@ -64,9 +72,9 @@ export const DEFAULTS: Settings = {
 const MAX_MEETINGS = 10 // the most a workspace may run at once
 
 // A workspace's row → settings. Rows saved before seats had a persona hold model ids; those seats
-// get the personas toBrief used to hand out, in seat order.
-export function fromStore(row: Partial<Settings> | undefined): Settings {
-  const s = { ...DEFAULTS, ...row }
+// get the personas toBrief used to hand out, in seat order. Rows saved before the clerk get `clerk`.
+export function fromStore(row: Partial<Settings> | undefined, clerk = HAIKU): Settings {
+  const s = { ...DEFAULTS, clerk, ...row }
   const seats = s.seats as (Seat | string)[]
   return {
     ...s,
@@ -84,7 +92,8 @@ export function settingsBrief(s: Settings, task: string): Brief {
       persona
     })),
     chairId: `m${s.chair + 1}`,
-    maxTurns: s.maxTurns
+    maxTurns: s.maxTurns,
+    board: { cli: 'harness', model: `openrouter:${s.clerk}` }
   })
 }
 
@@ -135,6 +144,7 @@ const refusedKey = (status: number): boolean => status === 401 || status === 403
 
 const ROWS = 6 // the Edit table modal's seat rows; a row with no model is an empty seat
 const EMPTY = 'none' // the model select's "— empty —"
+const MODEL_ID = /^[a-z0-9][\w.-]*\/[\w.:-]+$/i // an OpenRouter id
 
 // The Edit table modal's answers → settings, or what's wrong by block. Seat rows are actions
 // blocks (two selects side by side) and Slack shows errors on input blocks only, so the seats'
@@ -154,21 +164,23 @@ export function readTable(
   const seats = rows.filter((r): r is Seat => !!r)
   const row = Number(v('chair')?.selected_option?.value ?? 0)
   const chair = rows.slice(0, row).filter(Boolean).length // its place once empty rows are dropped
+  const clerk = v('clerk')?.selected_option?.value ?? ''
   const maxTurns = Number(v('turns')?.value)
   const maxMeetings = Number(v('max')?.value)
   const who = v('who')?.selected_option?.value === 'admins' ? 'admins' : 'everyone'
   const errors: Record<string, string> = {}
-  const bad = seats.find(({ model }) => !/^[a-z0-9][\w.-]*\/[\w.:-]+$/i.test(model))
+  const bad = seats.find(({ model }) => !MODEL_ID.test(model))
   if (seats.length < 2) errors.chair = 'Pick a model for at least two seats.'
   else if (bad) errors.chair = `${bad.model} isn't an OpenRouter model id.`
   else if (!rows[row]) errors.chair = `Seat ${row + 1} is empty: the chair needs a model.`
+  if (!MODEL_ID.test(clerk)) errors.clerk = 'Pick an OpenRouter model for the clerk.'
   if (!Number.isInteger(maxTurns) || maxTurns < seats.length * 2 || maxTurns > 100)
     errors.turns = `A whole number from ${Math.max(4, seats.length * 2)} to 100.`
   if (!Number.isInteger(maxMeetings) || maxMeetings < 1 || maxMeetings > MAX_MEETINGS)
     errors.max = `1 to ${MAX_MEETINGS}.`
   return Object.keys(errors).length
     ? { errors }
-    : { table: { seats, chair, maxTurns, who, maxMeetings } }
+    : { table: { seats, chair, clerk, maxTurns, who, maxMeetings } }
 }
 
 const PROVIDERS: Record<string, string> = {
@@ -280,7 +292,7 @@ export function homeView(s: Settings, admin: boolean, connect?: string): types.H
       ...(admin ? [{ type: 'actions' as const, elements: keyButtons }] : []),
       { type: 'divider' },
       section(
-        `*The table*\n${seats}\n\nTurn budget ${s.maxTurns} · up to ${s.maxMeetings} meetings at once · ${s.who === 'admins' ? 'workspace admins' : "everyone in channels I'm in"} can convene`,
+        `*The table*\n${seats}\nClerk · \`${s.clerk}\` · writes the whiteboard\n\nTurn budget ${s.maxTurns} · up to ${s.maxMeetings} meetings at once · ${s.who === 'admins' ? 'workspace admins' : "everyone in channels I'm in"} can convene`,
         admin ? button('home_table', 'Edit') : undefined
       ),
       {
@@ -320,10 +332,7 @@ export const keyModal = (): types.ModalView => ({
 // `catalogue`: OpenRouter ids, newest first; empty = only the seats' own models to pick from.
 export function tableModal(s: Settings, catalogue: string[]): types.ModalView {
   const personas = PERSONA_IDS.map((p) => option(p, PERSONAS[p].label))
-  const groups = modelGroups(
-    catalogue,
-    s.seats.map((x) => x.model)
-  )
+  const groups = modelGroups(catalogue, [...s.seats.map((x) => x.model), s.clerk])
   const models = groups.flatMap((g) => g.options)
   const free = PERSONA_IDS.filter((p) => !s.seats.some((x) => x.persona === p))
   const rows = Array.from({ length: ROWS }, (_, i): types.KnownBlock[] => {
@@ -383,6 +392,20 @@ export function tableModal(s: Settings, catalogue: string[]): types.ModalView {
           options: seatOptions,
           initial_option: seatOptions[s.chair]
         }
+      },
+      {
+        type: 'input',
+        block_id: 'clerk',
+        label: plain('Clerk (writes the whiteboard)'),
+        element: {
+          type: 'static_select',
+          action_id: 'clerk',
+          option_groups: groups.slice(1), // no "— empty —": a meeting always has a clerk
+          initial_option: models.find((o) => o.value === s.clerk)
+        },
+        hint: plain(
+          'Keeps the live whiteboard as the seats talk. A small, cheap model does it well.'
+        )
       },
       {
         type: 'input',
@@ -474,10 +497,19 @@ export async function serveHosted(): Promise<App> {
     )
   const store = await openStore(e.DATABASE_URL!)
   debate.configure(dataDir())
-  void listModels('harness') // warm the catalogue: the Edit table modal's model selects list it
+  // ponytail: OpenRouter's list is fetched once per process (cli.ts), so models released since
+  // show up after a restart; a TTL there if the server runs for weeks between deploys
+  let haiku = newestHaiku([]) // the clerk of rows saved before it, once the catalogue is in
+  const openrouterIds = (): Promise<string[]> =>
+    listModels('harness').then((ids) => {
+      const c = ids.filter((id) => id.startsWith('openrouter:')).map((id) => id.slice(11))
+      haiku = newestHaiku(c, haiku)
+      return c
+    })
+  void openrouterIds() // warm the catalogue: the Edit table modal's model selects list it
 
   const load = async (team: string): Promise<Settings> =>
-    fromStore(await store.get<Partial<Settings>>('settings', team))
+    fromStore(await store.get<Partial<Settings>>('settings', team), haiku)
   const save = (team: string, s: Settings): Promise<void> => store.put('settings', team, s)
   const teamDir = (team: string): string => {
     if (!/^[A-Z0-9]+$/.test(team)) throw new Error(`not a workspace id: ${team}`)
@@ -495,13 +527,9 @@ export async function serveHosted(): Promise<App> {
   const installStore = installations(store, secret, async (team, i) => {
     if (i.user?.id) await save(team, { ...(await load(team)), installer: i.user.id })
   })
-  // ponytail: OpenRouter's list is fetched once per process (cli.ts), so models released since
-  // show up after a restart; a TTL there if the server runs for weeks between deploys
   const catalogue = (): Promise<string[]> =>
     Promise.race([
-      listModels('harness').then((ids) =>
-        ids.filter((id) => id.startsWith('openrouter:')).map((id) => id.slice(11))
-      ),
+      openrouterIds(),
       // a modal must open within 3 s of the click: without the catalogue, the seats' own models
       new Promise<string[]>((r) => setTimeout(() => r([]), 1500))
     ])
