@@ -1,5 +1,5 @@
-# The hosted, installable app (README, "Hosted"). Replace consortium.example.com with your server's
-# domain (PUBLIC_URL), then at https://api.slack.com/apps → Create New App → From a manifest.
+# The public Consortium app (README, "Hosted"), served by Render at https://consortium-yqs2.onrender.com.
+# api.slack.com/apps → Create New App → From a manifest → a normal (non-sandbox) workspace → paste this.
 display_information:
   name: Consortium
   description: A table of AI models that debates your question in a thread and writes the decision.
@@ -15,13 +15,13 @@ features:
     always_online: false
   slash_commands:
     - command: /consortium
-      url: https://consortium.example.com/slack/events
+      url: https://consortium-yqs2.onrender.com/slack/events
       description: Convene the table on a question
       usage_hint: '<question>'
       should_escape: false
 oauth_config:
   redirect_urls:
-    - https://consortium.example.com/slack/oauth_redirect
+    - https://consortium-yqs2.onrender.com/slack/oauth_redirect
   scopes:
     bot:
       - app_mentions:read
@@ -35,7 +35,7 @@ oauth_config:
       - users:read
 settings:
   event_subscriptions:
-    request_url: https://consortium.example.com/slack/events
+    request_url: https://consortium-yqs2.onrender.com/slack/events
     bot_events:
       - app_home_opened
       - app_mention
@@ -45,7 +45,7 @@ settings:
       - tokens_revoked
   interactivity:
     is_enabled: true
-    request_url: https://consortium.example.com/slack/events
+    request_url: https://consortium-yqs2.onrender.com/slack/events
   org_deploy_enabled: false
   socket_mode_enabled: false
   token_rotation_enabled: false
