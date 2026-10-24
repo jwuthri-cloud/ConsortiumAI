@@ -7,7 +7,7 @@ import { mkdtemp } from 'node:fs/promises'
 import { createServer, type AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { App, types } from '@slack/bolt'
+import { webApi, type App, type Installation, type types } from '@slack/bolt'
 import { runMember } from '../src/main/cli'
 import {
   MAX_FILES,
@@ -23,19 +23,27 @@ import {
 import { appJwt, appManifest, clone, cloneArgs, cloneEnv, githubApp } from '../src/main/github'
 import {
   DEFAULTS,
+  SCOPES,
   askModal,
   homeView,
   keyed,
   missingScopes,
+  closest,
+  preselect,
   readAsk,
   readLink,
   reinstallNeeded,
+  repoIn,
+  repoOptions,
+  repoPicker,
   repoPrefix,
+  unreadable,
   serveHosted,
   settingsBrief,
   signLink
 } from '../src/main/hosted'
 import { bridge, type Tenancy } from '../src/main/slack'
+import { installations, openStore, seal } from '../src/main/store'
 
 const SECRET = 'x'.repeat(40)
 const file = (name: string, mimetype = 'text/plain', size = 10): SlackFile => ({
@@ -315,8 +323,10 @@ test('the ask form: valid blocks, the channel’s repository first, answers read
   assert.equal(channel.response_url_enabled, true)
   const repo = input('repo').element as types.StaticSelect
   assert.ok(input('repo').optional)
-  assert.equal(repo.options!.length, 100) // Slack's cap, "— none —" included
+  assert.equal(repo.options!.length, 100) // Slack's cap, "No repository" included
   assert.equal(repo.options![0].value, 'none')
+  assert.equal((repo.options![1].text as types.PlainTextElement).text, 'old') // by name…
+  assert.equal(repo.options![1].description?.text, 'acme') // …the owner under it
   assert.equal(repo.initial_option?.value, 'acme/old') // not among the newest: added
   assert.ok(repo.options!.some((o) => o.value === repo.initial_option?.value))
   assert.ok(repo.options!.every((o) => (o.text as types.PlainTextElement).text.length <= 75))
@@ -361,6 +371,136 @@ test('the ask form: valid blocks, the channel’s repository first, answers read
   assert.deepEqual(readAsk({ question: { question: { value: ' ' } }, channel: { channel: {} } }), {
     errors: { question: 'Ask a question.', channel: 'Pick a channel.' }
   })
+})
+
+// connectlyai's repositories, most recently pushed first
+const ORG = [
+  'crewmate',
+  'connectly-backend',
+  'connectly-frontend',
+  'testing',
+  'api_docs',
+  'webchat.test',
+  'webchat',
+  'cq',
+  'docs.connectly.ai',
+  'memory-server',
+  'main',
+  'FeBe',
+  'backend.claude',
+  'bug-radar'
+].map((n) => `connectlyai/${n}`)
+
+test('the repository a question names: whole names first, every part that counts, no noise', () => {
+  // a part of the name, the org's prefix left out
+  assert.equal(
+    repoIn('why does backend retry webhooks twice?', ORG),
+    'connectlyai/connectly-backend'
+  )
+  assert.equal(repoIn('Is the Frontend slow?', ORG), 'connectlyai/connectly-frontend')
+  // the most parts said beats an older match on fewer
+  assert.equal(repoIn('what does the claude backend do?', ORG), 'connectlyai/backend.claude')
+  assert.equal(repoIn('Should the bug radar page us?', ORG), 'connectlyai/bug-radar')
+  // a generic part needn't be said; plurals count
+  assert.equal(repoIn('Why is memory leaking?', ORG), 'connectlyai/memory-server')
+  // the whole name beats part of one, owner/name too
+  assert.equal(repoIn('Is webchat.test in sync with webchat?', ORG), 'connectlyai/webchat.test')
+  assert.equal(repoIn('Why does webchat drop messages?', ORG), 'connectlyai/webchat')
+  assert.equal(repoIn('Look at connectlyai/cq first', ORG), 'connectlyai/cq')
+  assert.equal(repoIn('how does FeBe build?', ORG), 'connectlyai/FeBe')
+  // common words name nothing, nor does a partial name, nor the owner
+  assert.equal(repoIn('Should main be protected? Are we testing enough?', ORG), undefined)
+  assert.equal(repoIn('Is our test coverage OK for the API docs?', ORG), undefined)
+  assert.equal(repoIn('Should connectly raise prices?', ORG), undefined)
+  assert.equal(repoIn('', ORG), undefined)
+  assert.equal(repoIn('backend', []), undefined)
+})
+
+test('the repository a question starts with: the one it names, else the channel’s last, else none', () => {
+  const last = 'connectlyai/webchat'
+  assert.equal(preselect('why does backend retry?', ORG, last), 'connectlyai/connectly-backend')
+  assert.equal(preselect('Should we raise prices?', ORG, last), last)
+  assert.equal(preselect(undefined, ORG, last), last)
+  assert.equal(preselect('Should we raise prices?', ORG), null)
+})
+
+test('a repository it can’t read: plain words, the closest names, where admins add it', () => {
+  assert.deepEqual(closest('connectlyai/backend', ORG), [
+    'connectlyai/connectly-backend',
+    'connectlyai/backend.claude'
+  ])
+  assert.deepEqual(closest('connectlyai/webchats', ORG).slice(0, 1), ['connectlyai/webchat'])
+  assert.deepEqual(closest('acme/nothing-like-it', ORG), [])
+  const msg = unreadable('connectlyai/backend', ORG)
+  assert.match(msg, /^`connectlyai\/backend` isn't one of the repositories Consortium can read/)
+  assert.match(msg, /Did you mean `connectly-backend` or `backend\.claude`\?/)
+  assert.match(msg, /Home tab → Change repositories/)
+  assert.doesNotMatch(msg, /GitHub answered|422|repo:/)
+  assert.doesNotMatch(unreadable('acme/x', []), /Did you mean/)
+})
+
+test('the ask form with a question: filled in, the repository it names selected, Start', () => {
+  const v = askModal({
+    channel: 'C1',
+    question: 'why does backend retry webhooks twice?',
+    repos: ORG,
+    repo: preselect('why does backend retry webhooks twice?', ORG, 'connectlyai/webchat'),
+    files: true,
+    install: ''
+  })
+  const input = (id: string): types.InputBlock =>
+    v.blocks.find((b) => b.block_id === id) as types.InputBlock
+  assert.equal(
+    (input('question').element as types.PlainTextInput).initial_value,
+    'why does backend retry webhooks twice?'
+  )
+  assert.equal(
+    (input('repo').element as types.StaticSelect).initial_option?.value,
+    'connectlyai/connectly-backend'
+  )
+  assert.equal(v.submit?.text, 'Start')
+  assert.equal(
+    (askModal({ files: true, install: '' }).blocks[0] as types.InputBlock).element.type,
+    'plain_text_input'
+  )
+  assert.ok(
+    !(
+      'initial_value' in
+      (askModal({ files: true, install: '' }).blocks[0] as types.InputBlock).element
+    )
+  )
+})
+
+test('the mention’s picker: a valid select (the pick always in it, No repository) and Start', () => {
+  const blocks = repoPicker({
+    id: 'abc',
+    question: 'why does <backend> retry & fail?',
+    repos: ORG,
+    repo: 'connectlyai/gone',
+    files: 2
+  })
+  assert.equal(blocks.length, 2)
+  const [head, actions] = blocks as [types.SectionBlock, types.ActionsBlock]
+  assert.match(head.text!.text, /Which repository should the table read\?\* · 2 files/)
+  assert.match(head.text!.text, /&lt;backend&gt; retry &amp; fail\?/) // escaped
+  assert.equal(actions.block_id, 'pick_abc')
+  const [select, start] = actions.elements as [types.StaticSelect, types.Button]
+  assert.equal(select.action_id, 'pick_repo')
+  assert.equal(select.options![0].value, 'none')
+  assert.equal((select.options![0].text as types.PlainTextElement).text, 'No repository')
+  assert.equal(select.initial_option?.value, 'connectlyai/gone') // not listed: added first
+  assert.ok(select.options!.some((o) => o.value === select.initial_option?.value))
+  assert.ok(
+    select.options!.every(
+      (o) => o.value!.length <= 75 && (o.text as types.PlainTextElement).text.length <= 75
+    )
+  )
+  assert.deepEqual([start.action_id, start.value, start.style], ['pick_start', 'abc', 'primary'])
+  // no pick: No repository first
+  assert.equal(repoOptions(ORG, null).initial.value, 'none')
+  assert.equal(repoOptions([], undefined).options.length, 1)
+  const long = repoPicker({ id: 'x', question: 'q'.repeat(500), repos: [] })
+  assert.ok((long[0] as types.SectionBlock).text!.text.length < 300)
 })
 
 test('repo: a prefix picks the repository for one question', () => {
@@ -511,8 +651,10 @@ test('the bridge: what convene set up goes when the meeting ends, or never start
         done: () => void cleaned.push(x.id)
       }
     },
-    ask: async (o) => void asked.push(o)
+    // the form for `/consortium` alone; a question too once `take` (GitHub connected, hosted)
+    ask: async (o) => (asked.push(o), !o.question || take)
   }
+  let take = false
   bridge(app, tenancy)
   const said: string[] = []
   const command = (text: string): Promise<unknown> =>
@@ -526,9 +668,33 @@ test('the bridge: what convene set up goes when the meeting ends, or never start
 
   await command('') // nothing after the command: the form
   assert.deepEqual(asked, [{ team: 'T1', client, user: 'U1', channel: 'C1', trigger: 'TR' }])
+  assert.deepEqual(said, [])
+
+  // a repository to pick: the form with the question, or the mention's picker; nothing starts yet
+  take = true
+  await command('Why does backend retry?')
+  assert.equal((asked.at(-1) as { question?: string }).question, 'Why does backend retry?')
+  const f = file('a.md')
+  await on.app_mention({
+    event: { user: 'U1', channel: 'C1', text: '<@UBOT> Why so slow?', thread_ts: '9', files: [f] },
+    client,
+    context: { teamId: 'T1' }
+  })
+  assert.deepEqual(asked.at(-1), {
+    team: 'T1',
+    client,
+    user: 'U1',
+    channel: 'C1',
+    thread: '9',
+    question: 'Why so slow?',
+    files: [f]
+  })
+  assert.equal(posted.length, 0)
+  take = false
 
   failPost = true
-  await command('Not invited')
+  await command('Not invited') // no repository to pick: it starts at once
+  assert.equal((asked.at(-1) as { question?: string }).question, 'Not invited')
   assert.equal(cleaned.length, 1)
   assert.match(said.at(-1)!, /not_in_channel/)
 
@@ -675,5 +841,205 @@ test('GitHub routes: setup, connect through a cookie, an installation counted on
     }
   } finally {
     globalThis.fetch = real
+  }
+})
+
+test('hosted, end to end: the form on the repository the question names, the picker, Start, plain errors', async () => {
+  const port = await new Promise<number>((done) => {
+    const srv = createServer().listen(0, () => {
+      const { port } = srv.address() as AddressInfo
+      srv.close(() => done(port))
+    })
+  })
+  const db = `sqlite:${join(await mkdtemp(join(tmpdir(), 'consortium-pick-')), 'c.db')}`
+  const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
+  Object.assign(process.env, {
+    PORT: String(port),
+    PUBLIC_URL: `http://localhost:${port}`,
+    DATABASE_URL: db,
+    CONSORTIUM_DATA: await mkdtemp(join(tmpdir(), 'consortium-pick-data-')),
+    CONSORTIUM_SECRET: SECRET,
+    SLACK_CLIENT_ID: '1.2',
+    SLACK_CLIENT_SECRET: 'x',
+    SLACK_SIGNING_SECRET: 'x',
+    GITHUB_APP_ID: '42',
+    GITHUB_APP_SLUG: 'consortium-test',
+    GITHUB_APP_PRIVATE_KEY: privateKey.export({ type: 'pkcs1', format: 'pem' }).toString(),
+    GITHUB_APP_CLIENT_ID: 'Iv1.abc',
+    GITHUB_APP_CLIENT_SECRET: 'cs'
+  })
+  // the workspace: installed, a key, GitHub connected, the channel's last repository webchat
+  const store = await openStore(db)
+  await installations(store, SECRET, async () => {}).storeInstallation({
+    team: { id: 'T1', name: 'One' },
+    enterprise: undefined,
+    user: { id: 'U9', token: undefined, scopes: undefined },
+    bot: { token: 'xoxb-one', scopes: SCOPES, id: 'B1', userId: 'UB1' },
+    isEnterpriseInstall: false
+  } as unknown as Installation)
+  await store.put('settings', 'T1', { key: seal('sk-or-v1-test', SECRET, 'T1'), keyHint: 'k' })
+  await store.put('github', 'T1', { installation: 7, account: 'connectlyai' })
+  await store.put('channel-repos', 'T1', { C1: 'connectlyai/webchat' })
+  await store.close()
+
+  // Slack's Web API, its response_urls, GitHub and OpenRouter: all here
+  const slack: [string, Record<string, unknown>][] = []
+  const realCall = webApi.WebClient.prototype.apiCall
+  webApi.WebClient.prototype.apiCall = async function (method, options = {}) {
+    slack.push([method, options])
+    return { ok: true, ts: '1', permalink: 'p' }
+  }
+  const responded: Record<string, unknown>[] = [] // what went to response_urls
+  const hook = 'https://hooks.slack.test'
+  const realFetch = globalThis.fetch
+  const day = (i: number): string => new Date(Date.UTC(2026, 9, 20 - i)).toISOString()
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url.startsWith(hook)) {
+      responded.push(JSON.parse(String(init?.body)))
+      return new Response('ok')
+    }
+    if (url.endsWith('/app/installations/7/access_tokens')) {
+      const asked = JSON.parse(String(init?.body ?? '{}')).repositories?.[0]
+      return asked === 'backend' // not one of theirs
+        ? Response.json(
+            { message: 'There is at least one repository that does not exist' },
+            { status: 422 }
+          )
+        : Response.json({ token: 'ghs_x' })
+    }
+    if (url.startsWith('https://api.github.com/installation/repositories'))
+      return Response.json({
+        total_count: ORG.length,
+        repositories: ORG.map((full_name, i) => ({
+          full_name,
+          name: full_name.split('/')[1],
+          pushed_at: day(i),
+          size: 1
+        }))
+      })
+    if (url === 'https://api.github.com/repos/connectlyai/connectly-backend')
+      return Response.json({
+        full_name: url.slice(29),
+        name: 'connectly-backend',
+        size: 400 * 1024
+      })
+    if (url === 'https://openrouter.ai/api/v1/key') return Response.json({ data: {} })
+    return new Response('{"data":[]}')
+  }
+  const app = await serveHosted()
+  const send = (body: Record<string, unknown>): Promise<void> =>
+    app.processEvent({ body: { api_app_id: 'A1', token: 'x', ...body }, ack: async () => {} })
+  const command = (text: string): Promise<void> =>
+    send({
+      command: '/consortium',
+      text,
+      team_id: 'T1',
+      user_id: 'U1',
+      channel_id: 'C1',
+      trigger_id: 'TR1',
+      response_url: `${hook}/command`
+    })
+  const last = (method: string): Record<string, unknown> =>
+    slack.findLast(([m]) => m === method)![1]
+  try {
+    // /consortium <question>: the form, filled in, on the repository the question names
+    await command('why does backend retry webhooks twice?')
+    const view = last('views.open').view as types.ModalView
+    const input = (id: string): types.InputBlock =>
+      view.blocks.find((b) => b.block_id === id) as types.InputBlock
+    assert.equal(
+      (input('question').element as types.PlainTextInput).initial_value,
+      'why does backend retry webhooks twice?'
+    )
+    assert.equal(
+      (input('repo').element as types.StaticSelect).initial_option?.value,
+      'connectlyai/connectly-backend'
+    )
+    assert.equal(view.submit?.text, 'Start')
+    assert.ok(!slack.some(([m]) => m === 'chat.postMessage')) // nothing started
+
+    // repo: still works, silently; a repository it can't read gets plain words and near names
+    await command('repo:connectlyai/backend why does backend retry webhooks twice?')
+    const refusal = String(responded.at(-1)?.text)
+    assert.match(
+      refusal,
+      /^Can't convene: `connectlyai\/backend` isn't one of the repositories Consortium can read in this workspace\. Did you mean `connectly-backend` or `backend\.claude`\? An admin can add repositories in Consortium's Home tab → Change repositories\.$/
+    )
+
+    // a mention: the picker, only for them, on the same repository; nothing starts yet
+    await send({
+      type: 'event_callback',
+      team_id: 'T1',
+      event_id: 'Ev1',
+      event_time: 1,
+      event: {
+        type: 'app_mention',
+        user: 'U1',
+        channel: 'C1',
+        text: '<@UB1> why does backend retry webhooks twice?',
+        ts: '5.1',
+        event_ts: '5.1'
+      }
+    })
+    const picker = last('chat.postEphemeral')
+    assert.equal(picker.user, 'U1')
+    const actions = (picker.blocks as types.KnownBlock[])[1] as types.ActionsBlock
+    const select = actions.elements[0] as types.StaticSelect
+    assert.equal(select.initial_option?.value, 'connectlyai/connectly-backend')
+    const id = (actions.elements[1] as types.Button).value!
+    assert.ok(!slack.some(([m]) => m === 'chat.postMessage'))
+
+    // Start: the picker goes, the meeting convenes with the pick (here: too big to read)
+    const start = (): Promise<void> =>
+      send({
+        type: 'block_actions',
+        team: { id: 'T1' },
+        user: { id: 'U1' },
+        channel: { id: 'C1' },
+        container: { type: 'message', message_ts: '6', channel_id: 'C1', is_ephemeral: true },
+        trigger_id: 'TR2',
+        response_url: `${hook}/picker`,
+        actions: [
+          {
+            type: 'button',
+            action_id: 'pick_start',
+            block_id: actions.block_id,
+            value: id,
+            action_ts: '1'
+          }
+        ],
+        state: {
+          values: {
+            [actions.block_id!]: {
+              pick_repo: { type: 'static_select', selected_option: select.initial_option }
+            }
+          }
+        }
+      })
+    await start()
+    assert.deepEqual(responded.at(-1), { delete_original: true })
+    const said = slack
+      .filter(([m]) => m === 'chat.postEphemeral')
+      .slice(-2)
+      .map(([, o]) => o.text)
+    assert.deepEqual(said, [
+      ':hourglass_flowing_sand: Getting `connectlyai/connectly-backend` ready…',
+      "Can't convene: `connectlyai/connectly-backend` is about 400 MB; the table reads repositories up to 300 MB."
+    ])
+    await start() // once only
+    assert.match(String(responded.at(-1)?.text), /expired: mention me again/)
+  } finally {
+    await app.stop()
+    globalThis.fetch = realFetch
+    webApi.WebClient.prototype.apiCall = realCall
+    for (const k of [
+      'GITHUB_APP_ID',
+      'GITHUB_APP_SLUG',
+      'GITHUB_APP_PRIVATE_KEY',
+      'GITHUB_APP_CLIENT_ID',
+      'GITHUB_APP_CLIENT_SECRET'
+    ])
+      delete process.env[k]
   }
 })

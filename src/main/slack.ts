@@ -287,14 +287,19 @@ export type Tenancy = {
   maxMeetings(team: string): Promise<number>
   convene(team: string, channel: string, question: string, x: Extra): Promise<Convened> // throws what to tell them
   forget?(team: string): Promise<void> // the app was uninstalled there
-  // `/consortium` with nothing after it: a form to ask with (hosted)
+  // Before a question starts (hosted): a form to ask with (`trigger`: `/consortium`, the Home tab)
+  // or, for a mention, a message to pick the repository with. `question` unset: `/consortium`
+  // alone, always the form. false: start it at once.
   ask?(o: {
     team: string
     client: Client
     user: string
     channel?: string
-    trigger: string
-  }): Promise<void>
+    trigger?: string
+    question?: string
+    files?: SlackFile[]
+    thread?: string
+  }): Promise<boolean>
   // files posted in a meeting's thread, as text for the host's message (hosted); throws what to tell them
   attach?(team: string, client: Client, files: SlackFile[], question: string): Promise<string>
 }
@@ -664,32 +669,38 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
     (client: Client, channel: string, user: string, thread_ts?: string) => (text: string) =>
       client.chat.postEphemeral({ channel, user, thread_ts, text })
 
+  // t.ask first, when there is one: true = it took the question (a form, a picker, a refusal)
+  const asked = async (
+    o: Parameters<NonNullable<Tenancy['ask']>>[0],
+    say: (text: string) => Promise<unknown>
+  ): Promise<boolean> => {
+    if (!t.ask) return false
+    const no = await t.refuse(o.team, o.user, o.client)
+    if (!no) return t.ask(o)
+    await say(no)
+    return true
+  }
+
   app.command('/consortium', async ({ command, ack, respond, client, context }) => {
     await ack()
     const team = tenantOf(context)
     const say = (text: string): Promise<unknown> => respond({ response_type: 'ephemeral', text })
-    if (t.ask && !unmention(command.text)) {
-      const no = await t.refuse(team, command.user_id, client)
-      if (no) return void (await say(no))
-      const o = { team, client, user: command.user_id, channel: command.channel_id }
-      return t.ask({ ...o, trigger: command.trigger_id })
-    }
-    await start(team, client, command.channel_id, command.user_id, command.text, say)
+    const { user_id: user, channel_id: channel, trigger_id: trigger } = command
+    const question = unmention(command.text)
+    const o = { team, client, user, channel, trigger, ...(question && { question }) }
+    if (await asked(o, say)) return
+    await start(team, client, channel, user, command.text, say)
   })
 
   app.event('app_mention', async ({ event, client, context }) => {
     const team = tenantOf(context)
     // a mention inside a running meeting's thread is a steer: the message listener has it
     if (!event.user || (event.thread_ts && meetings.has(slot(team, event.thread_ts)))) return
-    await start(
-      team,
-      client,
-      event.channel,
-      event.user,
-      event.text,
-      ephemeral(client, event.channel, event.user, event.thread_ts),
-      { files: event.files }
-    )
+    const say = ephemeral(client, event.channel, event.user, event.thread_ts)
+    const question = unmention(event.text)
+    const o = { team, client, user: event.user, channel: event.channel, thread: event.thread_ts }
+    if (question && (await asked({ ...o, question, files: event.files }, say))) return
+    await start(team, client, event.channel, event.user, event.text, say, { files: event.files })
   })
 
   app.message(async ({ message, client, context }) => {

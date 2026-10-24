@@ -17,7 +17,7 @@ features:
     - command: /consortium
       url: https://consortium-yqs2.onrender.com/slack/events
       description: Convene the table on a question
-      usage_hint: '[repo:owner/name] <question>, or nothing for a form with files'
+      usage_hint: '<question>, or nothing for a form with files'
       should_escape: false
 oauth_config:
   redirect_urls:

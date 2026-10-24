@@ -3,7 +3,15 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve } from 'node:path'
-import { App, webApi, type BlockAction, type CustomRoute, type types } from '@slack/bolt'
+import {
+  App,
+  webApi,
+  type BlockAction,
+  type ButtonAction,
+  type CustomRoute,
+  type StaticSelectAction,
+  type types
+} from '@slack/bolt'
 import * as debate from './debate'
 import { toBrief } from './api'
 import { imageModels, listModels, runMember } from './cli'
@@ -179,7 +187,8 @@ export const missingScopes = (
 export const reinstallNeeded = (url: string): string =>
   `Consortium can't read files in this workspace yet: it was installed before it could. Someone allowed to install apps can <${url}|Reinstall to enable files>, then try again.`
 
-// "repo:owner/name question" or "repo:none question": the repository for this one question.
+// "repo:owner/name question" or "repo:none question": the repository for this one question. A
+// power user's shortcut, said nowhere: everyone else confirms the one picked for them (repoIn).
 export function repoPrefix(text: string): { repo?: string | null; text: string } {
   const [, r, rest] = text.match(/^\s*repo:\s*(none|[\w.-]+\/[\w.-]+)\s+([\s\S]+)$/i) ?? []
   return r
@@ -187,6 +196,92 @@ export function repoPrefix(text: string): { repo?: string | null; text: string }
     : { text: text.trim() }
 }
 const REPO = /^[\w.-]+\/[\w.-]+$/
+
+// Words that name no repository, however many repositories they name a part of.
+const STOP = new Set(
+  `a about after all also an and any are as at be been but by can could did do does doing done each
+  even ever every first for from get got had has have how i if in into is it its just last like make
+  may me might more most must my need new next no not now of off old on one only or our out over same
+  set should so some still than that the their them then there these they thing this those to too
+  two under up us use very want was way we were what when where which who why will with would yes you
+  your main master test testing repo repository project code data app`.split(/\s+/)
+)
+// Parts a repository's name may carry that a question doesn't say: "backend" is connectly-backend.
+const GENERIC = new Set(
+  'app api service server web sdk lib core js ts py go cli tool doc dev prod'.split(' ')
+)
+const singular = (w: string): string =>
+  w.length > 3 && w.endsWith('s') && !w.endsWith('ss') ? w.slice(0, -1) : w
+// "ConnectlyBackend", "connectly-backend", "backend.claude" → their words, lower case, singular
+const words = (s: string): string[] =>
+  s
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean)
+    .map(singular)
+
+// How `text` names each repository (full names): `exact` when it says the whole name; else the
+// parts of the name it says (`said`) of the ones that count (`of`: not the owner's, not generic).
+// `loose` counts a part a word starts (or is started by), for "did you mean".
+function said(
+  text: string,
+  repos: string[],
+  loose = false
+): { repo: string; exact: boolean; said: number; of: number }[] {
+  const tokens = new Set(text.toLowerCase().match(/[a-z0-9][\w./-]*[a-z0-9]|[a-z0-9]/g))
+  const heard = words(text).filter((w) => w.length > 2 && !STOP.has(w))
+  return repos.map((repo) => {
+    const [owner, name = ''] = repo.toLowerCase().split('/')
+    const exact = !STOP.has(name) && (tokens.has(name) || tokens.has(repo.toLowerCase()))
+    const parts = words(name).filter((p) => !owner.includes(p) && !GENERIC.has(p))
+    const hit = (p: string): boolean =>
+      heard.some(
+        (w) =>
+          w === p ||
+          (loose && Math.min(w.length, p.length) > 3 && (w.startsWith(p) || p.startsWith(w)))
+      )
+    return { repo, exact, said: parts.filter(hit).length, of: parts.length }
+  })
+}
+
+// The repository a question names: the whole name before part of one, the most parts said, then
+// the most recently pushed (`repos` comes newest first). Every part that counts must be said, so
+// "backend" picks connectly-backend and not backend.claude.
+// ponytail: words only, no typo tolerance; the select is right there to fix a wrong pick
+export function repoIn(question: string, repos: string[]): string | undefined {
+  const all = said(question, repos)
+  const exact = all.filter((x) => x.exact).sort((a, b) => b.repo.length - a.repo.length)[0]
+  const full = all.filter((x) => x.of && x.said === x.of).sort((a, b) => b.said - a.said)[0]
+  return (exact ?? full)?.repo
+}
+
+// The repository a question starts with: the one it names, else the channel's last, else none.
+export const preselect = (
+  question: string | undefined,
+  repos: string[],
+  last?: string
+): string | null => (question && repoIn(question, repos)) || last || null
+
+// The repositories closest to a name the installation can't read, best first.
+export function closest(full: string, repos: string[], n = 3): string[] {
+  const score = (x: ReturnType<typeof said>[number]): number =>
+    x.exact ? 2 : x.said / Math.max(1, x.of)
+  return said(full, repos, true)
+    .filter((x) => x.exact || x.said)
+    .sort((a, b) => score(b) - score(a))
+    .slice(0, n)
+    .map((x) => x.repo)
+}
+
+// A repository the installation can't read, in plain words: the near names it has, and who adds it.
+export function unreadable(full: string, repos: string[]): string {
+  const near = closest(full, repos).map((r) => `\`${r.split('/')[1]}\``)
+  const mean = near.length
+    ? ` Did you mean ${near.length > 1 ? `${near.slice(0, -1).join(', ')} or ${near.at(-1)}` : near[0]}?`
+    : ''
+  return `\`${full}\` isn't one of the repositories Consortium can read in this workspace.${mean} An admin can add repositories in Consortium's Home tab → Change repositories.`
+}
 
 // OpenRouter's refusals, said so the workspace knows what to do.
 export function explain(e: unknown): unknown {
@@ -374,7 +469,7 @@ export function homeView(
     ? [
         { type: 'divider' },
         section(
-          `*GitHub*\n${g.account ? `:white_check_mark: Connected to \`${g.account}\`${repos}. Pick one when you ask, or start with \`repo:owner/name\`; the table reads it, read-only.` : 'Not connected. Connect a GitHub account or org, and the table can read one of its repositories, read-only, when you ask.'}`
+          `*GitHub*\n${g.account ? `:white_check_mark: Connected to \`${g.account}\`${repos}. When you ask, Consortium picks the one your question names (or the channel's last) and you confirm it; the table reads it, read-only.` : 'Not connected. Connect a GitHub account or org, and the table can read one of its repositories, read-only, when you ask.'}`
         ),
         ...(admin && g.connect
           ? [
@@ -411,7 +506,7 @@ export function homeView(
     blocks: [
       { type: 'header', text: plain('Consortium') },
       section(
-        'A table of AI models that debates your question in a thread and writes the decision. Invite me to a channel, then `/consortium <question>` or mention @Consortium there. `/consortium` alone opens a form to attach files or a repository. Reply in the thread to steer the meeting.'
+        'A table of AI models that debates your question in a thread and writes the decision. Invite me to a channel, then `/consortium <question>` or mention @Consortium there (attach files to the mention, or use `/consortium` alone for a form). Reply in the thread to steer the meeting.'
       ),
       {
         type: 'actions',
@@ -589,29 +684,44 @@ export function tableModal(s: Settings, catalogue: string[]): types.ModalView {
   }
 }
 
-const NONE = 'none' // the repository select's "— none —"
+const NONE = 'none' // the repository select's "No repository"
 
-// The form `/consortium` alone (or the Home tab's New question) opens. `repos`: what the repository
-// select lists (unset = no select), `repo` its first pick; `files`: the install reads files (else
-// `install`, the reinstall link); `note`: a line under the repository.
+// The repository select's options: "No repository", then the repositories by name (the owner
+// under it), newest first, within Slack's 100 and `repo` always among them; and its first pick.
+export function repoOptions(
+  repos: string[],
+  repo?: string | null
+): { options: types.PlainTextOption[]; initial: types.PlainTextOption } {
+  const list = repo && !repos.includes(repo) ? [repo, ...repos] : repos
+  const options = [
+    option(NONE, 'No repository'),
+    ...list.slice(0, MAX_OPTIONS - 1).map((r) => {
+      const [owner, name] = r.split('/')
+      return { ...option(r, name ?? r), description: plain(owner.slice(0, 75)) }
+    })
+  ]
+  return { options, initial: options.find((x) => x.value === (repo ?? NONE)) ?? options[0] }
+}
+
+// The form `/consortium` opens (alone, or with a question when GitHub is connected; the Home
+// tab's New question too). `question`: what they typed; `repos`: what the repository select lists
+// (unset = no select), `repo` its first pick; `files`: the install reads files (else `install`,
+// the reinstall link); `note`: a line under the repository.
 export function askModal(o: {
   channel?: string
+  question?: string
   repos?: string[]
   repo?: string | null
   files: boolean
   install: string
   note?: string
 }): types.ModalView {
-  const list = o.repo && o.repos && !o.repos.includes(o.repo) ? [o.repo, ...o.repos] : o.repos
-  const repos = list && [
-    option(NONE, '— none —'),
-    ...list.slice(0, MAX_OPTIONS - 1).map((r) => option(r, r))
-  ]
+  const repos = o.repos && repoOptions(o.repos, o.repo)
   return {
     type: 'modal',
     callback_id: 'ask_modal',
     title: plain('Ask the table'),
-    submit: plain('Convene'),
+    submit: plain('Start'),
     close: plain('Cancel'),
     blocks: [
       {
@@ -622,7 +732,8 @@ export function askModal(o: {
           type: 'plain_text_input',
           action_id: 'question',
           multiline: true,
-          placeholder: plain('What should the table decide?')
+          placeholder: plain('What should the table decide?'),
+          ...(o.question && { initial_value: o.question.slice(0, 3000) })
         }
       },
       {
@@ -648,10 +759,10 @@ export function askModal(o: {
               element: {
                 type: 'static_select' as const,
                 action_id: 'repo',
-                options: repos,
-                initial_option: repos.find((x) => x.value === (o.repo ?? NONE)) ?? repos[0]
+                options: repos.options,
+                initial_option: repos.initial
               },
-              hint: plain('The table reads it, read-only, for this meeting.')
+              hint: plain('The table reads it, read-only, for this meeting. Type to search.')
             }
           ]
         : []),
@@ -691,6 +802,35 @@ export function readAsk(
   return Object.keys(errors).length
     ? { errors }
     : { question, channel, repo, files: values.files?.files?.files ?? [] }
+}
+
+// What an @mention gets, only for them, when GitHub is connected: the repository select (`repo`
+// first) and Start, one click when the pick is right. `id`: the question waiting on it.
+export function repoPicker(o: {
+  id: string
+  question: string
+  repos: string[]
+  repo?: string | null
+  files?: number
+}): types.KnownBlock[] {
+  const { options, initial } = repoOptions(o.repos, o.repo)
+  const quoted = o.question.length > 200 ? `${o.question.slice(0, 199)}…` : o.question
+  const esc = (s: string): string =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  const files = o.files ? ` · ${o.files} file${o.files > 1 ? 's' : ''}` : ''
+  return [
+    section(
+      `*Which repository should the table read?*${files}\n>${esc(quoted).replace(/\n/g, '\n>')}`
+    ),
+    {
+      type: 'actions',
+      block_id: `pick_${o.id}`,
+      elements: [
+        { type: 'static_select', action_id: 'pick_repo', options, initial_option: initial },
+        button('pick_start', 'Start', { style: 'primary', value: o.id })
+      ]
+    }
+  ]
 }
 
 // ---------- signed links ----------
@@ -843,30 +983,53 @@ export async function serveHosted(): Promise<App> {
     listed.set(installation, { at: Date.now(), list })
     return list
   }
+  const namesOf = (installation: number): Promise<string[]> =>
+    reposOf(installation).then((r) => r.repos.map((x) => x.full_name))
   // the repository each channel asked with last, per workspace
   const lastRepos = async (team: string): Promise<Record<string, string>> =>
     (await store.get<Record<string, string>>('channel-repos', team)) ?? {}
   // the repository, cloned into `work` with a token for it alone: its folder
   const fetchRepo = async (installation: number, full: string, work: string): Promise<string> => {
-    if (!REPO.test(full)) throw new Error(`${full} isn't a repository name (owner/name).`)
+    if (!REPO.test(full)) throw new Error(`\`${full}\` isn't a repository name (owner/name).`)
     let token: string
     let r: Repo
+    // GitHub's own words go to the log; the person gets plain ones
+    const later = (err: unknown): Error => {
+      console.error(`github: ${full}:`, err instanceof Error ? err.message : err)
+      return new Error(`GitHub didn't hand over \`${full}\` just now; try again in a moment.`)
+    }
     try {
       token = await installationToken(github!, installation, [full.split('/')[1]])
       r = await getRepo(token, full)
     } catch (err) {
-      throw new Error(
-        `${full} isn't among the repositories this workspace's GitHub connection can read; an admin can add it with Change repositories in the Home tab (${err instanceof Error ? err.message : err}).`
-      )
+      const e = later(err)
+      if (!/GitHub answered (403|404|422)\b/.test(String(err))) throw e // not a "no": try again
+      throw new Error(unreadable(full, await namesOf(installation).catch(() => [])))
     }
     if (r.size > MAX_REPO_KB)
       throw new Error(
-        `${full} is about ${Math.round(r.size / 1024)} MB; the table reads repositories up to 300 MB.`
+        `\`${full}\` is about ${Math.round(r.size / 1024)} MB; the table reads repositories up to 300 MB.`
       )
     const into = join(work, r.name)
-    await clone(token, `https://github.com/${r.full_name}.git`, into)
+    await clone(token, `https://github.com/${r.full_name}.git`, into).catch((err) => {
+      throw later(err)
+    })
     return into
   }
+
+  // mentions waiting on their repository picker's Start, by the id on the button
+  // ponytail: in memory, like `pending` below; a restart before Start means mentioning again
+  type Waiting = {
+    team: string
+    user: string
+    channel: string
+    thread?: string
+    question: string
+    files?: SlackFile[]
+    repo: string | null // the pick so far
+    exp: number
+  }
+  const picks = new Map<string, Waiting>()
 
   const tenancy: Tenancy = {
     refuse: async (team, user, client) => {
@@ -967,9 +1130,11 @@ export async function serveHosted(): Promise<App> {
         throw err
       }
     },
-    ask: async ({ team, client, channel, trigger }) => {
-      const [link, last, files] = await Promise.all([
-        linkOf(team),
+    ask: async ({ team, client, user, channel, trigger, question, files, thread }) => {
+      const link = await linkOf(team)
+      // a question with no repository to pick, or one picked with repo:, starts at once
+      if (question !== undefined && (!link || repoPrefix(question).repo !== undefined)) return false
+      const [last, reads] = await Promise.all([
         channel ? lastRepos(team).then((r) => r[channel]) : undefined,
         readsFiles(team)
       ])
@@ -978,19 +1143,70 @@ export async function serveHosted(): Promise<App> {
       if (github && !link)
         note = "Connect GitHub in Consortium's Home tab, and the table can read a repository."
       if (link) {
-        // the form must open within 3 s of the command
-        const names = await Promise.race([
-          reposOf(link.installation).then((r) => r.repos.map((x) => x.full_name)),
-          new Promise<undefined>((r) => setTimeout(r, 1500))
-        ]).catch(() => undefined)
+        // a form must open within 3 s of the command; a mention's picker can wait for the list
+        const names = await (
+          trigger
+            ? Promise.race([
+                namesOf(link.installation),
+                new Promise<undefined>((r) => setTimeout(r, 1500))
+              ])
+            : namesOf(link.installation)
+        ).catch(() => undefined)
         repos = names ?? (last ? [last] : [])
         if (!names)
           note = 'The repository list is still loading: run /consortium again to see it all.'
       }
-      await client.views.open({
-        trigger_id: trigger,
-        view: askModal({ channel, repos, repo: last, files, install: reinstall, note })
+      const repo = link ? preselect(question, repos ?? [], last) : null
+      if (trigger)
+        try {
+          await client.views.open({
+            trigger_id: trigger,
+            view: askModal({
+              channel,
+              question,
+              repos,
+              repo,
+              files: reads,
+              install: reinstall,
+              note
+            })
+          })
+          return true
+        } catch (err) {
+          // past Slack's 3 s for the form (a cold database): the question gets the picker instead
+          if (question === undefined || !channel) throw err
+          console.error(
+            'slack: no form, the picker instead:',
+            err instanceof Error ? err.message : err
+          )
+        }
+      const now = Date.now()
+      for (const [k, p] of picks) if (p.exp < now) picks.delete(k)
+      const id = randomBytes(12).toString('base64url')
+      picks.set(id, {
+        team,
+        user,
+        channel: channel!,
+        thread,
+        question: question ?? '',
+        files,
+        repo,
+        exp: now + 30 * 60_000 // the life of the message's response_url
       })
+      await client.chat.postEphemeral({
+        channel: channel!,
+        user,
+        thread_ts: thread,
+        text: 'Which repository should the table read?',
+        blocks: repoPicker({
+          id,
+          question: question ?? '',
+          repos: repos ?? [],
+          repo,
+          files: files?.length
+        })
+      })
+      return true
     },
     attach: async (team, client, files, question) => {
       if (!(await readsFiles(team))) throw new Error(reinstallNeeded(reinstall))
@@ -1291,8 +1507,34 @@ export async function serveHosted(): Promise<App> {
       }))
     await tenancy.ask!({ team, client, user, trigger: body.trigger_id })
   })
-  // the repository select reports each pick; Convene reads it
+  // the repository select reports each pick; Start reads it
   app.action({ block_id: 'repo' }, async ({ ack }) => ack())
+  // the mention's picker: each pick kept, then Start convenes with it and the mention's files
+  app.action<BlockAction>('pick_repo', async ({ ack, body, action }) => {
+    await ack()
+    const a = action as StaticSelectAction
+    const p = picks.get(a.block_id.slice(5))
+    if (p && p.user === body.user.id)
+      p.repo = a.selected_option.value === NONE ? null : a.selected_option.value
+  })
+  app.action<BlockAction>('pick_start', async ({ ack, body, action, client, context, respond }) => {
+    await ack()
+    const id = (action as ButtonAction).value ?? ''
+    const p = picks.get(id)
+    if (!p || p.exp < Date.now() || p.user !== body.user.id || p.team !== tenantOf(context))
+      return void (await respond({
+        replace_original: true,
+        text: 'This question expired: mention me again.'
+      }))
+    picks.delete(id)
+    const picked = (body.state?.values as Values | undefined)?.[`pick_${id}`]?.pick_repo
+      ?.selected_option?.value
+    const repo = picked === undefined ? p.repo : picked === NONE ? null : picked
+    await respond({ delete_original: true })
+    const say = (text: string): Promise<unknown> =>
+      client.chat.postEphemeral({ channel: p.channel, user: p.user, thread_ts: p.thread, text })
+    await start(p.team, client, p.channel, p.user, p.question, say, { files: p.files, repo })
+  })
   app.view('ask_modal', async ({ ack, body, view, client, context, respond }) => {
     const r = readAsk(view.state.values as Values)
     if ('errors' in r) return void (await ack({ response_action: 'errors', errors: r.errors }))
