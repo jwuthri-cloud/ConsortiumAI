@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, readFileSync } from 'node:fs'
 import { mkdtemp } from 'node:fs/promises'
+import { createServer, type AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { App, Installation } from '@slack/bolt'
@@ -18,6 +19,7 @@ import {
   modelGroups,
   readLink,
   readTable,
+  serveHosted,
   settingsBrief,
   signLink,
   tableModal
@@ -489,4 +491,50 @@ test('the bridge: a workspace reaches only its own meetings, under its own limit
   assert.ok(existsSync(join(dir, 'sessions', `${a}.json`)))
   stop(a)
   stop(b)
+})
+
+test("the web pages: landing and privacy, Bolt's OAuth results replaced, nothing echoed unescaped", async () => {
+  const port = await new Promise<number>((done) => {
+    const s = createServer().listen(0, () => {
+      const { port } = s.address() as AddressInfo
+      s.close(() => done(port))
+    })
+  })
+  Object.assign(process.env, {
+    PORT: String(port),
+    PUBLIC_URL: `http://localhost:${port}`,
+    DATABASE_URL: 'sqlite::memory:',
+    CONSORTIUM_DATA: await mkdtemp(join(tmpdir(), 'consortium-pages-')),
+    CONSORTIUM_SECRET: SECRET,
+    SLACK_CLIENT_ID: '1.2',
+    SLACK_CLIENT_SECRET: 'x',
+    SLACK_SIGNING_SECRET: 'x'
+  })
+  const app = await serveHosted()
+  const XSS = '<script>alert(1)</script>'
+  const get = async (path: string): Promise<[number, string]> => {
+    const r = await fetch(`http://localhost:${port}${path}`)
+    return [r.status, await r.text()]
+  }
+  try {
+    for (const path of ['/', '/privacy']) {
+      const [status, html] = await get(`${path}?q=${encodeURIComponent(XSS)}`)
+      assert.equal(status, 200)
+      assert.match(html, /<a class="btn[^"]*" href="\/slack\/install">/)
+      assert.ok(!html.includes('alert(1)'))
+    }
+    const [cancelled, why] = await get('/slack/oauth_redirect?error=access_denied&state=s')
+    assert.equal(cancelled, 400)
+    assert.match(why, /cancelled on Slack's permission screen/)
+    assert.match(why, /href="\/slack\/install">Try again/)
+    const [failed, page] = await get(`/slack/oauth_redirect?error=${encodeURIComponent(XSS)}`)
+    assert.equal(failed, 400)
+    assert.ok(page.includes('Slack said: &lt;script&gt;alert(1)&lt;/script&gt;'))
+    assert.ok(!page.includes(XSS))
+    const [expired, link] = await get(`/openrouter/connect?t=${encodeURIComponent(XSS)}`)
+    assert.equal(expired, 400)
+    assert.ok(!link.includes('alert(1)'))
+  } finally {
+    await app.stop()
+  }
 })

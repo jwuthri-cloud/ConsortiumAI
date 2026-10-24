@@ -9,6 +9,7 @@ import { listModels, runMember } from './cli'
 import { dataDir } from './paths'
 import { bridge, type Tenancy } from './slack'
 import { derive, installations, openStore, seal, tenantOf, unseal } from './store'
+import * as pages from './pages'
 import { PERSONAS, PERSONA_IDS, makeLabels } from '../shared/personas'
 import { splitModel, type Brief, type PersonaId } from '../shared/types'
 
@@ -451,24 +452,10 @@ export function readLink(
 
 // ---------- pages ----------
 
-const escHtml = (s: string): string =>
-  s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!)
-
-function page(res: ServerResponse, status: number, title: string, html: string): void {
+function send(res: ServerResponse, status: number, html: string): void {
   res.writeHead(status, { 'content-type': 'text/html; charset=utf-8' })
-  res.end(
-    `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escHtml(title)}</title><style>body{font:16px/1.55 system-ui,sans-serif;max-width:40rem;margin:4rem auto;padding:0 1rem;color:#1d1c1d}a{color:#1264a3}</style><h1>${escHtml(title)}</h1>${html}`
-  )
+  res.end(html)
 }
-
-const LANDING = `<p>A table of AI models that debates your question in a Slack thread, live, and writes the decision. It runs on your workspace's own OpenRouter key: you pick the models, you pay OpenRouter directly.</p>
-<p><a href="/slack/install"><img alt="Add to Slack" height="40" width="139" src="https://platform.slack-edge.com/img/add_to_slack.png" srcset="https://platform.slack-edge.com/img/add_to_slack.png 1x, https://platform.slack-edge.com/img/add_to_slack@2x.png 2x"></a></p>
-<p>After installing, open Consortium's <b>Home</b> tab in Slack to connect OpenRouter. <a href="/privacy">Privacy</a></p>`
-
-// PLACEHOLDER: replace with your own policy (and contact) before listing in the Slack Marketplace.
-const PRIVACY = `<p><b>Placeholder: replace this page before you publish the app.</b></p>
-<p>What this service keeps, per Slack workspace: the installation (its bot token, encrypted), its settings and OpenRouter key (the key encrypted), and each meeting's transcript and decision. Questions, thread replies and the table's answers are sent to OpenRouter and to the model providers the workspace picked, under their terms. Uninstalling the app deletes the workspace's installation, settings, key and transcripts.</p>
-<p>Contact: <i>you@example.com</i></p>`
 
 // ---------- the server ----------
 
@@ -560,9 +547,9 @@ export async function serveHosted(): Promise<App> {
     {
       path: '/',
       method: 'GET',
-      handler: (_req, res) => page(res, 200, 'Consortium for Slack', LANDING)
+      handler: (_req, res) => send(res, 200, pages.landing())
     },
-    { path: '/privacy', method: 'GET', handler: (_req, res) => page(res, 200, 'Privacy', PRIVACY) },
+    { path: '/privacy', method: 'GET', handler: (_req, res) => send(res, 200, pages.privacy()) },
     { path: '/health', method: 'GET', handler: (_req, res) => void res.writeHead(200).end('ok') },
     {
       // OpenRouter's OAuth with PKCE: openrouter.ai/docs/use-cases/oauth-pkce
@@ -570,13 +557,7 @@ export async function serveHosted(): Promise<App> {
       method: 'GET',
       handler: (req, res) => {
         const who = readLink(secret, new URL(req.url ?? '', base).searchParams.get('t') ?? '')
-        if (!who)
-          return page(
-            res,
-            400,
-            'Link expired',
-            "<p>Open Consortium's Home tab in Slack and press Connect OpenRouter again.</p>"
-          )
+        if (!who) return send(res, 400, pages.expired())
         const now = Date.now()
         for (const [k, p] of pending) if (p.exp < now) pending.delete(k)
         const verifier = randomBytes(32).toString('base64url')
@@ -601,13 +582,7 @@ export async function serveHosted(): Promise<App> {
         const p = pending.get(state)
         pending.delete(state)
         const code = new URL(req.url ?? '', base).searchParams.get('code')
-        if (!p || p.exp < Date.now() || !code)
-          return page(
-            res,
-            400,
-            'Link expired',
-            "<p>Open Consortium's Home tab in Slack and press Connect OpenRouter again.</p>"
-          )
+        if (!p || p.exp < Date.now() || !code) return send(res, 400, pages.expired())
         try {
           const r = await fetch('https://openrouter.ai/api/v1/auth/keys', {
             method: 'POST',
@@ -626,25 +601,15 @@ export async function serveHosted(): Promise<App> {
             key: seal(key, secret, p.team),
             keyHint: hint(key)
           })
-          const { bot } = await installStore.fetchInstallation({
+          const { bot, appId } = await installStore.fetchInstallation({
             teamId: p.team,
             enterpriseId: undefined,
             isEnterpriseInstall: false
           })
           await publishHome(new webApi.WebClient(bot?.token), p.team, p.user).catch(() => {})
-          page(
-            res,
-            200,
-            'Connected',
-            '<p>OpenRouter is connected. Back in Slack, the Home tab shows the key.</p>'
-          )
+          send(res, 200, pages.connected(p.team, appId))
         } catch (err) {
-          page(
-            res,
-            502,
-            "Couldn't connect",
-            `<p>${escHtml(err instanceof Error ? err.message : String(err))}. Try again from the Home tab, or paste a key there.</p>`
-          )
+          send(res, 502, pages.connectFailed(err instanceof Error ? err.message : String(err)))
         }
       }
     }
@@ -658,7 +623,21 @@ export async function serveHosted(): Promise<App> {
     scopes: SCOPES,
     installationStore: installStore,
     redirectUri: `${base}/slack/oauth_redirect`,
-    installerOptions: { directInstall: true, redirectUriPath: '/slack/oauth_redirect' },
+    installerOptions: {
+      directInstall: true,
+      redirectUriPath: '/slack/oauth_redirect',
+      // Bolt calls these after it has stored the installation (or failed to): our pages, not its
+      callbackOptions: {
+        success: (i, _o, _req, res) => send(res, 200, pages.installed(i.team?.id, i.appId)),
+        failure: (err, _o, req, res) => {
+          const sent = new URL(req.url ?? '', base).searchParams.get('error')
+          const byClient = /missing_state|invalid_state|missing_code|authorization_error/.test(
+            err.code
+          )
+          send(res, byClient ? 400 : 500, pages.installFailed(err.code, sent))
+        }
+      }
+    },
     customRoutes: routes
   })
   bridge(app, tenancy)
