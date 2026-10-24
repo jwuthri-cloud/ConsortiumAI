@@ -6,6 +6,30 @@ Local-first desktop app (Electron). No accounts, no server: the app spawns the C
 
 **Consortium for Slack** is the same table in a Slack thread, for any workspace: **[consortium-yqs2.onrender.com](https://consortium-yqs2.onrender.com)** (press _Add to Slack_). It's built and maintained by Julien ([@jwuthri-cloud](https://github.com/jwuthri-cloud)). The server is a free [Render](https://render.com) web service, deployed from this repo's `main` by [`render.yaml`](render.yaml); its data (installs, settings, encrypted keys) lives in a free [Neon](https://neon.tech) Postgres. Each workspace brings its own OpenRouter key and picks its models. How it works and how to run your own: [Hosted](#hosted).
 
+## What it looks like
+
+The desktop app, in real meetings.
+
+**Convene.** Write the question, attach a project if it's about code, and seat the table: each seat is a persona on a CLI or the Deep-agent.
+
+![Convene: the question, an optional project folder, and who sits at the table](docs/screenshots/convene.jpg)
+
+**The meeting room.** Members speak in turns; each badge shows the seat's role and the model actually running it. The conversation and the clerk's notes sit on the right.
+
+![The meeting room: each member as a 3D mascot with its role and model](docs/screenshots/meeting-room.jpg)
+
+**A live turn.** While a member prepares, the room shows what it's doing (reading files, searching, using a tool) and who speaks next. You can add context or steer at any time.
+
+![A live turn: the speaker reading files before it answers](docs/screenshots/live-turn.jpg)
+
+**The whiteboard.** The clerk keeps what's agreed, disputed and still open, with the turns each note comes from.
+
+![The whiteboard: agreed, disputed and open questions, with a diagram of the options](docs/screenshots/whiteboard.jpg)
+
+**The decision.** The chair writes the consortium: recommendation, rationale, plan and the dissent, next to who agreed with what.
+
+![The decision document with the agreement matrix](docs/screenshots/decision.jpg)
+
 ## Setup
 
 ```bash
