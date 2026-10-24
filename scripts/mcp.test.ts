@@ -596,3 +596,22 @@ test('MCP OAuth: discovery, registration, PKCE, the code for tokens, a refresh',
     server.close()
   }
 })
+
+test("the meeting's rules leave room for connected services in every case", async () => {
+  const { intro } = await import('../src/main/prompts')
+  const members = [
+    { id: 'm1', cli: 'harness' as const, model: 'openrouter:x/y', persona: 'engineer' as const }
+  ]
+  const brief = { task: 'How is prod?', members, chairId: 'm1', maxTurns: 4 }
+  for (const b of [
+    brief,
+    { ...brief, attachments: ['/a/b.png'] },
+    { ...brief, projectPath: '/p' }
+  ]) {
+    const said = intro(b, members[0], { m1: 'The Engineer' })
+    assert.ok(said.includes('call their read-only tools when the question needs live facts'))
+    assert.ok(
+      !said.includes('Do not use tools') && !said.includes('only to read the attached files')
+    )
+  }
+})

@@ -41,13 +41,18 @@ function notes(shape: Shape | null): string {
 export const NO_LOCATIONS =
   'Never write file paths, line numbers or URLs. Name code by what it is (the function, module or component, and what it does) and a source by what it is (for example "the Electron release notes").'
 
+// Connected services (hosted Slack: Linear, Datadog, …) are listed in a seat's own setup, which
+// differs per seat; the rule only has to leave room for them, never forbid tools outright.
+const SERVICES =
+  'If your setup lists connected services (Linear, Datadog, …), call their read-only tools when the question needs live facts from them, and say which service each fact came from.'
+
 function projectRule(brief: Brief): string {
   const files = brief.attachments ?? []
   const rule = brief.projectPath
-    ? `A project is attached at ${brief.projectPath}. Inspect its code read-only when a claim depends on it. Start with a targeted search and read only the relevant files; do not conduct a broad audit unless the question calls for one. Reuse evidence already established in the conversation and name what remains unverified. Never create, modify or delete anything.`
+    ? `A project is attached at ${brief.projectPath}. Inspect its code read-only when a claim depends on it. Start with a targeted search and read only the relevant files; do not conduct a broad audit unless the question calls for one. Reuse evidence already established in the conversation and name what remains unverified. ${SERVICES} Never create, modify or delete anything.`
     : files.length
-      ? 'No project is attached. Use your read-only tools only to read the attached files. Never create, modify or delete anything.'
-      : 'No project is attached. Do not use tools; reason from the question and what you know.'
+      ? `No project is attached. Read the attached files with your read-only file tools. ${SERVICES} Never create, modify or delete anything.`
+      : `No project is attached: don't look for files; reason from the question and what you know. ${SERVICES}`
   return files.length
     ? `${rule}\nThe human attached these files as part of the question; read them before you answer:\n${files.map((f) => `- ${f}`).join('\n')}`
     : rule
