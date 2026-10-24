@@ -1,18 +1,21 @@
 # The hosted Slack app on Render (README, "Hosted"): New → Blueprint → this repo.
 # Starter, not Free: a free service sleeps, and Slack gives up on a request after 3 seconds.
-# ponytail: no disk; transcripts in /data are lost on redeploy (settings, keys and installs are in
-# Postgres). Add a disk at /data when meeting history on the server matters.
+# One SQLite file on a 1 GB disk instead of a Render Postgres ($0.25/month, daily snapshots).
+# ponytail: a disk means one instance and a few seconds' downtime per deploy; move DATABASE_URL to
+# a Postgres when one instance stops being enough.
 services:
   - type: web
     name: consortium
     runtime: docker
     plan: starter
     healthCheckPath: /health
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
     envVars:
       - key: DATABASE_URL
-        fromDatabase:
-          name: consortium-db
-          property: connectionString
+        value: sqlite:/data/consortium.db
       - key: CONSORTIUM_SECRET
         generateValue: true
       - key: SLACK_CLIENT_ID
@@ -21,7 +24,3 @@ services:
         sync: false
       - key: SLACK_SIGNING_SECRET
         sync: false
-
-databases:
-  - name: consortium-db
-    plan: basic-256mb
