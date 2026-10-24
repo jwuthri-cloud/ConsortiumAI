@@ -242,7 +242,7 @@ type Live = {
   text: string
   activity: string
   model?: string // shown in the footer; the CLI may report the real one after the turn starts
-  final?: { body: string; foot: string }
+  final?: { body: string; foot: string; calls?: string } // calls: what its Tool calls button opens
 }
 
 function liveMessage(l: Live): { text: string; blocks: Block[] } {
@@ -253,6 +253,18 @@ function liveMessage(l: Live): { text: string; blocks: Block[] } {
   const blocks: Block[] = []
   if (body) blocks.push({ type: 'markdown', text: cut(body, BODY) })
   if (foot) blocks.push(context(foot))
+  if (l.final?.calls)
+    blocks.push({
+      type: 'actions',
+      elements: [
+        {
+          type: 'button',
+          action_id: 'tool_calls',
+          text: { type: 'plain_text', text: 'Tool calls' },
+          value: l.final.calls
+        }
+      ]
+    })
   return { text: cut(body || foot, 300), blocks }
 }
 
@@ -276,6 +288,7 @@ type Meeting = {
   chain: Promise<unknown>
   timers: Map<string, NodeJS.Timeout>
   done?: () => void // once it has ended: what convene set up for it goes
+  calls?: Convened['calls']
 }
 
 function config(): SlackConfig {
@@ -362,6 +375,9 @@ export type Convened = {
   question?: string // what the root message shows (default: the brief's task)
   attached?: string // see BoardView
   done?: () => void // called once the meeting has ended, or didn't start
+  // The tool calls `who` (m1…, chair) made since it was last asked, kept under `title` (hosted):
+  // the id its message's Tool calls button opens, or undefined when it made none.
+  calls?: (who: string, title: string) => Promise<string | undefined>
 }
 
 // One workspace: slack.json, re-read on each use.
@@ -474,7 +490,7 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
     const old = m.live.get(key)
     if (old && !old.final) {
       // the chair redrafts after the host spoke: close its first draft
-      old.final = FLOOR
+      old.final = { ...FLOOR }
       renderTurn(m, key, true)
     }
     const l: Live = { text: '', activity: ACTIVITY_LABELS.starting, model }
@@ -493,6 +509,20 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
     const { url, team_id } = await m.client.auth.test()
     return `${url}docs/${team_id}/${id}`
   }
+
+  // The tool calls a seat made in a turn, kept (hosted): its message gets a Tool calls button.
+  // Queued before the message's last update, which then carries it.
+  const keep = (m: Meeting, key: string, who: string, title: string): void => {
+    const calls = m.calls
+    if (calls)
+      q(m, async () => {
+        const id = await calls(who, title)
+        const l = m.live.get(key)
+        if (id && l?.final) l.final.calls = id
+      })
+  }
+  const title = (m: Meeting, who: string, turn: number): string =>
+    `${m.labels[who] ?? who} · turn ${turn}`
 
   // One meeting's engine events → its thread. Audio never arrives: SILENT keeps the engine quiet.
   const send = (m: Meeting, e: DebateEvent): void => {
@@ -534,16 +564,19 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
         const done = m.live.get(`${e.turn.speaker}:${e.turn.n}`)
         const foot = [voteLine(e.turn), toolsLine(e.turn.trace)].filter(Boolean).join(' · ')
         if (done) done.final = { body: e.turn.text, foot }
+        keep(m, `${e.turn.speaker}:${e.turn.n}`, e.turn.speaker, title(m, e.turn.speaker, e.turn.n))
         renderTurn(m, `${e.turn.speaker}:${e.turn.n}`, true)
         break
       }
       case 'turn-cancelled': // the host took the floor; this seat speaks again after them
-        if (l) l.final = FLOOR
+        if (l) l.final = { ...FLOOR }
+        keep(m, key, e.memberId, title(m, e.memberId, e.turn))
         renderTurn(m, key, true)
         break
       case 'turn-error':
         if (l)
           l.final = { body: '', foot: `:warning: Couldn't answer: ${esc(cut(e.message, 300))}` }
+        keep(m, key, e.memberId, title(m, e.memberId, e.turn))
         renderTurn(m, key, true)
         break
       case 'whiteboard':
@@ -562,6 +595,7 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
         const chair = [...m.live.keys()].findLast((k) => k.endsWith(':0'))
         const draft = chair && m.live.get(chair)
         if (draft) draft.final = { body: e.markdown, foot: '' }
+        if (chair) keep(m, chair, 'chair', 'The decision')
         if (chair) renderTurn(m, chair, true)
         m.view.state = 'decided'
         q(m, async () => {
@@ -685,7 +719,8 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
         live: new Map(),
         chain: Promise.resolve(),
         timers: new Map(),
-        done: c.done
+        done: c.done,
+        calls: c.calls
       }
       try {
         const root = await client.chat.postMessage({

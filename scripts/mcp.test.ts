@@ -5,6 +5,7 @@ import { createServer, type IncomingHttpHeaders } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import {
   LIMITS,
+  SHOWN,
   beginOAuth,
   clip,
   finishOAuth,
@@ -16,35 +17,49 @@ import {
   probe,
   publicHttps,
   sealState,
+  testArgs,
+  testServer,
   toolName,
   usable
 } from '../src/main/mcp'
-import { toolsLine } from '../src/main/slack'
+import { bridge, toolsLine, type Tenancy } from '../src/main/slack'
 import {
   DEFAULTS,
   allowModal,
+  callsModal,
   connectModal,
   fromStore,
   homeView,
   keyed,
+  personaModal,
+  readLens,
   readConnect,
   readTable,
   seatTools,
+  settingsBrief,
   tableModal,
+  testModal,
   toolStatus,
   toolsAttached,
   type Settings
 } from '../src/main/hosted'
 import { seal } from '../src/main/store'
-import type { Connection } from '../src/main/mcp'
+import type { Connection, ToolCall } from '../src/main/mcp'
 import type { runMember } from '../src/main/cli'
+import type { App, types } from '@slack/bolt'
+import { mkdtemp } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { PERSONAS, PERSONA_IDS } from '../src/shared/personas'
 
 const SECRET = 'x'.repeat(40)
 
 type FakeTool = {
   name: string
   readOnly?: boolean
-  run?: (args: Record<string, unknown>) => Promise<string> | string
+  run?: (
+    args: Record<string, unknown>
+  ) => Promise<string | { text: string; isError: true }> | string | { text: string; isError: true }
 }
 
 // A remote MCP server, as small as the protocol allows: JSON-RPC over POST, JSON answers.
@@ -86,8 +101,14 @@ async function fakeServer(
       })
     if (m.method === 'tools/call') {
       const t = tools.find((x) => x.name === m.params.name)
-      const text = t?.run ? await t.run(m.params.arguments) : `ran ${m.params.name}`
-      return reply({ result: { content: [{ type: 'text', text }] } })
+      const out = t?.run ? await t.run(m.params.arguments) : `ran ${m.params.name}`
+      const r = typeof out === 'string' ? { text: out } : out
+      return reply({
+        result: {
+          content: [{ type: 'text', text: r.text }],
+          ...('isError' in r && { isError: true })
+        }
+      })
     }
     reply({ error: { code: -32601, message: 'Method not found' } })
   })
@@ -614,4 +635,350 @@ test("the meeting's rules leave room for connected services in every case", asyn
       !said.includes('Do not use tools') && !said.includes('only to read the attached files')
     )
   }
+})
+
+// Slack's limits on what a view or message holds: 100 blocks, 3,000 characters a section or
+// context text, 24 a title, 75 an option, 2,000 a button's value; an input's text within its cap.
+function slackValid(blocks: unknown[], title?: string): void {
+  assert.ok(blocks.length <= 100, `${blocks.length} blocks`)
+  if (title !== undefined) assert.ok(title.length <= 24, `title ${title}`)
+  const walk = (x: unknown, where: string): void => {
+    if (Array.isArray(x)) return x.forEach((y, i) => walk(y, `${where}[${i}]`))
+    if (!x || typeof x !== 'object') return
+    const o = x as Record<string, unknown>
+    if (o.type === 'section' && o.text)
+      assert.ok((o.text as { text: string }).text.length <= 3000, `${where}: section too long`)
+    if (o.type === 'mrkdwn' || o.type === 'plain_text')
+      assert.ok(String(o.text).length <= 3000, `${where}: text too long`)
+    if (o.type === 'button' && o.value) assert.ok(String(o.value).length <= 2000, where)
+    if (o.type === 'plain_text_input' && o.initial_value && o.max_length)
+      assert.ok(String(o.initial_value).length <= Number(o.max_length), `${where}: over its cap`)
+    if ('value' in o && 'text' in o && typeof o.text === 'object' && o.type === undefined)
+      assert.ok((o.text as { text: string }).text.length <= 75, `${where}: option too long`)
+    for (const [k, v] of Object.entries(o)) walk(v, `${where}.${k}`)
+  }
+  walk(blocks, 'blocks')
+}
+const validView = (v: types.ModalView): void => slackValid(v.blocks, v.title.text)
+
+test('each tool call is recorded for its seat: arguments, size, errors, secrets hidden', async () => {
+  const KEY = 'sk-test-0123456789abcdef'
+  const s = await fakeServer([
+    { name: 'search', readOnly: true, run: (a) => `found 3 logs for ${a.q}; token ${KEY}` },
+    {
+      name: 'broken',
+      readOnly: true,
+      run: () => ({ text: 'Forbidden: logs_read_data', isError: true })
+    },
+    {
+      name: 'slow',
+      readOnly: true,
+      run: () => new Promise((r) => setTimeout(() => r('late'), 300))
+    }
+  ])
+  const box = await openToolbox(
+    [{ id: 'dd', name: 'Datadog', url: s.url, headers: { authorization: `Bearer ${KEY}` } }],
+    { limits: { ...LIMITS, perTurn: 3, callMs: 50 }, fetchFn: fetch }
+  )
+  try {
+    const [search] = box.forSeat(undefined, 'm1')
+    const said = String(await search.invoke({ q: `service:api ${KEY}` }))
+    assert.equal(said, 'found 3 logs for service:api [secret]; token [secret]')
+    const [, broken, slow] = box.forSeat(undefined, 'm2')
+    assert.match(String(await broken.invoke({})), /^The tool reported an error: Forbidden/)
+    assert.match(String(await slow.invoke({})), /^Datadog slow failed: .*time/i)
+    await broken.invoke({})
+    assert.match(String(await broken.invoke({})), /3 calls in one turn/) // refused, recorded too
+
+    const m1 = box.take('m1')
+    assert.equal(m1.length, 1)
+    const [c] = m1
+    assert.deepEqual(
+      { ...c, ms: 0 },
+      {
+        who: 'm1',
+        server: 'Datadog',
+        tool: 'search',
+        args: '{"q":"service:api [secret]"}',
+        chars: said.length,
+        result: said,
+        ms: 0
+      }
+    )
+    assert.ok(c.ms >= 0)
+    assert.deepEqual(box.take('m1'), [], 'taken once')
+    const m2 = box.take('m2')
+    assert.deepEqual(
+      m2.map((x) => [x.tool, !!x.error]),
+      [
+        ['broken', true],
+        ['slow', true],
+        ['broken', true],
+        ['broken', true]
+      ]
+    )
+    assert.match(m2[1].result, /time/i)
+    assert.match(m2[3].result, /Tool limit reached/)
+    assert.ok(!JSON.stringify(m2).includes(KEY))
+  } finally {
+    await box.close()
+    s.close()
+  }
+})
+
+test('a long result: the seat reads 8,000 characters, the record keeps its size and start', async () => {
+  const s = await fakeServer([{ name: 'big', readOnly: true, run: () => 'y'.repeat(20_000) }])
+  const box = await openToolbox([{ id: 'f', name: 'F', url: s.url, headers: {} }], {
+    fetchFn: fetch
+  })
+  try {
+    const [big] = box.forSeat(undefined, 'm1')
+    await big.invoke({ q: 'z'.repeat(5000) })
+    const [c] = box.take('m1')
+    assert.equal(c.chars, 20_000)
+    assert.equal(c.result.length, SHOWN.result + 1)
+    assert.ok(c.args.length < SHOWN.args + 60 && c.args.includes('more characters cut'))
+  } finally {
+    await box.close()
+    s.close()
+  }
+})
+
+test("the Test button: one cheap read, its arguments from the tool's own schema", async () => {
+  const now = Date.parse('2026-10-24T01:00:00Z')
+  assert.deepEqual(
+    testArgs(
+      {
+        type: 'object',
+        properties: {
+          query: { type: 'string' },
+          from: { type: 'string' },
+          to: { type: 'string' },
+          limit: { type: 'integer' },
+          sort: { type: 'string' }
+        }
+      },
+      1,
+      now
+    ),
+    { query: '*', from: 'now-15m', to: 'now', limit: 1 }
+  )
+  assert.deepEqual(
+    testArgs({ properties: { start_time: { type: 'number' }, first: { type: 'number' } } }, 3, now),
+    { start_time: now - 15 * 60_000, first: 3 }
+  )
+
+  const asked: Record<string, unknown>[] = []
+  const KEY = 'dd-secret-api-key-123456'
+  const dd = await fakeServer([
+    { name: 'search_datadog_logs', readOnly: true, run: (a) => (asked.push(a), `1 log: ${KEY}`) },
+    { name: 'create_monitor', readOnly: false }
+  ])
+  const refused = await fakeServer([], { status: 401 })
+  const plain = await fakeServer([{ name: 'read', readOnly: true }])
+  try {
+    const headers = { DD_API_KEY: KEY }
+    const ok = await testServer({ id: 'datadog', name: 'Datadog', url: dd.url, headers }, fetch)
+    assert.deepEqual(asked, [{ q: '*' }]) // the fake's schema takes only q
+    assert.equal(ok.connected, true)
+    assert.equal(ok.tools, 2)
+    assert.equal(ok.usable, 1)
+    assert.equal(ok.call?.tool, 'search_datadog_logs')
+    assert.equal(ok.call?.result, '1 log: [secret]')
+    const missing = await testServer({ id: 'linear', name: 'Linear', url: dd.url, headers }, fetch)
+    assert.match(missing.error ?? '', /doesn't list list_issues/)
+    const no = await testServer(
+      { id: 'datadog', name: 'Datadog', url: refused.url, headers },
+      fetch
+    )
+    assert.equal(no.connected, false)
+    assert.ok(no.error && !no.error.includes(KEY))
+    const other = await testServer({ id: 'wiki', name: 'Wiki', url: plain.url, headers: {} }, fetch)
+    assert.deepEqual(other, { connected: true, tools: 1, usable: 1 })
+
+    for (const [r, id] of [
+      [ok, 'datadog'],
+      [missing, 'linear'],
+      [no, 'datadog'],
+      [other, 'wiki']
+    ] as const)
+      validView(testModal('Datadog', id, r))
+    const shown = JSON.stringify(testModal('Datadog', 'datadog', ok))
+    assert.match(shown, /Connected.*2 tools listed, 1 of them usable/)
+    assert.match(
+      shown,
+      /search_datadog_logs.*\{&quot;q&quot;:&quot;\*&quot;\}|search_datadog_logs.*\{\\"q\\":\\"\*\\"\}/
+    )
+    assert.match(shown, /datadoghq\.com/)
+    assert.match(JSON.stringify(testModal('Datadog', 'datadog', no)), /didn't connect/)
+  } finally {
+    dd.close()
+    refused.close()
+    plain.close()
+  }
+})
+
+test("the Tool calls modal: every call within Slack's limits, nothing unescaped", () => {
+  const call = (i: number): ToolCall => ({
+    who: 'm1',
+    server: 'Datadog <prod>',
+    tool: 'search_datadog_logs',
+    args: JSON.stringify({ query: '```<b>&' + 'q'.repeat(2000) }).slice(0, 1050),
+    chars: 12_345,
+    result: '```' + '<x>&'.repeat(500),
+    ...(i % 2 && { error: true }),
+    ms: 1234
+  })
+  const v = callsModal({
+    who: 'The Researcher · turn 3',
+    calls: Array.from({ length: 50 }, (_, i) => call(i))
+  })
+  validView(v)
+  assert.equal(v.blocks.length, 41)
+  const text = JSON.stringify(v)
+  assert.ok(!/<b>|<x>|<prod>/.test(text), 'escaped')
+  assert.match(text, /The Researcher · turn 3\* · 50 calls/)
+  assert.match(text, /The first 40 are shown/)
+  assert.match(
+    text,
+    /1\. Datadog &lt;prod&gt; · search_datadog_logs\* · 1\.2 s · 12,345 characters/
+  )
+  assert.match(text, /2\. .* · :x: failed/)
+  // each code block opens and closes once: no fence of its own inside
+  const first = (v.blocks[1] as { text: { text: string } }).text.text
+  assert.equal(first.match(/```/g)?.length, 4)
+})
+
+test('the Home tab: Personas and Test for admins, within Slack limits with everything connected', () => {
+  const s = fromStore({ ...DEFAULTS, lenses: { skeptic: 'Doubt <everything>.' } })
+  s.seats = [...s.seats, { model: 'x/y', persona: 'skeptic' }]
+  const conns: Connection[] = Array.from({ length: 10 }, (_, i) => ({
+    id: `s${i}`,
+    name: `Server ${i}`,
+    url: 'https://x',
+    auth: i ? 'oauth' : 'headers',
+    secret: 'v1.a.b.c',
+    tools: [
+      { name: 'read', readOnly: true },
+      { name: 'write', readOnly: false }
+    ]
+  }))
+  const more = {
+    files: false,
+    install: 'https://h/slack/install',
+    github: { connect: 'https://h/gh', account: 'acme', repos: 3 },
+    tools: { conns, links: Object.fromEntries(conns.map((c) => [c.id, `https://h/${c.id}`])) }
+  }
+  const admin = homeView(s, true, 'https://h/connect', more)
+  slackValid(admin.blocks)
+  const a = JSON.stringify(admin)
+  assert.equal(a.match(/"action_id":"persona_edit"/g)?.length, 6)
+  assert.equal(a.match(/"action_id":"mcp_test"/g)?.length, 10)
+  assert.match(a, /\*The Skeptic\* · _edited_\\n>Doubt &lt;everything&gt;\./)
+  assert.ok(a.includes(PERSONAS.strategist.lens), 'the others: their default')
+  assert.match(a, /4\. The Skeptic \(edited persona\) · `x\/y`/)
+  assert.match(a, /1\. The Strategist · `/)
+  const member = JSON.stringify(homeView(s, false, undefined, more))
+  assert.ok(!member.includes('persona_edit') && !member.includes('mcp_test'))
+})
+
+test('the persona form: prefilled, capped, and Reset to the default', () => {
+  const lensOf = (v: types.ModalView): Record<string, unknown> =>
+    (v.blocks.find((b) => b.block_id === 'lens') as unknown as { element: Record<string, unknown> })
+      .element
+  for (const p of PERSONA_IDS) validView(personaModal(p, { [p]: 'z'.repeat(1500) }))
+  assert.equal(lensOf(personaModal('skeptic', { skeptic: 'Doubt.' })).initial_value, 'Doubt.')
+  assert.equal(lensOf(personaModal('skeptic')).initial_value, PERSONAS.skeptic.lens)
+  assert.equal(lensOf(personaModal('skeptic')).max_length, 1500)
+  const v = (text: string, reset = false): Parameters<typeof readLens>[1] => ({
+    lens: { lens: { value: text } },
+    reset: { reset: { selected_options: reset ? [{ value: 'reset' }] : [] } }
+  })
+  assert.deepEqual(readLens('skeptic', v('  Doubt everything.  ')), { lens: 'Doubt everything.' })
+  assert.deepEqual(readLens('skeptic', v('Doubt everything.', true)), {}, 'reset')
+  assert.deepEqual(readLens('skeptic', v('   ')), {}, 'emptied')
+  assert.deepEqual(readLens('skeptic', v(PERSONAS.skeptic.lens)), {}, "the default's words")
+  assert.match(
+    JSON.stringify(readLens('skeptic', v('z'.repeat(1501)))),
+    /At most 1500 characters; this is 1501/
+  )
+})
+
+test('a seat message gets a Tool calls button when its turn used tools, the decision too', async () => {
+  const VOTE =
+    '```json\n{"position":"Ship","confidence":0.9,"agrees_with":[],"disagreements":[]}\n```'
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const on: Record<string, (args: any) => Promise<unknown>> = {}
+  const app = {
+    command: (n: string, f: (typeof on)[string]) => (on[n] = f),
+    event: () => {},
+    message: () => {},
+    action: () => {}
+  } as unknown as App
+  const sent: { method: string; args: Record<string, unknown> }[] = []
+  let n = 0
+  const make = (path: string[]): unknown =>
+    new Proxy(
+      async (args: Record<string, unknown>) => {
+        sent.push({ method: path.join('.'), args })
+        return { ts: String(++n), canvas_id: 'F1', url: 'https://x/', team_id: 'T1' }
+      },
+      { get: (_, k: string) => make([...path, k]) }
+    )
+  const run: typeof runMember = async (_cli, _a, _delta, key) => {
+    if (key.endsWith(':whiteboard')) return { text: 'not a board' }
+    if (key.endsWith(':chair')) return { text: '# Decision\n## Recommendation\nShip.' }
+    return { text: `Ship.\n${VOTE}` }
+  }
+  const asked: [string, string][] = []
+  const tenancy: Tenancy = {
+    refuse: async () => undefined,
+    maxMeetings: async () => 1,
+    convene: async (_team, _channel, question) => ({
+      brief: settingsBrief(
+        { ...DEFAULTS, seats: DEFAULTS.seats.slice(0, 2), maxTurns: 4 },
+        question
+      ),
+      run,
+      dir: await mkdtemp(join(tmpdir(), 'calls-')),
+      calls: async (who, title) => {
+        asked.push([who, title])
+        return who === 'm1' || who === 'chair' ? `id-${who}` : undefined
+      }
+    })
+  }
+  bridge(app, tenancy)
+  await on['/consortium']({
+    command: { channel_id: 'C1', user_id: 'U1', text: 'Ship it?' },
+    ack: async () => {},
+    respond: async () => {},
+    client: make([]),
+    context: { teamId: 'T1' }
+  })
+  const buttons = (): string[] =>
+    sent
+      .filter((x) => x.method === 'chat.update')
+      .flatMap(
+        (x) =>
+          (x.args.blocks as {
+            type: string
+            elements?: { action_id?: string; value?: string }[]
+          }[]) ?? []
+      )
+      .flatMap((b) => b.elements ?? [])
+      .filter((e) => e.action_id === 'tool_calls')
+      .map((e) => e.value!)
+  for (let i = 0; i < 400 && !asked.some(([w]) => w === 'chair'); i++)
+    await new Promise((r) => setTimeout(r, 5))
+  await new Promise((r) => setTimeout(r, 50))
+  assert.deepEqual(asked.slice(0, 2), [
+    ['m1', 'The Strategist · turn 1'],
+    ['m2', 'The Engineer · turn 2']
+  ])
+  assert.ok(asked.some(([w, t]) => w === 'chair' && t === 'The decision'))
+  const b = buttons()
+  assert.ok(b.includes('id-m1') && b.includes('id-chair'), b.join())
+  assert.ok(!b.includes('id-m2'))
+  for (const x of sent.filter((y) => y.method === 'chat.update' && Array.isArray(y.args.blocks)))
+    slackValid(x.args.blocks as unknown[])
 })

@@ -239,12 +239,58 @@ export async function probe(
 export const hide = (text: string, secrets: string[]): string =>
   secrets.reduce((t, v) => (v.length > 3 ? t.split(v).join('[secret]') : t), text)
 
+// One call a seat made, for the people at the table to see (its message's Tool calls button):
+// secrets hidden, the arguments and the result cut short.
+export type ToolCall = {
+  who: string // the seat that called: m1…, chair
+  server: string // its name, "Datadog"
+  tool: string // the server's own name for it
+  args: string // compact JSON
+  chars: number // the whole result's length
+  result: string // its start, or what went wrong
+  error?: boolean
+  ms: number
+}
+export const SHOWN = { args: 1000, result: 300 }
+
+// Records `fn`'s call of `tool` as `who`: its arguments, how long it took, how much came back.
+export async function recorded(
+  c: Pick<ToolCall, 'who' | 'server' | 'tool'>,
+  args: Record<string, unknown>,
+  secrets: string[],
+  fn: () => Promise<{ text: string; error?: boolean }>,
+  shown = SHOWN.result
+): Promise<{ text: string; call: ToolCall }> {
+  const at = Date.now()
+  let r: { text: string; error?: boolean }
+  try {
+    r = await fn()
+  } catch (e) {
+    r = { text: e instanceof Error ? e.message : String(e), error: true }
+  }
+  const text = hide(r.text, secrets)
+  return {
+    text,
+    call: {
+      ...c,
+      args: clip(hide(JSON.stringify(args ?? {}), secrets), SHOWN.args),
+      chars: text.length,
+      result: text.length > shown ? `${text.slice(0, shown)}…` : text,
+      ...(r.error && { error: true }),
+      ms: Date.now() - at
+    }
+  }
+}
+
 export type Toolbox = {
   opened: { id: string; name: string; tools: number }[]
   failed: { id: string; name: string; why: string }[]
   listed: Record<string, NonNullable<Connection['tools']>> // what each opened server listed
-  // A seat's tools: those of `servers` (unset: all), with a turn's budget of their own.
-  forSeat(servers?: string[]): StructuredToolInterface[]
+  // A seat's tools: those of `servers` (unset: all), with a turn's budget of their own; their
+  // calls recorded as `who`'s.
+  forSeat(servers?: string[], who?: string): StructuredToolInterface[]
+  // The calls `who` made since it was last asked, in order.
+  take(who: string): ToolCall[]
   close(): Promise<void>
 }
 
@@ -272,6 +318,7 @@ export async function openToolbox(
     return [{ id: s.id, name: s.name, why: why.slice(0, 200) }]
   })
   let meeting = 0
+  let calls: ToolCall[] = []
   return {
     opened: opened.map((s) => ({
       id: s.id,
@@ -282,7 +329,7 @@ export async function openToolbox(
     listed: Object.fromEntries(
       opened.map((s) => [s.id, s.tools.map((t) => ({ name: t.name, readOnly: usable(t) }))])
     ),
-    forSeat: (servers) => {
+    forSeat: (servers, who = '') => {
       let turn = 0
       return opened
         .filter((s) => !servers || servers.includes(s.id))
@@ -292,21 +339,37 @@ export async function openToolbox(
             .map((t) =>
               tool(
                 async (args: Record<string, unknown>) => {
-                  if (turn >= limits.perTurn)
-                    return `Tool limit reached: ${limits.perTurn} calls in one turn. Answer with what you have.`
-                  if (meeting >= limits.perMeeting)
-                    return `Tool limit reached: ${limits.perMeeting} calls in this meeting. Answer with what you have.`
-                  turn++
-                  meeting++
-                  try {
-                    const r = (await s.client.callTool(
-                      { name: t.name, arguments: args },
-                      { timeout: limits.callMs }
-                    )) as CallToolResult
-                    return clip(hide(resultText(r), secrets), limits.chars)
-                  } catch (e) {
-                    return `${s.name} ${t.name} failed: ${hide(e instanceof Error ? e.message : String(e), secrets)}`
-                  }
+                  const { text, call } = await recorded(
+                    { who, server: s.name, tool: t.name },
+                    args,
+                    secrets,
+                    async () => {
+                      if (turn >= limits.perTurn)
+                        return {
+                          text: `Tool limit reached: ${limits.perTurn} calls in one turn. Answer with what you have.`,
+                          error: true
+                        }
+                      if (meeting >= limits.perMeeting)
+                        return {
+                          text: `Tool limit reached: ${limits.perMeeting} calls in this meeting. Answer with what you have.`,
+                          error: true
+                        }
+                      turn++
+                      meeting++
+                      try {
+                        const r = (await s.client.callTool(
+                          { name: t.name, arguments: args },
+                          { timeout: limits.callMs }
+                        )) as CallToolResult
+                        return { text: resultText(r), error: !!r.isError }
+                      } catch (e) {
+                        const why = e instanceof Error ? e.message : String(e)
+                        return { text: `${s.name} ${t.name} failed: ${why}`, error: true }
+                      }
+                    }
+                  )
+                  calls.push(call) // until the seat's turn is over and its calls are taken
+                  return clip(text, limits.chars)
                 },
                 {
                   name: toolName(s.id, t.name),
@@ -317,7 +380,97 @@ export async function openToolbox(
             )
         )
     },
+    take: (who) => {
+      const mine = calls.filter((c) => c.who === who)
+      calls = calls.filter((c) => c.who !== who)
+      return mine
+    },
     close: async () => void (await Promise.allSettled(opened.map((s) => s.client.close())))
+  }
+}
+
+// What a server's Test button calls: one cheap read where there's an obvious one, else only its
+// list of tools. Its arguments come from the tool's own schema: those of `want` it takes.
+const TESTS: Record<string, { tool: string; limit: number }> = {
+  datadog: { tool: 'search_datadog_logs', limit: 1 },
+  linear: { tool: 'list_issues', limit: 3 }
+}
+export function testArgs(
+  schema: Record<string, unknown>,
+  limit: number,
+  now = Date.now()
+): Record<string, unknown> {
+  const props = (schema.properties ?? {}) as Record<string, { type?: string }>
+  const since = now - 15 * 60_000
+  const out: Record<string, unknown> = {}
+  for (const [k, p] of Object.entries(props)) {
+    const num = p?.type === 'number' || p?.type === 'integer'
+    if (/^(query|q|filter|search)$/i.test(k) && !num) out[k] = '*'
+    else if (/^(from|start|start_time|from_time|time_from)$/i.test(k))
+      out[k] = num ? since : 'now-15m'
+    else if (/^(to|end|end_time|to_time|time_to)$/i.test(k)) out[k] = num ? now : 'now'
+    else if (/^(limit|page_size|max_results|first|count)$/i.test(k) && num) out[k] = limit
+  }
+  return out
+}
+
+export type TestResult = {
+  connected: boolean
+  tools: number // how many it lists
+  usable: number // of them, read-only or allowed
+  call?: ToolCall // the read it ran, if it has one to run
+  error?: string // why it didn't connect, or its read is missing
+}
+
+// A server's Test: connect, list its tools, and run its cheap read; every answer as it came.
+export async function testServer(
+  s: Pick<Open, 'id' | 'name' | 'url' | 'headers' | 'allow'>,
+  fetchFn: FetchLike = publicFetch,
+  limits = LIMITS
+): Promise<TestResult> {
+  const secrets = Object.values(s.headers).flatMap((v) => [
+    v,
+    ...v.split(' ').filter((p) => p.length >= 16)
+  ])
+  let box: Awaited<ReturnType<typeof connect>>
+  try {
+    box = await connect(s, fetchFn, limits.openMs)
+  } catch (e) {
+    return {
+      connected: false,
+      tools: 0,
+      usable: 0,
+      error: hide(e instanceof Error ? e.message : String(e), secrets)
+    }
+  }
+  try {
+    const out: TestResult = {
+      connected: true,
+      tools: box.tools.length,
+      usable: box.tools.filter((t) => usable(t, s.allow)).length
+    }
+    const want = TESTS[s.id]
+    const t = want && box.tools.find((x) => x.name === want.tool)
+    if (!want) return out
+    if (!t)
+      return { ...out, error: `${s.name} doesn't list ${want.tool}, the tool the Test calls.` }
+    const args = testArgs(t.inputSchema, want.limit)
+    const { call } = await recorded(
+      { who: 'test', server: s.name, tool: t.name },
+      args,
+      secrets,
+      async () => {
+        const r = (await box.client.callTool(
+          { name: t.name, arguments: args },
+          { timeout: limits.callMs }
+        )) as CallToolResult
+        return { text: resultText(r), error: !!r.isError }
+      },
+      1500
+    )
+    return { ...out, call }
+  } finally {
+    void box.client.close().catch(() => {})
   }
 }
 

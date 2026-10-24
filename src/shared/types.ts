@@ -75,6 +75,7 @@ export type Brief = {
   maxTurns: number // budget across all members; the last cycle is always final statements
   board?: { cli: Cli; model?: string } // who writes the live whiteboard; unset = the chair's CLI and model
   voices?: boolean // read each member's answer aloud in its seat's voice (needs an OpenRouter key)
+  lenses?: Partial<Record<PersonaId, string>> // a workspace's own persona prompts (hosted Slack); unset = PERSONAS'
 }
 
 export type Vote = {

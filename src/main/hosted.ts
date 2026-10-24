@@ -53,9 +53,12 @@ import {
   probe,
   publicHttps,
   refreshed,
+  testServer,
   type Connection,
   type Open,
   type Secret,
+  type TestResult,
+  type ToolCall,
   type Toolbox
 } from './mcp'
 import { dataDir } from './paths'
@@ -113,6 +116,7 @@ export type Settings = {
   who: 'admins' | 'everyone' // who may convene, steer and press the buttons
   maxMeetings: number // running at once in this workspace
   installer?: string // who installed it: an admin here whatever Slack says
+  lenses?: Partial<Record<PersonaId, string>> // the personas' prompts edited here; the rest are PERSONAS'
 }
 
 // The clerk when OpenRouter's catalogue can't be had: Anthropic's newest Haiku, small and cheap.
@@ -141,15 +145,35 @@ const MAX_MEETINGS = 10 // the most a workspace may run at once
 export function fromStore(row: Partial<Settings> | undefined, clerk = HAIKU): Settings {
   const s = { ...DEFAULTS, clerk, ...row }
   const seats = s.seats as (Seat | string)[]
-  return {
+  const out: Settings = {
     ...s,
     seats: seats.map((x, i) => (typeof x === 'string' ? { model: x, persona: PERSONA_IDS[i] } : x))
   }
+  const lenses = ownLenses(s.lenses)
+  if (lenses) out.lenses = lenses
+  else delete out.lenses
+  return out
+}
+
+export const MAX_LENS = 1500 // a persona's prompt, in characters
+
+// The personas' prompts a workspace edited: only real personas, plain text cut to MAX_LENS, and
+// none that says what the default says. Undefined when nothing is left.
+export function ownLenses(x: unknown): Settings['lenses'] {
+  if (!x || typeof x !== 'object') return undefined
+  const out = Object.fromEntries(
+    PERSONA_IDS.flatMap((p) => {
+      const v = (x as Record<string, unknown>)[p]
+      const t = typeof v === 'string' ? v.trim().slice(0, MAX_LENS) : ''
+      return t && t !== PERSONAS[p].lens ? [[p, t]] : []
+    })
+  )
+  return Object.keys(out).length ? out : undefined
 }
 
 // A workspace's table for a question: Deep-agent seats on OpenRouter, nothing else.
 export function settingsBrief(s: Settings, task: string): Brief {
-  return toBrief({
+  const brief = toBrief({
     task,
     members: s.seats.map(({ model, persona }) => ({
       cli: 'harness',
@@ -160,6 +184,7 @@ export function settingsBrief(s: Settings, task: string): Brief {
     maxTurns: s.maxTurns,
     board: { cli: 'harness', model: `openrouter:${s.clerk}` }
   })
+  return s.lenses ? { ...brief, lenses: s.lenses } : brief
 }
 
 // `d` is one of `roots` or inside one
@@ -530,6 +555,7 @@ function toolsBlocks(t: NonNullable<HomeMore['tools']>, admin: boolean): types.K
             })
           ]
         : []),
+      ...(c.secret ? [button('mcp_test', 'Test', { value: c.id })] : []),
       ...(c.tools?.some((x) => !x.readOnly)
         ? [button('mcp_allow', 'Allowed tools', { value: c.id })]
         : []),
@@ -587,7 +613,7 @@ export function homeView(
   const seats = s.seats
     .map(
       (x, i) =>
-        `${i + 1}. ${labels[i]} · \`${x.model}\`${i === s.chair ? ' · *chair*' : ''}${uses(x)}`
+        `${i + 1}. ${labels[i]}${s.lenses?.[x.persona] ? ' (edited persona)' : ''} · \`${x.model}\`${i === s.chair ? ' · *chair*' : ''}${uses(x)}`
     )
     .join('\n')
   const keyButtons: types.Button[] = [
@@ -678,6 +704,7 @@ export function homeView(
         `*The table*\n${seats}\nClerk · \`${s.clerk}\` · writes the whiteboard\n\nTurn budget ${s.maxTurns} · up to ${s.maxMeetings} meetings at once · ${s.who === 'admins' ? 'workspace admins' : "everyone in channels I'm in"} can convene`,
         admin ? button('home_table', 'Edit') : undefined
       ),
+      ...(admin ? personaBlocks(s) : []),
       {
         type: 'context',
         elements: [
@@ -689,6 +716,148 @@ export function homeView(
           }
         ]
       }
+    ]
+  }
+}
+
+// The Home tab's Personas (admins): each persona's prompt as the seats get it, and Edit.
+function personaBlocks(s: Settings): types.KnownBlock[] {
+  return [
+    { type: 'divider' },
+    section(
+      "*Personas*\nHow each persona thinks: its lens, the part of a seat's prompt that makes The Engineer an engineer. Edit one to fit this workspace; every seat with that persona gets it."
+    ),
+    ...PERSONA_IDS.map((p) => {
+      const own = s.lenses?.[p]
+      const text = `>${mrk(own ?? PERSONAS[p].lens).replace(/\n/g, '\n>')}`.slice(0, 2800)
+      return section(
+        `*${PERSONAS[p].label}*${own ? ' · _edited_' : ''}\n${text}`,
+        button('persona_edit', 'Edit', { value: p })
+      )
+    })
+  ]
+}
+
+// Editing a persona's prompt: the workspace's text (or the default), and Reset to default.
+export function personaModal(p: PersonaId, lenses: Settings['lenses'] = {}): types.ModalView {
+  const reset = option('reset', 'Reset to the default')
+  return {
+    type: 'modal',
+    callback_id: 'persona_modal',
+    private_metadata: p,
+    title: plain(PERSONAS[p].label.slice(0, 24)),
+    submit: plain('Save'),
+    close: plain('Cancel'),
+    blocks: [
+      {
+        type: 'input',
+        block_id: 'lens',
+        optional: true,
+        label: plain('Lens'),
+        element: {
+          type: 'plain_text_input',
+          action_id: 'lens',
+          multiline: true,
+          max_length: MAX_LENS,
+          initial_value: lenses[p] ?? PERSONAS[p].lens
+        },
+        hint: plain(
+          `Plain text, up to ${MAX_LENS.toLocaleString('en-US')} characters. Each seat with this persona reads it as "Your lens: …", in this workspace's meetings.`
+        )
+      },
+      {
+        type: 'input',
+        block_id: 'reset',
+        optional: true,
+        label: plain('Default'),
+        element: { type: 'checkboxes', action_id: 'reset', options: [reset] }
+      },
+      {
+        type: 'context',
+        elements: [{ type: 'mrkdwn', text: `The default: ${mrk(PERSONAS[p].lens)}` }]
+      }
+    ]
+  }
+}
+
+// The persona form's answers: the workspace's own lens, or none (the default: reset, emptied, or
+// the default's own words), or what's wrong.
+export function readLens(
+  p: PersonaId,
+  values: Values
+): { lens?: string } | { errors: Record<string, string> } {
+  const text = (values.lens?.lens?.value ?? '').trim()
+  if (values.reset?.reset?.selected_options?.length || !text || text === PERSONAS[p].lens) return {}
+  if (text.length > MAX_LENS)
+    return { errors: { lens: `At most ${MAX_LENS} characters; this is ${text.length}.` } }
+  return { lens: text }
+}
+
+// A code block in mrkdwn, at most `max` characters of `t`, with no fence of its own inside.
+const code = (t: string, max: number): string =>
+  `\`\`\`${mrk(t)
+    .replace(/`{3,}/g, (f) => f.split('').join('\u200b'))
+    .slice(0, max)}\`\`\``
+
+// One tool call: which, how long, how much; the arguments as sent; the start of what came back.
+export function callBlock(c: ToolCall, n: number): types.KnownBlock {
+  const outcome = c.error
+    ? ':x: failed'
+    : `${c.chars.toLocaleString('en-US')} character${c.chars === 1 ? '' : 's'}`
+  return section(
+    `*${n}. ${mrk(c.server)} · ${mrk(c.tool)}* · ${(c.ms / 1000).toFixed(1)} s · ${outcome}\n${code(c.args, 1000)}\n${code(c.result, 1700)}`
+  )
+}
+
+const MAX_CALLS = 40 // shown in one modal (Slack: 100 blocks)
+
+// A seat message's Tool calls: each call it made in that turn, in order.
+export function callsModal(o: { who: string; calls: ToolCall[] }): types.ModalView {
+  const more = o.calls.length - MAX_CALLS
+  return {
+    type: 'modal',
+    title: plain('Tool calls'),
+    close: plain('Close'),
+    blocks: [
+      {
+        type: 'context',
+        elements: [
+          {
+            type: 'mrkdwn',
+            text: `*${mrk(o.who)}* · ${o.calls.length} call${o.calls.length === 1 ? '' : 's'}, in order: the arguments as sent, then the start of what came back (the seat read up to ${LIMITS.chars.toLocaleString('en-US')} characters of it).${more > 0 ? ` The first ${MAX_CALLS} are shown.` : ''}`
+          }
+        ]
+      },
+      ...o.calls.slice(0, MAX_CALLS).map((c, i) => callBlock(c, i + 1))
+    ]
+  }
+}
+
+// What a server's Test found: did it connect, what it lists, and its one read, as it came back.
+export function testModal(name: string, id: string, r: TestResult): types.ModalView {
+  const head = !r.connected
+    ? `:x: *${mrk(name)} didn't connect.*\n${code(r.error ?? '', 2500)}`
+    : [
+        `:white_check_mark: *Connected.* ${r.tools} tools listed, ${r.usable} of them usable by seats.`,
+        r.error && `:warning: ${mrk(r.error)}`,
+        !r.call && !r.error && 'Its tools are listed; the Test has no read of its own to run here.'
+      ]
+        .filter(Boolean)
+        .join('\n')
+  const datadog =
+    id === 'datadog' && r.call
+      ? "The last 15 minutes of logs, all of them (query `*`), one at most. Empty while Datadog shows logs? The site must be the one you sign in at (US1 is datadoghq.com), and the application key's owner needs Logs Read Data and Logs Read Index Data. A 401 or 403 is the keys."
+      : ''
+  return {
+    type: 'modal',
+    title: plain(`Test ${name}`.slice(0, 24)),
+    close: plain('Close'),
+    blocks: [
+      section(head),
+      ...(r.call ? [callBlock(r.call, 1)] : []),
+      ...(datadog
+        ? [{ type: 'context' as const, elements: [{ type: 'mrkdwn' as const, text: datadog }] }]
+        : [])
     ]
   }
 }
@@ -1538,7 +1707,7 @@ export async function serveHosted(): Promise<App> {
           mine: [folder, work].filter((d): d is string => !!d),
           images: pixels(got),
           sees: (m) => vision.includes(m),
-          tools: (who) => box?.forSeat(seatTools(s, who)) ?? []
+          tools: (who) => box?.forSeat(seatTools(s, who), who) ?? []
         })
         const attached = [
           attachedLine(
@@ -1550,7 +1719,16 @@ export async function serveHosted(): Promise<App> {
         ]
           .filter(Boolean)
           .join('\n')
-        return { brief, run, dir, question: asked.text, attached, done }
+        // a seat's calls in a turn, kept for its message's Tool calls button
+        // ponytail: kept until the app is uninstalled; a sweep by age if the table grows
+        const calls = async (who: string, title: string): Promise<string | undefined> => {
+          const made = box?.take(who) ?? []
+          if (!made.length) return undefined
+          const id = randomBytes(9).toString('base64url')
+          await store.put('tool-calls', `${team}:${id}`, { who: title, calls: made })
+          return id
+        }
+        return { brief, run, dir, question: asked.text, attached, done, calls }
       } catch (err) {
         done()
         throw err
@@ -1655,6 +1833,7 @@ export async function serveHosted(): Promise<App> {
     forget: async (team) => {
       for (const kind of ['installation', 'settings', 'github', 'channel-repos', 'mcp'])
         await store.del(kind, team)
+      await store.drop('tool-calls', `${team}:`)
       rmSync(teamDir(team), { recursive: true, force: true })
     }
   }
@@ -2216,6 +2395,80 @@ export async function serveHosted(): Promise<App> {
           : c
       )
     )
+    await publishHome(client, team, body.user.id)
+  })
+
+  // ---- what the seats looked up, and a server's Test ----
+  // a modal opens first, inside Slack's 3 s; what it shows comes after
+  const loading = async (
+    client: Client,
+    trigger: string,
+    text: string
+  ): Promise<string | undefined> =>
+    (
+      await client.views
+        .open({ trigger_id: trigger, view: noticeView(`:hourglass_flowing_sand: ${text}`) })
+        .catch((err) => (console.error('slack: no modal:', msg(err)), undefined))
+    )?.view?.id
+  app.action<BlockAction>('tool_calls', async ({ ack, body, action, client, context }) => {
+    await ack()
+    const view = await loading(client, body.trigger_id, 'Getting the calls…')
+    if (!view) return
+    const kept = await store.get<{ who: string; calls: ToolCall[] }>(
+      'tool-calls',
+      `${tenantOf(context)}:${(action as ButtonAction).value ?? ''}`
+    )
+    await client.views.update({
+      view_id: view,
+      view: kept ? callsModal(kept) : noticeView("These tool calls weren't kept.")
+    })
+  })
+  app.action<BlockAction>('mcp_test', async ({ ack, body, action, client, context }) => {
+    await ack()
+    const team = tenantOf(context)
+    const id = (action as ButtonAction).value ?? ''
+    const view = await loading(client, body.trigger_id, 'Testing…')
+    if (!view) return
+    const c = (await connsOf(team)).find((x) => x.id === id)
+    const no = !(await asAdmin(client, team, body.user.id))
+      ? 'Only workspace admins can test the tools.'
+      : !c?.secret
+        ? "That server isn't connected."
+        : undefined
+    if (no || !c) return void (await client.views.update({ view_id: view, view: noticeView(no!) }))
+    let r: TestResult
+    try {
+      const sec = await credentials(team, c)
+      r = await testServer({ ...c, headers: headersOf(sec) })
+    } catch (err) {
+      r = { connected: false, tools: 0, usable: 0, error: msg(err) }
+    }
+    await client.views.update({ view_id: view, view: testModal(c.name, c.id, r) })
+  })
+
+  // ---- personas ----
+  app.action<BlockAction>('persona_edit', async ({ ack, body, action, client, context }) => {
+    await ack()
+    const p = (action as ButtonAction).value as PersonaId
+    const s = PERSONA_IDS.includes(p) && (await asAdmin(client, tenantOf(context), body.user.id))
+    if (s) await client.views.open({ trigger_id: body.trigger_id, view: personaModal(p, s.lenses) })
+  })
+  app.view('persona_modal', async ({ ack, body, view, client, context }) => {
+    const team = tenantOf(context)
+    const p = view.private_metadata as PersonaId
+    const s = await asAdmin(client, team, body.user.id)
+    if (!s || !PERSONA_IDS.includes(p))
+      return void (await ack({
+        response_action: 'errors',
+        errors: { lens: 'Only workspace admins can change the personas.' }
+      }))
+    const r = readLens(p, view.state.values as Values)
+    if ('errors' in r) return void (await ack({ response_action: 'errors', errors: r.errors }))
+    await ack()
+    const lenses = ownLenses({ ...s.lenses, [p]: r.lens })
+    const next: Settings = { ...s, lenses }
+    if (!lenses) delete next.lenses
+    await save(team, next)
     await publishHome(client, team, body.user.id)
   })
 

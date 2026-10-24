@@ -8,6 +8,7 @@ export type Store = {
   get<T>(kind: string, id: string): Promise<T | undefined>
   put(kind: string, id: string, value: unknown): Promise<void>
   del(kind: string, id: string): Promise<void>
+  drop(kind: string, prefix: string): Promise<void> // every `kind` whose id starts with `prefix`
   close(): Promise<void>
 }
 
@@ -33,6 +34,9 @@ export async function openStore(url: string): Promise<Store> {
       del: async (kind, id) => {
         await pool.query('delete from docs where kind = $1 and id = $2', [kind, id])
       },
+      drop: async (kind, prefix) => {
+        await pool.query('delete from docs where kind = $1 and starts_with(id, $2)', [kind, prefix])
+      },
       close: () => pool.end()
     }
   }
@@ -44,6 +48,7 @@ export async function openStore(url: string): Promise<Store> {
     'insert into docs values (?, ?, ?) on conflict (kind, id) do update set value = excluded.value'
   )
   const del = db.prepare('delete from docs where kind = ? and id = ?')
+  const drop = db.prepare('delete from docs where kind = ? and substr(id, 1, ?) = ?')
   return {
     get: async (kind, id) => {
       const row = get.get(kind, id) as { value: string } | undefined
@@ -51,6 +56,7 @@ export async function openStore(url: string): Promise<Store> {
     },
     put: async (kind, id, value) => void put.run(kind, id, JSON.stringify(value)),
     del: async (kind, id) => void del.run(kind, id),
+    drop: async (kind, prefix) => void drop.run(kind, prefix.length, prefix),
     close: async () => db.close()
   }
 }

@@ -15,6 +15,7 @@ import {
   explain,
   fromStore,
   homeView,
+  ownLenses,
   keyed,
   modelGroups,
   newestHaiku,
@@ -29,6 +30,8 @@ import { installations, openStore, seal, unseal } from '../src/main/store'
 import { sealState } from '../src/main/mcp'
 import { bridge, type Tenancy } from '../src/main/slack'
 import type { DebateEvent } from '../src/shared/types'
+import { intro } from '../src/main/prompts'
+import { PERSONAS } from '../src/shared/personas'
 
 const SECRET = 'x'.repeat(40)
 
@@ -595,5 +598,58 @@ test("the web pages: landing and privacy, Bolt's OAuth results replaced, nothing
     assert.ok(!deniedPage.includes(XSS))
   } finally {
     await app.stop()
+  }
+})
+
+test("a workspace's persona prompts: kept clean, carried in the brief, read by each seat", () => {
+  // rows saved before personas could be edited: the defaults, and no lenses key at all
+  assert.ok(!('lenses' in fromStore(undefined)) && !('lenses' in fromStore({ maxTurns: 9 })))
+  const s = fromStore({
+    lenses: {
+      skeptic: '  Doubt everything, kindly.  ',
+      engineer: '',
+      designer: PERSONAS.designer.lens, // the default's own words: not an edit
+      customer: 'y'.repeat(2000),
+      bogus: 'not a persona'
+    } as never
+  })
+  assert.deepEqual(s.lenses, { skeptic: 'Doubt everything, kindly.', customer: 'y'.repeat(1500) })
+  assert.equal(ownLenses({ skeptic: 3, engineer: null }), undefined)
+  assert.equal(ownLenses('junk'), undefined)
+
+  const seats = [
+    { model: 'a/one', persona: 'skeptic' as const },
+    { model: 'b/two', persona: 'strategist' as const }
+  ]
+  const brief = settingsBrief({ ...s, seats }, 'Ship it?')
+  assert.deepEqual(brief.lenses, s.lenses)
+  const labels = { m1: 'The Skeptic', m2: 'The Strategist' }
+  assert.match(intro(brief, brief.members[0], labels), /Your lens: Doubt everything, kindly\.\n/)
+  assert.ok(
+    intro(brief, brief.members[1], labels).includes(`Your lens: ${PERSONAS.strategist.lens}`)
+  )
+  // no edits (and the desktop app, Socket Mode): no lenses, the defaults
+  const plain = settingsBrief({ ...DEFAULTS, seats }, 'Ship it?')
+  assert.equal(plain.lenses, undefined)
+  assert.ok(intro(plain, plain.members[0], labels).includes(`Your lens: ${PERSONAS.skeptic.lens}`))
+})
+
+test("the store drops a workspace's rows of a kind by prefix, and nobody else's", async () => {
+  for (const url of ['sqlite::memory:', process.env.TEST_DATABASE_URL].filter(
+    (u): u is string => !!u
+  )) {
+    const store = await openStore(url)
+    await store.put('tool-calls', 'T1:a', { n: 1 })
+    await store.put('tool-calls', 'T1:b', { n: 2 })
+    await store.put('tool-calls', 'T10:c', { n: 3 })
+    await store.put('settings', 'T1:x', { n: 4 })
+    await store.drop('tool-calls', 'T1:')
+    assert.equal(await store.get('tool-calls', 'T1:a'), undefined)
+    assert.equal(await store.get('tool-calls', 'T1:b'), undefined)
+    assert.deepEqual(await store.get('tool-calls', 'T10:c'), { n: 3 })
+    assert.deepEqual(await store.get('settings', 'T1:x'), { n: 4 })
+    await store.drop('tool-calls', 'T10:')
+    await store.del('settings', 'T1:x')
+    await store.close()
   }
 })
