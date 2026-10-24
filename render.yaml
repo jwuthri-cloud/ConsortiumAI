@@ -1,12 +1,13 @@
 # The hosted Slack app on Render (README, "Hosted"): New → Blueprint → this repo.
-# Starter, not Free: a free service sleeps, and Slack gives up on a request after 3 seconds.
+# Free plan. ponytail: a free service sleeps after 15 idle minutes, so the first Slack request
+# after a nap can time out (Slack waits 3 seconds); switch to plan: starter if that bites.
 # The database is outside Render: set DATABASE_URL to a Postgres connection string (a free Neon
 # database is enough). Transcripts in /data are lost on redeploy; settings, keys and installs aren't.
 services:
   - type: web
     name: consortium
     runtime: docker
-    plan: starter
+    plan: free
     healthCheckPath: /health
     envVars:
       - key: DATABASE_URL
