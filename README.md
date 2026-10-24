@@ -4,6 +4,8 @@ One question. Several AI members that disagree on purpose — each one a coding-
 
 Local-first desktop app (Electron). No accounts, no server: the app spawns the CLIs that are already signed in on your machine. An optional fifth seat, the **Deep-agent**, runs on an API key instead.
 
+**Consortium for Slack** is the same table in a Slack thread, for any workspace: **[consortium-yqs2.onrender.com](https://consortium-yqs2.onrender.com)** (press _Add to Slack_). It's built and maintained by Julien ([@jwuthri-cloud](https://github.com/jwuthri-cloud)). The server is a free [Render](https://render.com) web service, deployed from this repo's `main` by [`render.yaml`](render.yaml); its data (installs, settings, encrypted keys) lives in a free [Neon](https://neon.tech) Postgres. Each workspace brings its own OpenRouter key and picks its models. How it works and how to run your own: [Hosted](#hosted).
+
 ## Setup
 
 ```bash

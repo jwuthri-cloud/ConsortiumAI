@@ -69,7 +69,7 @@ function doc(o: {
 const header = (cta = true): string =>
   `<header class="wrap bar"><a class="brand" href="/">${MARK}Consortium</a><nav aria-label="Site"><a class="hide-sm" href="/privacy">Privacy</a>${cta ? '<a class="btn" href="/slack/install">Add to Slack</a>' : ''}</nav></header>`
 
-const footer = `<footer class="foot"><div class="wrap"><a class="brand" href="/">${MARK}Consortium</a><span>A table of AI models for Slack, on your own OpenRouter key.</span><nav aria-label="Footer"><a href="/privacy">Privacy</a><a href="/slack/install">Add to Slack</a></nav></div></footer>`
+const footer = `<footer class="foot"><div class="wrap"><a class="brand" href="/">${MARK}Consortium</a><span>A table of AI models for Slack, on your own OpenRouter key.<br>Built and maintained by <a href="https://github.com/jwuthri-cloud">Julien</a> · runs on Render, data on Neon.</span><nav aria-label="Footer"><a href="https://github.com/jwuthri-cloud/ConsortiumAI">Source</a><a href="/privacy">Privacy</a><a href="/slack/install">Add to Slack</a></nav></div></footer>`
 
 // ---------- the landing page ----------
 
@@ -329,13 +329,14 @@ const PRIVACY_CSS = `
 @media (max-width:52rem){.doc{grid-template-columns:1fr}.doc aside{position:static}}
 `
 
-// PLACEHOLDER: replace with your own policy (and contact) before listing in the Slack Marketplace.
+// The public instance's policy: who runs it, where data lives, what's kept. Review before a Slack Marketplace listing.
 const PRIVACY_BODY = `${header()}
 <main class="wrap doc">
 <aside><p class="eyebrow">Consortium for Slack</p><h1>Privacy</h1>
-<nav aria-label="On this page"><ul class="toc"><li><a href="#keeps">What this service keeps</a></li><li><a href="#sent">Where questions go</a></li><li><a href="#uninstall">Uninstalling</a></li><li><a href="#contact">Contact</a></li></ul></nav></aside>
+<nav aria-label="On this page"><ul class="toc"><li><a href="#who">Who runs it</a></li><li><a href="#keeps">What this service keeps</a></li><li><a href="#sent">Where questions go</a></li><li><a href="#uninstall">Uninstalling</a></li><li><a href="#contact">Contact</a></li></ul></nav></aside>
 <article class="prose">
-<div class="note"><p class="eyebrow">Placeholder</p><b>Replace this page before you publish the app.</b></div>
+<h2 id="who">Who runs it</h2>
+<p>Consortium for Slack is built and maintained by <a href="https://github.com/jwuthri-cloud">Julien</a>; the code is open at <a href="https://github.com/jwuthri-cloud/ConsortiumAI">github.com/jwuthri-cloud/ConsortiumAI</a>. The server runs on <a href="https://render.com">Render</a> and the data is stored in a <a href="https://neon.tech">Neon</a> Postgres database, both in the US (Oregon).</p>
 <h2 id="keeps">What this service keeps</h2>
 <p>Per Slack workspace: the installation (its bot token, encrypted), its settings and OpenRouter key (the key encrypted), and each meeting's transcript and decision.</p>
 <h2 id="sent">Where questions go</h2>
@@ -343,7 +344,7 @@ const PRIVACY_BODY = `${header()}
 <h2 id="uninstall">Uninstalling</h2>
 <p>Uninstalling the app deletes the workspace's installation, settings, key and transcripts.</p>
 <h2 id="contact">Contact</h2>
-<p><i>you@example.com</i></p>
+<p>Questions or a request about your data: open an issue at <a href="https://github.com/jwuthri-cloud/ConsortiumAI/issues">github.com/jwuthri-cloud/ConsortiumAI/issues</a>.</p>
 </article>
 </main>
 ${footer}`
