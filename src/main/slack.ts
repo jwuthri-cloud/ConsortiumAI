@@ -289,6 +289,7 @@ type Meeting = {
   timers: Map<string, NodeJS.Timeout>
   done?: () => void // once it has ended: what convene set up for it goes
   calls?: Convened['calls']
+  log?: () => Promise<void>
 }
 
 function config(): SlackConfig {
@@ -378,6 +379,18 @@ export type Convened = {
   // The tool calls `who` (m1…, chair) made since it was last asked, kept under `title` (hosted):
   // the id its message's Tool calls button opens, or undefined when it made none.
   calls?: (who: string, title: string) => Promise<string | undefined>
+  // The meeting as it stands, once it starts and once it ends (hosted: the Home tab's Recent meetings)
+  log?: (r: MeetingLog) => Promise<void>
+}
+// `user`: who asked. `link`: the root message's permalink. `cost`: as its footer says it.
+export type MeetingLog = {
+  ts: string
+  channel: string
+  user: string
+  question: string
+  link: string
+  state: BoardView['state']
+  cost: string
 }
 
 // One workspace: slack.json, re-read on each use.
@@ -620,6 +633,7 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
     if (ENDED.has(e.type)) {
       meetings.delete(slot(m.team, m.ts))
       m.done?.()
+      void m.log?.()
     }
   }
 
@@ -737,6 +751,20 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
         ))
       }
       meetings.set(slot(team, m.ts), m)
+      const log = c.log
+      m.log =
+        log &&
+        (() =>
+          log({
+            ts: m.ts,
+            channel,
+            user,
+            question: m.view.question,
+            link: m.link,
+            state: m.view.state,
+            cost: fmtUsd(sumUsage(Object.values(m.view.usage ?? {})))
+          }).catch((e) => console.error('slack: meeting not logged:', slackError(e))))
+      void m.log?.()
       q(m, () => whiteboard(m))
       debate.runDebate(brief, (e) => send(m, e), m.id, undefined, run, SILENT, dir)
     } finally {
@@ -872,7 +900,7 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
       all.map((m) => {
         m.view.state = 'stopped'
         m.view.note = '_The Slack bridge shut down._'
-        return Promise.all([rootUpdate(m), canvasUpdate(m)]).catch(() => {})
+        return Promise.all([rootUpdate(m), canvasUpdate(m), m.log?.()]).catch(() => {})
       })
     )
     await app.stop()

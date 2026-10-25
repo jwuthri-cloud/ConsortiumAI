@@ -11,6 +11,7 @@ import { runMember } from '../src/main/cli'
 import { SILENT } from '../src/main/api'
 import {
   DEFAULTS,
+  ICONS,
   SCOPES,
   explain,
   fromStore,
@@ -28,7 +29,7 @@ import {
 } from '../src/main/hosted'
 import { installations, openStore, seal, unseal } from '../src/main/store'
 import { sealState } from '../src/main/mcp'
-import { bridge, type Tenancy } from '../src/main/slack'
+import { bridge, type MeetingLog, type Tenancy } from '../src/main/slack'
 import type { DebateEvent } from '../src/shared/types'
 import { intro } from '../src/main/prompts'
 import { PERSONAS } from '../src/shared/personas'
@@ -328,13 +329,24 @@ test('the Home tab: the table by persona and model, buttons for admins only, nev
     { model: 'openai/gpt-6.1-sol', persona: 'skeptic' as const }
   ]
   const s = { ...DEFAULTS, seats, chair: 1, key: 'v1.sealed', keyHint: 'sk-or-v1-…3f9a' }
-  const text = (admin: boolean): string => JSON.stringify(homeView(s, admin, 'https://x/connect'))
-  assert.ok(text(false).includes('1. The Skeptic · `anthropic/claude-sonnet-5.5`\\n'))
-  assert.ok(text(false).includes('2. The Skeptic 2 · `openai/gpt-6.1-sol` · *chair*'))
-  assert.ok(text(false).includes('Clerk · `anthropic/claude-haiku-5.5`'))
-  assert.ok(text(true).includes('home_key') && text(true).includes('https://x/connect'))
-  assert.ok(!text(false).includes('home_key') && !text(false).includes('https://x/connect'))
-  assert.ok(text(false).includes('sk-or-v1-…3f9a') && !text(false).includes('v1.sealed'))
+  const text = (admin: boolean, section: 'table' | 'tools'): string =>
+    JSON.stringify(homeView(s, admin, 'https://x/connect', { section }))
+  assert.ok(text(false, 'table').includes(':thinking_face: *The Skeptic*"'))
+  assert.ok(text(false, 'table').includes(':thinking_face: *The Skeptic 2* · chair"'))
+  assert.ok(text(false, 'table').includes('`openai/gpt-6.1-sol`'))
+  assert.ok(text(false, 'table').includes('`anthropic/claude-haiku-5.5`')) // the clerk
+  assert.ok(
+    text(true, 'table').includes('home_table') && !text(false, 'table').includes('home_table')
+  )
+  assert.ok(
+    text(true, 'tools').includes('key_paste') && text(true, 'tools').includes('https://x/connect')
+  )
+  assert.ok(
+    !text(false, 'tools').includes('key_') && !text(false, 'tools').includes('https://x/connect')
+  )
+  assert.ok(
+    text(false, 'tools').includes('sk-or-v1-…3f9a') && !text(false, 'tools').includes('v1.sealed')
+  )
 })
 
 test("two workspaces' meetings run side by side, each on its own key and in its own folder", async () => {
@@ -471,6 +483,7 @@ test('the bridge: a workspace reaches only its own meetings, under its own limit
     return { text: `Ship.\n${VOTE}` }
   }
   const dir = await mkdtemp(join(tmpdir(), 'bridge-'))
+  const logged: MeetingLog[] = [] // the Home tab's Recent meetings
   const tenancy: Tenancy = {
     refuse: async (_team, user) => (user === 'NOPE' ? 'not you' : undefined),
     maxMeetings: async () => 1,
@@ -480,7 +493,8 @@ test('the bridge: a workspace reaches only its own meetings, under its own limit
         question
       ),
       run,
-      dir
+      dir,
+      log: async (r) => void logged.push(r)
     })
   }
   bridge(app, tenancy)
@@ -507,6 +521,15 @@ test('the bridge: a workspace reaches only its own meetings, under its own limit
   await command('TA', 'Question A')
   await until(() => prompts.length === 1)
   const a = prompts[0][0]
+  assert.deepEqual(logged[0], {
+    ts: '1',
+    channel: 'C1',
+    user: 'U1',
+    question: 'Question A',
+    link: '',
+    state: 'running',
+    cost: '—'
+  })
   await command('TA', 'Another one') // over TA's limit
   assert.deepEqual(said, [
     '1 meetings are running, the most this table holds at once (1). Try again when one ends.'
@@ -534,6 +557,7 @@ test('the bridge: a workspace reaches only its own meetings, under its own limit
   assert.ok(existsSync(join(dir, 'sessions', `${a}.json`)))
   stop(a)
   stop(b)
+  await until(() => logged.filter((r) => r.state === 'stopped').length === 2)
 })
 
 test("the web pages: landing and privacy, Bolt's OAuth results replaced, nothing echoed unescaped", async () => {
@@ -560,6 +584,12 @@ test("the web pages: landing and privacy, Bolt's OAuth results replaced, nothing
     return [r.status, await r.text()]
   }
   try {
+    const icon = await fetch(`http://localhost:${port}/icons/linear.png`)
+    assert.equal(icon.headers.get('content-type'), 'image/png')
+    assert.deepEqual([...new Uint8Array(await icon.arrayBuffer()).slice(1, 4)], [80, 78, 71]) // PNG
+    for (const name of ICONS) assert.equal((await get(`/icons/${name}.png`))[0], 200, name)
+    assert.equal((await get('/icons/..%2Fhosted.ts'))[0], 404)
+    assert.equal((await get('/icons/nope.png'))[0], 404)
     for (const path of ['/', '/privacy']) {
       const [status, html] = await get(`${path}?q=${encodeURIComponent(XSS)}`)
       assert.equal(status, 200)

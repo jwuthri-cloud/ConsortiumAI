@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve } from 'node:path'
@@ -9,6 +9,7 @@ import {
   type BlockAction,
   type ButtonAction,
   type CustomRoute,
+  type OverflowAction,
   type StaticSelectAction,
   type types
 } from '@slack/bolt'
@@ -62,7 +63,7 @@ import {
   type Toolbox
 } from './mcp'
 import { dataDir } from './paths'
-import { bridge, noticeView, openLoading, type Tenancy } from './slack'
+import { bridge, noticeView, openLoading, type MeetingLog, type Tenancy } from './slack'
 import { derive, installations, openStore, seal, tenantOf, unseal } from './store'
 import * as pages from './pages'
 import { PERSONAS, PERSONA_IDS, makeLabels } from '../shared/personas'
@@ -483,7 +484,10 @@ const option = (value: string, text: string): types.PlainTextOption => ({
   value,
   text: plain(text.slice(0, 75)) // Slack's cap on an option's text
 })
-const section = (text: string, accessory?: types.Button): types.KnownBlock => ({
+const section = (
+  text: string,
+  accessory?: types.Button | types.Overflow | types.ImageElement
+): types.KnownBlock => ({
   type: 'section',
   text: { type: 'mrkdwn', text },
   ...(accessory && { accessory })
@@ -498,20 +502,66 @@ const button = (
   text: plain(text),
   ...extra
 })
+const context = (...parts: (string | types.ImageElement)[]): types.KnownBlock => ({
+  type: 'context',
+  elements: parts.map((p) => (typeof p === 'string' ? { type: 'mrkdwn' as const, text: p } : p))
+})
+const image = (url: string, alt: string): types.ImageElement => ({
+  type: 'image',
+  image_url: url,
+  alt_text: alt
+})
+
+// The Home tab shows one section at a time, picked in its row of tabs.
+export const SECTIONS = ['overview', 'table', 'tools', 'personas'] as const
+export type Section = (typeof SECTIONS)[number]
+const TABS: Record<Section, string> = {
+  overview: 'Overview',
+  table: 'The table',
+  tools: 'Tools',
+  personas: 'Personas'
+}
+
+// The images this server serves at /icons/<name>.png (src/main/icons; scripts/generate-icons.py)
+export const ICONS = ['consortium', 'openrouter', 'github', ...CATALOG.map((x) => x.id), 'custom']
+const iconOf = (id: string): string => (CATALOG.some((x) => x.id === id) ? id : 'custom')
+
+const EMOJI: Record<PersonaId, string> = {
+  strategist: ':chess_pawn:',
+  engineer: ':wrench:',
+  researcher: ':mag:',
+  designer: ':art:',
+  skeptic: ':thinking_face:',
+  customer: ':bust_in_silhouette:'
+}
+
+// A meeting in the Overview's Recent meetings: a workspace's last RECENT (store kind 'meetings')
+export type MeetingRow = MeetingLog & { at: number }
+export const RECENT = 5
 
 // The rest of the Home tab: whether the install reads files (else `install`, where to reinstall),
 // and GitHub when this server has it: the account connected, its repositories, admins' link.
 // `tools`: the workspace's MCP connections, and (admins) each OAuth server's sign-in link by id.
+// `section`: the one shown (Overview unless said). `icons`: where /icons is (none: no images).
+// `meetings`: the workspace's last few; `viewer` sees their own questions, only who asked the others.
 export type HomeMore = {
   files?: boolean
   install?: string
   github?: { connect?: string; account?: string; repos?: number }
   tools?: { conns: Connection[]; links?: Record<string, string> }
+  section?: Section
+  icons?: string
+  meetings?: MeetingRow[]
+  viewer?: string
 }
 
 const mrk = (t: string): string =>
   t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
+const shorten = (t: string, max: number): string => {
+  const one = t.replace(/\s+/g, ' ').trim()
+  return one.length > max ? `${one.slice(0, max - 1)}…` : one
+}
 
 // The root message's line on the meeting's tools: what the seats can call, and what didn't open.
 export function toolsAttached(box: Pick<Toolbox, 'opened' | 'failed'>): string {
@@ -537,62 +587,311 @@ export function toolStatus(c: Connection): string {
   return `:white_check_mark: ${n} of ${all.length} tools usable${allowed}`
 }
 
-// The servers a seat calls, by name: all connected ones unless it has its own list.
-const seatServers = (seat: Seat, conns: Connection[]): string[] =>
-  conns.filter((c) => !seat.tools || seat.tools.includes(c.id)).map((c) => c.name)
+// The servers a seat calls: all connected ones unless it has its own list.
+const seatServers = (seat: Seat, conns: Connection[]): Connection[] =>
+  conns.filter((c) => !seat.tools || seat.tools.includes(c.id))
 
 const MAX_CONNECTIONS = 10 // a workspace's MCP servers (the Home tab's blocks are capped at 100)
 
-function toolsBlocks(t: NonNullable<HomeMore['tools']>, admin: boolean): types.KnownBlock[] {
-  const links = t.links ?? {}
-  const rows = t.conns.flatMap((c): types.KnownBlock[] => {
-    const buttons: types.Button[] = [
-      ...(c.auth === 'oauth' && links[c.id]
-        ? [
-            button('mcp_oauth', c.secret ? 'Reconnect' : 'Authorize', {
-              url: links[c.id],
-              ...(!c.secret && { style: 'primary' as const })
-            })
-          ]
-        : []),
-      ...(c.secret ? [button('mcp_test', 'Test', { value: c.id })] : []),
-      ...(c.tools?.some((x) => !x.readOnly)
-        ? [button('mcp_allow', 'Allowed tools', { value: c.id })]
-        : []),
-      button('mcp_off', 'Disconnect', {
-        value: c.id,
-        style: 'danger',
-        confirm: {
-          title: plain(`Disconnect ${c.name.slice(0, 80)}?`),
-          text: plain("The table's seats stop calling its tools, and its credentials are deleted."),
-          confirm: plain('Disconnect'),
-          deny: plain('Keep it')
-        }
-      })
-    ]
-    return [
-      section(`*${c.name}* · ${toolStatus(c)}`),
-      ...(admin ? [{ type: 'actions' as const, block_id: `mcp_${c.id}`, elements: buttons }] : [])
-    ]
+// A connection's actions, `verb:id` for the home_menu handler; `url` ones are links.
+type Item = { text: string; value: string; url?: string }
+// One item is a button, more an overflow menu (Slack: 5 at most). The destructive ones open a
+// confirmation dialog (confirmModal): an overflow's own confirm would ask before every item.
+function menu(items: Item[]): types.Button | types.Overflow | undefined {
+  const [one] = items
+  if (items.length < 2)
+    return (
+      one && button('home_menu', one.text, { value: one.value, ...(one.url && { url: one.url }) })
+    )
+  return {
+    type: 'overflow',
+    action_id: 'home_menu',
+    options: items
+      .slice(0, 5)
+      .map((i) => ({ ...option(i.value, i.text), ...(i.url && { url: i.url }) }))
+  }
+}
+
+// A connection in Tools: its name and menu, then its icon and state, small.
+const row = (
+  name: string,
+  icon: string | undefined,
+  state: string,
+  items: Item[]
+): types.KnownBlock[] => [
+  section(`*${mrk(name)}*`, menu(items)),
+  context(...(icon ? [image(icon, name)] : []), state)
+]
+
+// The menu items that ask first: the dialog's words, by verb.
+const CONFIRMS: Record<string, (name: string) => { title: string; text: string; ok: string }> = {
+  key_forget: () => ({
+    title: 'Remove the key',
+    text: "Remove this workspace's OpenRouter key? Meetings here stop starting until an admin adds one.",
+    ok: 'Remove'
+  }),
+  gh_off: () => ({
+    title: 'Disconnect GitHub',
+    text: 'Disconnect GitHub? The table stops reading its repositories. Consortium stays installed on GitHub until you remove it there.',
+    ok: 'Disconnect'
+  }),
+  mcp_off: (name) => ({
+    title: 'Disconnect',
+    text: `Disconnect *${mrk(name)}*? The table's seats stop calling its tools, and its credentials are deleted.`,
+    ok: 'Disconnect'
   })
+}
+
+// "mcp_off:linear" → ['mcp_off', 'linear']
+export const verbOf = (value: string): [string, string] => {
+  const i = value.indexOf(':')
+  return i < 0 ? [value, ''] : [value.slice(0, i), value.slice(i + 1)]
+}
+
+// The dialog before a destructive menu item; its Save does it (home_confirm). Undefined: no such item.
+export function confirmModal(value: string, name = ''): types.ModalView | undefined {
+  const c = CONFIRMS[verbOf(value)[0]]?.(name)
+  return (
+    c && {
+      type: 'modal',
+      callback_id: 'home_confirm',
+      private_metadata: value,
+      title: plain(c.title),
+      submit: plain(c.ok),
+      close: plain('Keep it'),
+      blocks: [section(c.text)]
+    }
+  )
+}
+
+function toolsBlocks(
+  s: Settings,
+  admin: boolean,
+  connect: string | undefined,
+  more: HomeMore
+): types.KnownBlock[] {
+  const icon = (name: string): string | undefined => more.icons && `${more.icons}/${name}.png`
+  const links = more.tools?.links ?? {}
+  const conns = more.tools?.conns ?? []
+  const g = more.github
+  const openrouter = row(
+    'OpenRouter',
+    icon('openrouter'),
+    s.key
+      ? `:white_check_mark: Connected · \`${s.keyHint}\` · each meeting's cost is in its footer`
+      : ":warning: No key: meetings can't start until an admin adds one",
+    admin
+      ? [
+          ...(connect
+            ? [{ text: 'Connect with OpenRouter', value: 'key_connect', url: connect }]
+            : []),
+          { text: s.key ? 'Paste another key' : 'Paste a key', value: 'key_paste' },
+          ...(s.key ? [{ text: 'Remove key…', value: 'key_forget' }] : [])
+        ]
+      : []
+  )
+  const repos =
+    g?.repos === undefined ? '' : ` · ${g.repos} ${g.repos === 1 ? 'repository' : 'repositories'}`
+  const github = g
+    ? row(
+        'GitHub',
+        icon('github'),
+        g.account
+          ? `:white_check_mark: Connected to \`${g.account}\`${repos} · the table reads the one a question names, read-only`
+          : 'Not connected: connect an account or org, and the table can read one of its repositories',
+        admin && g.connect
+          ? [
+              {
+                text: g.account ? 'Change repositories' : 'Connect GitHub',
+                value: 'gh_connect',
+                url: g.connect
+              },
+              ...(g.account ? [{ text: 'Disconnect…', value: 'gh_off' }] : [])
+            ]
+          : []
+      )
+    : []
+  const servers = conns.flatMap((c) =>
+    row(
+      c.name,
+      icon(iconOf(c.id)),
+      toolStatus(c),
+      admin
+        ? [
+            ...(c.auth === 'oauth' && links[c.id]
+              ? [
+                  {
+                    text: c.secret ? 'Reconnect' : 'Authorize',
+                    value: `mcp_oauth:${c.id}`,
+                    url: links[c.id]
+                  }
+                ]
+              : []),
+            ...(c.secret ? [{ text: 'Test', value: `mcp_test:${c.id}` }] : []),
+            ...(c.tools?.some((x) => !x.readOnly)
+              ? [{ text: 'Allowed tools', value: `mcp_allow:${c.id}` }]
+              : []),
+            { text: 'Disconnect…', value: `mcp_off:${c.id}` }
+          ]
+        : []
+    )
+  )
   const add = [
-    ...CATALOG.filter((x) => !t.conns.some((c) => c.id === x.id)).map((x) =>
+    ...CATALOG.filter((x) => !conns.some((c) => c.id === x.id)).map((x) =>
       button(`mcp_add_${x.id}`, `Connect ${x.name}`, {
         value: x.id,
         ...(x.auth === 'oauth' && links[x.id] && { url: links[x.id] })
       })
     ),
-    button('mcp_add_custom', 'Custom MCP server', { value: 'custom' })
+    button('mcp_add_custom', 'Custom server', { value: 'custom' })
   ]
   return [
+    section('*Tools* · what the table runs on, and what its seats can read during a meeting'),
+    ...openrouter,
+    ...github,
+    ...(more.tools ? servers : []),
+    ...(more.tools && admin && conns.length < MAX_CONNECTIONS
+      ? [{ type: 'actions' as const, block_id: 'mcp_connect', elements: add }]
+      : []),
+    ...(more.tools
+      ? [
+          context(
+            conns.length
+              ? 'Seats call read-only tools (and any an admin allows), each seat the services *The table → Edit* gives it.'
+              : admin
+                ? 'Connect services like Linear or Datadog, and seats can look things up in them during a meeting, read-only.'
+                : 'No services connected. A workspace admin can connect Linear, Datadog and more here.'
+          )
+        ]
+      : [])
+  ]
+}
+
+function tableBlocks(s: Settings, admin: boolean, more: HomeMore): types.KnownBlock[] {
+  const labels = makeLabels(s.seats.map((x, i) => ({ id: String(i), persona: x.persona })))
+  const conns = more.tools?.conns.filter((c) => c.secret) ?? []
+  // a seat's servers: their icons (Slack: 10 elements in a context) and names
+  const uses = (x: Seat): (string | types.ImageElement)[] => {
+    if (!conns.length) return []
+    const on = seatServers(x, conns)
+    if (!on.length) return ['no tools']
+    const icons = more.icons
+      ? on.slice(0, 8).map((c) => image(`${more.icons}/${iconOf(c.id)}.png`, c.name))
+      : []
+    return [...icons, on.map((c) => mrk(c.name)).join(', ')]
+  }
+  return [
+    section(
+      `*The table* · ${s.seats.length} seats`,
+      admin ? button('home_table', 'Edit') : undefined
+    ),
+    context(
+      `Turn budget ${s.maxTurns} · up to ${s.maxMeetings} meetings at once · ${s.who === 'admins' ? 'workspace admins' : "everyone in channels I'm in"} can convene`
+    ),
+    ...s.seats.flatMap((x, i) => [
+      section(
+        `${EMOJI[x.persona]} *${labels[i]}*${i === s.chair ? ' · chair' : ''}${s.lenses?.[x.persona] ? ' · _edited persona_' : ''}`
+      ),
+      context(`\`${x.model}\``, ...uses(x))
+    ]),
+    section(':memo: *Clerk* · writes the whiteboard'),
+    context(`\`${s.clerk}\``)
+  ]
+}
+
+// A lens's first sentence, for its one line in Personas.
+export const firstSentence = (t: string): string =>
+  shorten(t.match(/^[\s\S]*?[.!?](?=\s|$)/)?.[0] ?? t, 160)
+
+function personaBlocks(s: Settings, admin: boolean): types.KnownBlock[] {
+  return [
+    section(
+      "*Personas* · each seat thinks through its persona's lens; edit one to fit this workspace"
+    ),
+    ...PERSONA_IDS.map((p) => {
+      const own = s.lenses?.[p]
+      return section(
+        `${EMOJI[p]} *${PERSONAS[p].label}*${own ? ' · _edited_' : ''}\n${mrk(firstSentence(own ?? PERSONAS[p].lens))}`,
+        admin ? button('persona_edit', 'Edit', { value: p }) : undefined
+      )
+    })
+  ]
+}
+
+const STATES: Record<string, string> = {
+  running: ':hourglass_flowing_sand: running',
+  paused: ':double_vertical_bar: paused',
+  decided: ':white_check_mark: decided',
+  stopped: ':black_square_for_stop: stopped',
+  failed: ':warning: failed'
+}
+// Slack shows it in the reader's time zone; the fallback is UTC
+const when = (at: number): string =>
+  `<!date^${Math.floor(at / 1000)}^{date_short_pretty} at {time}|${new Date(at).toISOString().slice(0, 16).replace('T', ' ')} UTC>`
+
+// A recent meeting: its question (to whoever asked it; others see who asked: the channel may be
+// private), then where, when, how it ended and its cost.
+export function meetingBlocks(m: MeetingRow, viewer?: string): types.KnownBlock[] {
+  const mine = m.user === viewer
+  const title = mine ? mrk(shorten(m.question, 120)) : 'A question'
+  return [
+    section(`${m.link ? `<${m.link}|${title}>` : title}${mine ? '' : ` from <@${m.user}>`}`),
+    context(
+      [`<#${m.channel}>`, when(m.at), STATES[m.state] ?? m.state, m.cost === '—' ? '' : m.cost]
+        .filter(Boolean)
+        .join(' · ')
+    )
+  ]
+}
+
+function overviewBlocks(
+  s: Settings,
+  admin: boolean,
+  connect: string | undefined,
+  more: HomeMore
+): types.KnownBlock[] {
+  const labels = makeLabels(s.seats.map((x, i) => ({ id: String(i), persona: x.persona })))
+  const seats = s.seats
+    .map((x, i) => `${EMOJI[x.persona]} ${labels[i]}${i === s.chair ? ' (chair)' : ''}`)
+    .join(' · ')
+  const tools = [
+    s.key && 'OpenRouter',
+    more.github?.account && 'GitHub',
+    ...(more.tools?.conns.filter((c) => c.secret).map((c) => mrk(c.name)) ?? [])
+  ].filter(Boolean)
+  const edited = Object.keys(s.lenses ?? {}).length
+  const meetings = (more.meetings ?? []).slice(0, RECENT)
+  return [
+    ...(more.files === false
+      ? [
+          section(
+            `:warning: *Files need a reinstall.* Consortium was installed before it could read the files attached to questions. <${more.install}|Reinstall to enable files>`
+          )
+        ]
+      : []),
+    ...(admin && !s.key && connect
+      ? [
+          section(
+            ":key: *Add an OpenRouter key* and meetings can start: they run on this workspace's key.",
+            button('home_connect', 'Connect OpenRouter', { url: connect })
+          )
+        ]
+      : []),
+    section('*Recent meetings*'),
+    ...(meetings.length
+      ? meetings.flatMap((m) => meetingBlocks(m, more.viewer))
+      : [context('_None yet._')]),
+    context(
+      "In a channel I'm in: `/consortium <question>`, or mention @Consortium (attach files to the mention). Reply in the thread to steer the meeting."
+    ),
     { type: 'divider' },
     section(
-      `*Tools*\n${t.conns.length ? 'Seats can look things up in these services during a meeting, with their read-only tools (and any an admin allows). Each is connected once for the whole workspace; pick which seats use which in *The table → Edit*.' : admin ? 'Connect services like Linear or Datadog, and seats can look things up in them during a meeting, read-only.' : 'No services connected. A workspace admin can connect Linear, Datadog and more here.'}`
-    ),
-    ...rows,
-    ...(admin && t.conns.length < MAX_CONNECTIONS
-      ? [{ type: 'actions' as const, block_id: 'mcp_connect', elements: add }]
-      : [])
+      [
+        `*The table* · ${seats}`,
+        `*Tools* · ${tools.length ? tools.join(' · ') : '_none connected_'}`,
+        `*Personas* · ${edited ? `${edited} edited for this workspace` : 'the defaults'}`
+      ].join('\n')
+    )
   ]
 }
 
@@ -603,139 +902,61 @@ export function homeView(
   connect?: string,
   more: HomeMore = {}
 ): types.HomeView {
-  const labels = makeLabels(s.seats.map((x, i) => ({ id: String(i), persona: x.persona })))
-  const conns = more.tools?.conns.filter((c) => c.secret) ?? []
-  const uses = (x: Seat): string => {
-    if (!conns.length) return ''
-    const names = seatServers(x, conns)
-    return ` · :hammer_and_wrench: ${names.length ? names.join(', ') : 'no tools'}`
-  }
-  const seats = s.seats
-    .map(
-      (x, i) =>
-        `${i + 1}. ${labels[i]}${s.lenses?.[x.persona] ? ' (edited persona)' : ''} · \`${x.model}\`${i === s.chair ? ' · *chair*' : ''}${uses(x)}`
-    )
-    .join('\n')
-  const keyButtons: types.Button[] = [
-    ...(connect
-      ? [button('home_connect', 'Connect OpenRouter', { url: connect, style: 'primary' })]
-      : []),
-    button('home_key', s.key ? 'Paste another key' : 'Paste a key'),
-    ...(s.key
-      ? [
-          button('home_forget', 'Remove key', {
-            style: 'danger',
-            confirm: {
-              title: plain('Remove the key?'),
-              text: plain('Meetings in this workspace stop starting until an admin adds one.'),
-              confirm: plain('Remove'),
-              deny: plain('Keep it')
-            }
-          })
-        ]
-      : [])
+  const at = more.section ?? 'overview'
+  const live = (more.meetings ?? []).filter((m) => m.state === 'running').length
+  const status = !s.key
+    ? `:warning: Not ready: meetings need an OpenRouter key${admin ? '' : ', which a workspace admin adds here'}.`
+    : `:large_green_circle: Ready · ${s.seats.length} seats${live ? ` · ${live} meeting${live > 1 ? 's' : ''} running` : ''} · ${s.who === 'admins' ? 'admins' : 'everyone'} can convene`
+  const steps: [string, boolean][] = [
+    ['OpenRouter key', !!s.key],
+    ...(more.github ? [['GitHub', !!more.github.account] as [string, boolean]] : []),
+    ...(more.tools ? [['Tools', more.tools.conns.some((c) => c.secret)] as [string, boolean]] : []),
+    ['Invite me to a channel', !!more.meetings?.length]
   ]
-  const g = more.github
-  const repos =
-    g?.repos === undefined ? '' : ` · ${g.repos} ${g.repos === 1 ? 'repository' : 'repositories'}`
-  const githubBlocks: types.KnownBlock[] = g
-    ? [
-        { type: 'divider' },
-        section(
-          `*GitHub*\n${g.account ? `:white_check_mark: Connected to \`${g.account}\`${repos}. When you ask, Consortium picks the one your question names (or the channel's last) and you confirm it; the table reads it, read-only.` : 'Not connected. Connect a GitHub account or org, and the table can read one of its repositories, read-only, when you ask.'}`
-        ),
-        ...(admin && g.connect
-          ? [
-              {
-                type: 'actions' as const,
-                elements: [
-                  button('home_github', g.account ? 'Change repositories' : 'Connect GitHub', {
-                    url: g.connect,
-                    ...(!g.account && { style: 'primary' as const })
-                  }),
-                  ...(g.account
-                    ? [
-                        button('home_github_off', 'Disconnect', {
-                          style: 'danger',
-                          confirm: {
-                            title: plain('Disconnect GitHub?'),
-                            text: plain(
-                              'The table stops reading its repositories. Consortium stays installed on GitHub until you remove it there.'
-                            ),
-                            confirm: plain('Disconnect'),
-                            deny: plain('Keep it')
-                          }
-                        })
-                      ]
-                    : [])
-                ]
-              }
-            ]
-          : [])
-      ]
-    : []
+  const body =
+    at === 'table'
+      ? tableBlocks(s, admin, more)
+      : at === 'tools'
+        ? toolsBlocks(s, admin, connect, more)
+        : at === 'personas'
+          ? personaBlocks(s, admin)
+          : overviewBlocks(s, admin, connect, more)
   return {
     type: 'home',
     blocks: [
-      { type: 'header', text: plain('Consortium') },
       section(
-        'A table of AI models that debates your question in a thread and writes the decision. Invite me to a channel, then `/consortium <question>` or mention @Consortium there (attach files to the mention, or use `/consortium` alone for a form). Reply in the thread to steer the meeting.'
+        `*Consortium*\n${status}`,
+        more.icons ? image(`${more.icons}/consortium.png`, 'Consortium') : undefined
       ),
+      ...(steps.every(([, done]) => done)
+        ? []
+        : [
+            context(
+              ...steps.map(
+                ([what, done]) => `${done ? ':white_check_mark:' : ':white_circle:'} ${what}`
+              )
+            )
+          ]),
       {
         type: 'actions',
         elements: [button('home_ask', 'New question', { style: 'primary' })]
       },
-      ...(more.files === false
-        ? [
-            section(
-              `:warning: *Files need a reinstall.* Consortium was installed before it could read files, so it can't read the ones attached to questions. <${more.install}|Reinstall to enable files>`
-            )
-          ]
-        : []),
-      { type: 'divider' },
-      section(
-        `*OpenRouter key*\n${s.key ? `:white_check_mark: Connected (\`${s.keyHint}\`). Meetings here run on it; each one's cost is in its footer.` : ":warning: Not set: meetings can't start until an admin adds one."}`
-      ),
-      ...(admin ? [{ type: 'actions' as const, elements: keyButtons }] : []),
-      ...githubBlocks,
-      ...(more.tools ? toolsBlocks(more.tools, admin) : []),
-      { type: 'divider' },
-      section(
-        `*The table*\n${seats}\nClerk · \`${s.clerk}\` · writes the whiteboard\n\nTurn budget ${s.maxTurns} · up to ${s.maxMeetings} meetings at once · ${s.who === 'admins' ? 'workspace admins' : "everyone in channels I'm in"} can convene`,
-        admin ? button('home_table', 'Edit') : undefined
-      ),
-      ...(admin ? personaBlocks(s) : []),
       {
-        type: 'context',
-        elements: [
-          {
-            type: 'mrkdwn',
-            text: admin
-              ? 'Only workspace admins and whoever installed Consortium can change these.'
-              : 'A workspace admin can change these here.'
-          }
-        ]
-      }
+        type: 'actions',
+        block_id: 'home_tabs',
+        elements: SECTIONS.map((x) =>
+          button(`home_section_${x}`, x === at ? `● ${TABS[x]}` : TABS[x], { value: x })
+        )
+      },
+      { type: 'divider' },
+      ...body,
+      context(
+        admin
+          ? 'Only workspace admins and whoever installed Consortium can change these.'
+          : 'A workspace admin can change these here.'
+      )
     ]
   }
-}
-
-// The Home tab's Personas (admins): each persona's prompt as the seats get it, and Edit.
-function personaBlocks(s: Settings): types.KnownBlock[] {
-  return [
-    { type: 'divider' },
-    section(
-      "*Personas*\nHow each persona thinks: its lens, the part of a seat's prompt that makes The Engineer an engineer. Edit one to fit this workspace; every seat with that persona gets it."
-    ),
-    ...PERSONA_IDS.map((p) => {
-      const own = s.lenses?.[p]
-      const text = `>${mrk(own ?? PERSONAS[p].lens).replace(/\n/g, '\n>')}`.slice(0, 2800)
-      return section(
-        `*${PERSONAS[p].label}*${own ? ' · _edited_' : ''}\n${text}`,
-        button('persona_edit', 'Edit', { value: p })
-      )
-    })
-  ]
 }
 
 // Editing a persona's prompt: the workspace's text (or the default), and Reset to default.
@@ -1487,6 +1708,20 @@ export async function serveHosted(): Promise<App> {
     editConns(team, (l) =>
       l.some((x) => x.id === c.id) ? l.map((x) => (x.id === c.id ? c : x)) : [...l, c]
     )
+  // the Home tab's Recent meetings, newest first
+  const meetingsOf = async (team: string): Promise<MeetingRow[]> =>
+    (await store.get<MeetingRow[]>('meetings', team)) ?? []
+  // ponytail: read, change, write like editConns; two meetings ending at the same instant: last wins
+  const logMeeting = async (team: string, r: MeetingLog): Promise<void> => {
+    const rows = await meetingsOf(team)
+    const at = rows.find((x) => x.ts === r.ts)?.at ?? Date.now()
+    const row: MeetingRow = { ...r, question: r.question.slice(0, 300), at }
+    await store.put(
+      'meetings',
+      team,
+      [row, ...rows.filter((x) => x.ts !== r.ts)].sort((a, b) => b.at - a.at).slice(0, RECENT)
+    )
+  }
   // the servers the Edit table offers each seat: the authorized ones
   const serversOf = async (team: string): Promise<{ id: string; name: string }[]> =>
     (await connsOf(team)).filter((c) => c.secret).map(({ id, name }) => ({ id, name }))
@@ -1728,7 +1963,8 @@ export async function serveHosted(): Promise<App> {
           await store.put('tool-calls', `${team}:${id}`, { who: title, calls: made })
           return id
         }
-        return { brief, run, dir, question: asked.text, attached, done, calls }
+        const log = (r: MeetingLog): Promise<void> => logMeeting(team, r)
+        return { brief, run, dir, question: asked.text, attached, done, calls, log }
       } catch (err) {
         done()
         throw err
@@ -1831,7 +2067,7 @@ export async function serveHosted(): Promise<App> {
       return inline(got, skipped)
     },
     forget: async (team) => {
-      for (const kind of ['installation', 'settings', 'github', 'channel-repos', 'mcp'])
+      for (const kind of ['installation', 'settings', 'github', 'channel-repos', 'mcp', 'meetings'])
         await store.del(kind, team)
       await store.drop('tool-calls', `${team}:`)
       rmSync(teamDir(team), { recursive: true, force: true })
@@ -1848,6 +2084,18 @@ export async function serveHosted(): Promise<App> {
     },
     { path: '/privacy', method: 'GET', handler: (_req, res) => send(res, 200, pages.privacy()) },
     { path: '/health', method: 'GET', handler: (_req, res) => void res.writeHead(200).end('ok') },
+    {
+      // the Home tab's images: Slack fetches them from here
+      path: '/icons/:name',
+      method: 'GET',
+      handler: (req, res) => {
+        const name = String(req.params?.name ?? '').replace(/\.png$/, '')
+        if (!ICONS.includes(name)) return void res.writeHead(404).end()
+        res
+          .writeHead(200, { 'content-type': 'image/png', 'cache-control': 'public, max-age=86400' })
+          .end(readFileSync(join(__dirname, 'icons', `${name}.png`)))
+      }
+    },
     {
       // OpenRouter's OAuth with PKCE: openrouter.ai/docs/use-cases/oauth-pkce
       path: '/openrouter/connect',
@@ -2138,14 +2386,28 @@ export async function serveHosted(): Promise<App> {
   })
   const { start } = bridge(app, tenancy)
 
-  async function publishHome(client: Client, team: string, user: string): Promise<void> {
+  // each person's last section of the Home tab
+  // ponytail: in memory; after a restart the Home tab opens on Overview again
+  const shown = new Map<string, Section>()
+  async function publishHome(
+    client: Client,
+    team: string,
+    user: string,
+    section?: Section
+  ): Promise<void> {
+    if (section) shown.set(`${team}:${user}`, section)
     const s = await load(team)
     const admin = await isAdmin(client, user, s)
     const now = Date.now()
     const connect = admin
       ? `${base}/openrouter/connect?t=${signLink(secret, team, user)}`
       : undefined
-    const [install, link, conns] = await Promise.all([installOf(team), linkOf(team), connsOf(team)])
+    const [install, link, conns, meetings] = await Promise.all([
+      installOf(team),
+      linkOf(team),
+      connsOf(team),
+      meetingsOf(team)
+    ])
     const mcp = admin ? signLink(secret, team, user, now, 'mcp') : ''
     const signIns = [...CATALOG, ...conns].filter((c) => c.auth === 'oauth').map((c) => c.id)
     const repos = link
@@ -2171,7 +2433,11 @@ export async function serveHosted(): Promise<App> {
               signIns.map((id) => [id, `${base}/mcp/connect?t=${mcp}&s=${encodeURIComponent(id)}`])
             )
           : undefined
-      }
+      },
+      section: shown.get(`${team}:${user}`),
+      icons: `${base}/icons`,
+      meetings,
+      viewer: user
     }
     await client.views.publish({ user_id: user, view: homeView(s, admin, connect, more) })
   }
@@ -2189,13 +2455,47 @@ export async function serveHosted(): Promise<App> {
     if (event.tab === 'home') await publishHome(client, tenantOf(context), event.user)
   })
   app.action('home_connect', async ({ ack }) => ack()) // a link: the browser does the rest
-  app.action('home_github', async ({ ack }) => ack()) // a link too
-  app.action<BlockAction>('home_github_off', async ({ ack, body, client, context }) => {
+  app.action<BlockAction>(/^home_section_/, async ({ ack, body, action, client, context }) => {
+    await ack()
+    const x = (action as ButtonAction).value as Section
+    if (SECTIONS.includes(x)) await publishHome(client, tenantOf(context), body.user.id, x)
+  })
+  // Tools' menus (a button when there's one item): `verb:id`. Links (Connect, Reconnect, Change
+  // repositories) are the browser's; the destructive ones ask first, in confirmModal.
+  app.action<BlockAction>('home_menu', async ({ ack, body, action, client, context }) => {
+    await ack()
+    const a = action as OverflowAction | ButtonAction
+    const value = (a.type === 'overflow' ? a.selected_option.value : a.value) ?? ''
+    const [verb, id] = verbOf(value)
+    const team = tenantOf(context)
+    const user = body.user.id
+    const open = (view: types.ModalView): Promise<unknown> =>
+      client.views.open({ trigger_id: body.trigger_id, view })
+    if (verb === 'mcp_test') return testServerFor(client, body.trigger_id, team, user, id)
+    if (!['key_paste', 'key_forget', 'gh_off', 'mcp_allow', 'mcp_off'].includes(verb)) return
+    if (!(await asAdmin(client, team, user))) return
+    if (verb === 'key_paste') return void (await open(keyModal()))
+    const c = id ? (await connsOf(team)).find((x) => x.id === id) : undefined
+    if (verb === 'mcp_allow') return void (c && (await open(allowModal(c))))
+    if (verb === 'mcp_off' && !c) return
+    const ask = confirmModal(value, c?.name)
+    if (ask) await open(ask)
+  })
+  app.view('home_confirm', async ({ ack, body, view, client, context }) => {
     await ack()
     const team = tenantOf(context)
-    if (!(await asAdmin(client, team, body.user.id))) return
-    await store.del('github', team)
-    await publishHome(client, team, body.user.id)
+    const user = body.user.id
+    const s = await asAdmin(client, team, user)
+    if (!s) return
+    const [verb, id] = verbOf(view.private_metadata)
+    if (verb === 'key_forget') {
+      delete s.key
+      delete s.keyHint
+      await save(team, s)
+    } else if (verb === 'gh_off') await store.del('github', team)
+    else if (verb === 'mcp_off') await editConns(team, (l) => l.filter((x) => x.id !== id))
+    else return
+    await publishHome(client, team, user)
   })
   app.action<BlockAction>('home_ask', async ({ ack, body, client, context }) => {
     await ack()
@@ -2251,11 +2551,6 @@ export async function serveHosted(): Promise<App> {
       repo: r.repo
     })
   })
-  app.action<BlockAction>('home_key', async ({ ack, body, client, context }) => {
-    await ack()
-    if (await asAdmin(client, tenantOf(context), body.user.id))
-      await client.views.open({ trigger_id: body.trigger_id, view: keyModal() })
-  })
   app.action<BlockAction>('home_table', async ({ ack, body, client, context }) => {
     await ack()
     const s = await asAdmin(client, tenantOf(context), body.user.id)
@@ -2267,16 +2562,6 @@ export async function serveHosted(): Promise<App> {
   })
   // the seat rows' selects report each pick; the modal's Save reads them all
   app.action({ block_id: /^seat\d$/ }, async ({ ack }) => ack())
-  app.action<BlockAction>('home_forget', async ({ ack, body, client, context }) => {
-    await ack()
-    const team = tenantOf(context)
-    const s = await asAdmin(client, team, body.user.id)
-    if (!s) return
-    delete s.key
-    delete s.keyHint
-    await save(team, s)
-    await publishHome(client, team, body.user.id)
-  })
   app.view('key_modal', async ({ ack, body, view, client, context }) => {
     const team = tenantOf(context)
     const s = await asAdmin(client, team, body.user.id)
@@ -2317,28 +2602,12 @@ export async function serveHosted(): Promise<App> {
   })
 
   // ---- MCP servers in the Home tab ----
-  app.action('mcp_oauth', async ({ ack }) => ack()) // a link: the browser does the rest
   app.action<BlockAction>(/^mcp_add_/, async ({ ack, body, action, client, context }) => {
     await ack()
     const id = (action as ButtonAction).value ?? ''
     if (CATALOG.find((x) => x.id === id)?.auth === 'oauth') return // a link too
     if (await asAdmin(client, tenantOf(context), body.user.id))
       await client.views.open({ trigger_id: body.trigger_id, view: connectModal(id) })
-  })
-  app.action<BlockAction>('mcp_allow', async ({ ack, body, action, client, context }) => {
-    await ack()
-    const team = tenantOf(context)
-    const c = (await connsOf(team)).find((x) => x.id === (action as ButtonAction).value)
-    if (c && (await asAdmin(client, team, body.user.id)))
-      await client.views.open({ trigger_id: body.trigger_id, view: allowModal(c) })
-  })
-  app.action<BlockAction>('mcp_off', async ({ ack, body, action, client, context }) => {
-    await ack()
-    const team = tenantOf(context)
-    if (!(await asAdmin(client, team, body.user.id))) return
-    const id = (action as ButtonAction).value
-    await editConns(team, (l) => l.filter((x) => x.id !== id))
-    await publishHome(client, team, body.user.id)
   })
   app.view('mcp_modal', async ({ ack, body, view, client, context }) => {
     const team = tenantOf(context)
@@ -2423,14 +2692,18 @@ export async function serveHosted(): Promise<App> {
       view: kept ? callsModal(kept) : noticeView("These tool calls weren't kept.")
     })
   })
-  app.action<BlockAction>('mcp_test', async ({ ack, body, action, client, context }) => {
-    await ack()
-    const team = tenantOf(context)
-    const id = (action as ButtonAction).value ?? ''
-    const view = await loading(client, body.trigger_id, 'Testing…')
+  // a server's Test, from its menu in Tools
+  async function testServerFor(
+    client: Client,
+    trigger: string,
+    team: string,
+    user: string,
+    id: string
+  ): Promise<void> {
+    const view = await loading(client, trigger, 'Testing…')
     if (!view) return
     const c = (await connsOf(team)).find((x) => x.id === id)
-    const no = !(await asAdmin(client, team, body.user.id))
+    const no = !(await asAdmin(client, team, user))
       ? 'Only workspace admins can test the tools.'
       : !c?.secret
         ? "That server isn't connected."
@@ -2444,7 +2717,7 @@ export async function serveHosted(): Promise<App> {
       r = { connected: false, tools: 0, usable: 0, error: msg(err) }
     }
     await client.views.update({ view_id: view, view: testModal(c.name, c.id, r) })
-  })
+  }
 
   // ---- personas ----
   app.action<BlockAction>('persona_edit', async ({ ack, body, action, client, context }) => {

@@ -28,3 +28,28 @@ for target in ('build/icon.png', 'resources/icon.png'):
     im.save(ROOT / target)
 im.save(ROOT / 'build/icon.ico', sizes=[(s, s) for s in (16, 24, 32, 48, 64, 128, 256)])
 im.save(ROOT / 'build/icon.icns')
+
+# The hosted Slack app's Home tab images (served at /icons/<name>.png): the mark, and a plain
+# monogram for each service it connects. Our own drawings in each service's colour, not their logos.
+from PIL import ImageFont
+ICONS = ROOT / 'src/main/icons'
+ICONS.mkdir(exist_ok=True)
+im.resize((256, 256), Image.Resampling.LANCZOS).save(ICONS / 'consortium.png', optimize=True)
+FONT = '/System/Library/Fonts/Supplemental/Arial Bold.ttf'
+for name, bg, fg, text in (
+    ('openrouter', '#6467f2', '#ffffff', 'OR'),
+    ('github', '#24292f', '#ffffff', 'GH'),
+    ('linear', '#5e6ad2', '#ffffff', 'L'),
+    ('datadog', '#632ca6', '#ffffff', 'D'),
+    ('sentry', '#362d59', '#ffffff', 'S'),
+    ('notion', '#ffffff', '#191a20', 'N'),
+    ('atlassian', '#0052cc', '#ffffff', 'A'),
+    ('custom', '#191a20', '#c5b8ee', '{ }'),
+):
+    S = 256
+    icon = Image.new('RGBA', (S, S))
+    d = ImageDraw.Draw(icon)
+    d.rounded_rectangle((0, 0, S - 1, S - 1), radius=56, fill=bg, outline='#d6d3de' if bg == '#ffffff' else None, width=6)
+    font = ImageFont.truetype(FONT, 150 if len(text) == 1 else 104)
+    d.text((S / 2, S / 2 + 4), text, font=font, fill=fg, anchor='mm')
+    icon.resize((64, 64), Image.Resampling.LANCZOS).save(ICONS / f'{name}.png', optimize=True)

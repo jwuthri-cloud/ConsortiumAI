@@ -25,6 +25,7 @@ import {
   DEFAULTS,
   SCOPES,
   askModal,
+  confirmModal,
   homeView,
   keyed,
   missingScopes,
@@ -282,25 +283,35 @@ test('scopes: an install without files:read gets a reinstall link, in the Home t
   assert.ok(modal.includes(`<${url}|Reinstall to enable files>`) && !modal.includes('file_input'))
 })
 
-test('the Home tab: GitHub for admins (connect, change, disconnect), hidden without the app', () => {
+test('the Home tab: GitHub in Tools for admins (connect, change, disconnect), hidden without the app', () => {
   const text = (v: types.HomeView): string => JSON.stringify(v)
-  const ids = (v: types.HomeView): string[] =>
-    v.blocks.flatMap((b) =>
-      b.type === 'actions' ? b.elements.map((e) => (e as { action_id: string }).action_id) : []
-    )
-  assert.ok(!text(homeView(DEFAULTS, true)).includes('GitHub'))
-  assert.ok(ids(homeView(DEFAULTS, false)).includes('home_ask')) // everyone can ask
+  const tools = { section: 'tools' as const }
+  assert.ok(!text(homeView(DEFAULTS, true, undefined, tools)).includes('GitHub'))
+  assert.match(text(homeView(DEFAULTS, false)), /"action_id":"home_ask"/) // everyone can ask
   const off = homeView(DEFAULTS, true, undefined, {
+    ...tools,
     github: { connect: 'https://c/github/connect?t=1' }
   })
-  assert.ok(text(off).includes('Not connected') && ids(off).includes('home_github'))
+  assert.match(text(off), /Not connected/)
+  assert.match(
+    text(off),
+    /"Connect GitHub"\},"value":"gh_connect","url":"https:\/\/c\/github\/connect\?t=1"/
+  )
   const on = homeView(DEFAULTS, true, undefined, {
+    ...tools,
     github: { connect: 'https://c/github/connect?t=1', account: 'acme', repos: 12 }
   })
   assert.ok(text(on).includes('`acme` · 12 repositories'))
-  assert.ok(ids(on).includes('home_github') && ids(on).includes('home_github_off'))
-  const member = homeView(DEFAULTS, false, undefined, { github: { account: 'acme', repos: 1 } })
-  assert.ok(text(member).includes('1 repository') && !ids(member).includes('home_github'))
+  assert.match(text(on), /"Change repositories"\},"url":"https:\/\/c\/github\/connect\?t=1"/)
+  assert.match(text(on), /"value":"gh_off"/)
+  const ask = confirmModal('gh_off')!
+  assert.equal(ask.callback_id, 'home_confirm')
+  assert.equal(ask.private_metadata, 'gh_off')
+  const member = homeView(DEFAULTS, false, undefined, {
+    ...tools,
+    github: { account: 'acme', repos: 1 }
+  })
+  assert.ok(text(member).includes('1 repository') && !text(member).includes('gh_'))
 })
 
 test('the ask form: valid blocks, the channel’s repository first, answers read back', () => {

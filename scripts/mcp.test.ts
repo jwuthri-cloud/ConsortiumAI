@@ -26,8 +26,11 @@ import { bridge, toolsLine, type Tenancy } from '../src/main/slack'
 import {
   DEFAULTS,
   allowModal,
+  SECTIONS,
   callsModal,
+  confirmModal,
   connectModal,
+  firstSentence,
   fromStore,
   homeView,
   keyed,
@@ -41,6 +44,7 @@ import {
   testModal,
   toolStatus,
   toolsAttached,
+  verbOf,
   type Settings
 } from '../src/main/hosted'
 import { seal } from '../src/main/store'
@@ -423,11 +427,21 @@ test('the Home tab: connections, their state, and Connect buttons for admins onl
     wiki: 'https://h/mcp/connect?t=1&s=wiki',
     notion: 'https://h/mcp/connect?t=1&s=notion'
   }
-  const admin = JSON.stringify(homeView(s, true, undefined, { tools: { conns, links } }))
-  assert.match(admin, /\*Linear\* · :white_check_mark: 2 of 3 tools usable/)
+  const view = (admin: boolean, section: 'tools' | 'table'): string =>
+    JSON.stringify(
+      homeView(s, admin, undefined, { section, icons: 'https://h/icons', tools: { conns, links } })
+    )
+  const admin = view(true, 'tools')
+  assert.match(admin, /"text":"\*Linear\*".*?"type":"overflow"/)
+  assert.match(admin, /"image_url":"https:\/\/h\/icons\/linear.png".*?2 of 3 tools usable/)
+  assert.match(admin, /"image_url":"https:\/\/h\/icons\/custom.png","alt_text":"Wiki"/)
   assert.match(admin, /Didn't connect last time: &lt;boom&gt;/)
-  assert.match(admin, /\*Wiki\* · :hourglass_flowing_sand: Not authorized yet/)
-  assert.match(admin, /"text":"Authorize".*?"url":"https:\/\/h\/mcp\/connect\?t=1&s=wiki"/)
+  assert.match(admin, /:hourglass_flowing_sand: Not authorized yet/)
+  assert.match(admin, /"Authorize"\},"url":"https:\/\/h\/mcp\/connect\?t=1&s=wiki"/)
+  assert.match(admin, /"Reconnect"\},"url":"https:\/\/h\/mcp\/connect\?t=1&s=linear"/)
+  for (const v of ['mcp_test:linear', 'mcp_allow:linear', 'mcp_off:linear', 'mcp_off:wiki'])
+    assert.ok(admin.includes(`"value":"${v}"`), v)
+  assert.ok(!admin.includes('mcp_test:wiki'), 'not authorized: nothing to test')
   assert.match(
     admin,
     /"action_id":"mcp_add_notion".*?"url":"https:\/\/h\/mcp\/connect\?t=1&s=notion"/
@@ -437,16 +451,23 @@ test('the Home tab: connections, their state, and Connect buttons for admins onl
     !admin.includes('mcp_add_linear') && !admin.includes('mcp_add_datadog'),
     'connected: no Connect'
   )
-  assert.match(admin, /The Skeptic · `a\/one` · \*chair\* · :hammer_and_wrench: no tools/)
-  assert.match(admin, /`b\/two` · :hammer_and_wrench: Linear, Datadog/)
+  assert.ok(!admin.includes('"style":"danger"'), 'no red buttons')
+  const table = view(true, 'table')
+  assert.match(table, /`a\/one`"\},\{"type":"mrkdwn","text":"no tools"/)
+  assert.match(table, /`b\/two`".*?linear.png.*?datadog.png.*?"Linear, Datadog"/)
   assert.ok(!admin.includes(linear.secret!) && !admin.includes('lin_oauth_SECRET'))
-  const member = JSON.stringify(homeView(s, false, undefined, { tools: { conns } }))
-  assert.ok(!member.includes('mcp_add_') && !member.includes('mcp_off'))
-  assert.match(member, /\*Linear\* · :white_check_mark:/)
+  const member = view(false, 'tools')
+  assert.ok(!member.includes('mcp_add_') && !member.includes('home_menu'))
+  assert.match(member, /2 of 3 tools usable/)
   assert.equal(
     toolStatus({ ...linear, allow: ['create_issue'] }),
     ':white_check_mark: 3 of 3 tools usable, 1 of them allowed by an admin'
   )
+  const off = confirmModal('mcp_off:linear', 'Linear')!
+  validView(off)
+  assert.match(JSON.stringify(off.blocks), /Disconnect \*Linear\*\?/)
+  assert.deepEqual(verbOf('mcp_off:my-server'), ['mcp_off', 'my-server'])
+  assert.equal(confirmModal('mcp_test:linear'), undefined, 'Test asks nothing')
 })
 
 test('connecting Datadog or a custom server, and the allowed tools', () => {
@@ -651,6 +672,37 @@ function slackValid(blocks: unknown[], title?: string): void {
     if (o.type === 'mrkdwn' || o.type === 'plain_text')
       assert.ok(String(o.text).length <= 3000, `${where}: text too long`)
     if (o.type === 'button' && o.value) assert.ok(String(o.value).length <= 2000, where)
+    if (o.type === 'button')
+      assert.ok((o.text as { text: string }).text.length <= 75, `${where}: button text`)
+    if (o.type === 'overflow') {
+      const opts = o.options as { value?: string; url?: string }[]
+      assert.ok(opts.length >= 1 && opts.length <= 5, `${where}: ${opts.length} overflow options`)
+      for (const x of opts) assert.ok(x.value && x.value.length <= 150, `${where}: option value`)
+    }
+    if (o.type === 'image') {
+      assert.match(String(o.image_url), /^https:\/\/.+\.png$/, where)
+      assert.ok(o.alt_text, `${where}: alt text`)
+    }
+    if (o.type === 'context')
+      assert.ok((o.elements as unknown[]).length <= 10, `${where}: context elements`)
+    if (o.type === 'actions')
+      assert.ok((o.elements as unknown[]).length <= 25, `${where}: actions elements`)
+    if (o.type === 'actions' || o.type === 'section') {
+      const ids = [
+        ...((o.elements as { action_id?: string }[]) ?? []),
+        o.accessory as { action_id?: string }
+      ]
+        .map((x) => x?.action_id)
+        .filter(Boolean)
+      assert.equal(new Set(ids).size, ids.length, `${where}: action_ids repeat in a block`)
+    }
+    if (o.confirm) {
+      const c = o.confirm as Record<string, { text: string }>
+      assert.ok(c.title.text.length <= 100 && c.text.text.length <= 300, `${where}: confirm`)
+      assert.ok(c.confirm.text.length <= 30 && c.deny.text.length <= 30, `${where}: confirm`)
+    }
+    if (o.type === 'modal')
+      assert.ok(!o.submit || (o.submit as { text: string }).text.length <= 24, where)
     if (o.type === 'plain_text_input' && o.initial_value && o.max_length)
       assert.ok(String(o.initial_value).length <= Number(o.max_length), `${where}: over its cap`)
     if ('value' in o && 'text' in o && typeof o.text === 'object' && o.type === undefined)
@@ -849,11 +901,12 @@ test("the Tool calls modal: every call within Slack's limits, nothing unescaped"
   assert.equal(first.match(/```/g)?.length, 4)
 })
 
-test('the Home tab: Personas and Test for admins, within Slack limits with everything connected', () => {
-  const s = fromStore({ ...DEFAULTS, lenses: { skeptic: 'Doubt <everything>.' } })
-  s.seats = [...s.seats, { model: 'x/y', persona: 'skeptic' }]
+test('the Home tab: every section valid, for admins and members, empty and fully set up', () => {
+  const full = fromStore({ ...DEFAULTS, key: 'v1.k', keyHint: 'sk-or-v1-…3f9a' })
+  full.lenses = { skeptic: 'Doubt <everything>. Then build.' }
+  full.seats = PERSONA_IDS.map((persona, i) => ({ model: `x/m${i}`, persona }))
   const conns: Connection[] = Array.from({ length: 10 }, (_, i) => ({
-    id: `s${i}`,
+    id: i < 5 ? ['linear', 'datadog', 'sentry', 'notion', 'atlassian'][i] : `s${i}`,
     name: `Server ${i}`,
     url: 'https://x',
     auth: i ? 'oauth' : 'headers',
@@ -863,23 +916,83 @@ test('the Home tab: Personas and Test for admins, within Slack limits with every
       { name: 'write', readOnly: false }
     ]
   }))
-  const more = {
+  const meetings = Array.from({ length: 7 }, (_, i) => ({
+    ts: `17000000${i}.0001`,
+    channel: 'C1',
+    user: i % 2 ? 'U1' : 'U2',
+    question: `Should we <ship> ${'x'.repeat(400)}?`,
+    link: `https://acme.slack.com/archives/C1/p${i}`,
+    state: (['running', 'decided', 'stopped', 'failed'] as const)[i % 4],
+    cost: i ? '$0.42' : '—',
+    at: 1_700_000_000_000 - i * 60_000
+  }))
+  const everything = {
     files: false,
     install: 'https://h/slack/install',
     github: { connect: 'https://h/gh', account: 'acme', repos: 3 },
-    tools: { conns, links: Object.fromEntries(conns.map((c) => [c.id, `https://h/${c.id}`])) }
+    tools: { conns, links: Object.fromEntries(conns.map((c) => [c.id, `https://h/${c.id}`])) },
+    icons: 'https://h/icons',
+    meetings,
+    viewer: 'U1'
   }
-  const admin = homeView(s, true, 'https://h/connect', more)
-  slackValid(admin.blocks)
-  const a = JSON.stringify(admin)
-  assert.equal(a.match(/"action_id":"persona_edit"/g)?.length, 6)
-  assert.equal(a.match(/"action_id":"mcp_test"/g)?.length, 10)
-  assert.match(a, /\*The Skeptic\* · _edited_\\n>Doubt &lt;everything&gt;\./)
-  assert.ok(a.includes(PERSONAS.strategist.lens), 'the others: their default')
-  assert.match(a, /4\. The Skeptic \(edited persona\) · `x\/y`/)
-  assert.match(a, /1\. The Strategist · `/)
-  const member = JSON.stringify(homeView(s, false, undefined, more))
-  assert.ok(!member.includes('persona_edit') && !member.includes('mcp_test'))
+  const empty = {
+    github: { connect: 'https://h/gh' },
+    tools: { conns: [] },
+    icons: 'https://h/icons'
+  }
+  for (const [s, more] of [
+    [full, everything],
+    [DEFAULTS, empty],
+    [DEFAULTS, {}]
+  ] as const)
+    for (const admin of [true, false])
+      for (const section of SECTIONS) {
+        const v = homeView(s, admin, admin ? 'https://h/connect' : undefined, { ...more, section })
+        slackValid(v.blocks)
+        const a = JSON.stringify(v)
+        assert.ok(!a.includes('"style":"danger"'), 'no red buttons')
+        assert.ok((a.match(/"style":"primary"/g) ?? []).length <= 1, 'one primary button')
+        assert.match(a, /"action_id":"home_ask"/)
+        assert.equal(a.match(/"action_id":"home_section_/g)?.length, 4)
+        assert.ok(
+          a.includes(
+            `● ${section === 'table' ? 'The table' : section[0].toUpperCase() + section.slice(1)}`
+          )
+        )
+        if (!admin) assert.ok(!/home_menu|persona_edit|home_table|mcp_add_/.test(a), section)
+      }
+  const at = (admin: boolean, section: (typeof SECTIONS)[number]): string =>
+    JSON.stringify(homeView(full, admin, 'https://h/connect', { ...everything, section }))
+  const personas = at(true, 'personas')
+  assert.equal(personas.match(/"action_id":"persona_edit"/g)?.length, 6)
+  assert.match(personas, /\*The Skeptic\* · _edited_\\nDoubt &lt;everything&gt;\."/)
+  assert.ok(personas.includes(firstSentence(PERSONAS.strategist.lens)))
+  assert.ok(!personas.includes(PERSONAS.strategist.lens), 'the full lens only in its modal')
+  assert.equal(at(true, 'tools').match(/"value":"mcp_test:/g)?.length, 10)
+  assert.match(at(true, 'table'), /:thinking_face: \*The Skeptic\* · _edited persona_/)
+  const overview = at(false, 'overview')
+  assert.match(overview, /Reinstall to enable files/)
+  assert.equal(overview.match(/acme\.slack\.com/g)?.length, 5, 'the last five')
+  assert.match(
+    overview,
+    /<https:\/\/acme\.slack\.com\/archives\/C1\/p1\|Should we &lt;ship&gt; x+…>/
+  )
+  assert.match(overview, /\|A question> from <@U2>/)
+  assert.ok(!overview.includes('Should we &lt;ship&gt; x+…> from'), "others' questions stay hidden")
+  assert.match(
+    overview,
+    /<#C1> · <!date\^1699999940\^\{date_short_pretty\} at \{time\}\|[^>]+> · :white_check_mark: decided · \$0\.42/
+  )
+  assert.ok(!overview.includes(':white_circle:'), 'all set up: no checklist')
+  const fresh = JSON.stringify(homeView(DEFAULTS, true, 'https://h/connect', empty))
+  assert.match(
+    fresh,
+    /:white_circle: OpenRouter key.*:white_circle: GitHub.*:white_circle: Tools.*:white_circle: Invite me to a channel/
+  )
+  assert.match(fresh, /"Connect OpenRouter"\},"url":"https:\/\/h\/connect"/)
+  assert.match(fresh, /_None yet\._/)
+  assert.match(fresh, /"image_url":"https:\/\/h\/icons\/consortium.png"/)
+  for (const v of ['key_forget', 'gh_off', 'mcp_off:linear']) validView(confirmModal(v, 'Linear')!)
 })
 
 test('the persona form: prefilled, capped, and Reset to the default', () => {
