@@ -62,8 +62,34 @@ import {
   type ToolCall,
   type Toolbox
 } from './mcp'
+import {
+  createIssues,
+  decisionTitle,
+  draftIssues,
+  footer,
+  issuesLine,
+  issuesModal,
+  linearLists,
+  linearOf,
+  nextActions,
+  once,
+  readIssues,
+  resultModal,
+  withFooter,
+  type IssuesMeta,
+  type IssuesRecord
+} from './issues'
 import { dataDir } from './paths'
-import { bridge, noticeView, openLoading, type MeetingLog, type Tenancy } from './slack'
+import {
+  UNAVAILABLE,
+  bridge,
+  noticeView,
+  openLoading,
+  type MeetingLog,
+  type Round,
+  type Tenancy,
+  type Thread
+} from './slack'
 import { derive, installations, openStore, seal, tenantOf, unseal } from './store'
 import * as pages from './pages'
 import { PERSONAS, PERSONA_IDS, makeLabels } from '../shared/personas'
@@ -187,6 +213,82 @@ export function settingsBrief(s: Settings, task: string): Brief {
   })
   return s.lenses ? { ...brief, lenses: s.lenses } : brief
 }
+
+// A follow-up's turn budget: half the table's, at least two a seat.
+export const followTurns = (s: Settings): number =>
+  Math.min(100, Math.max(2 * s.seats.length, Math.ceil(s.maxTurns / 2)))
+
+const BOARD_NOTES = [
+  ['agreed', 'Agreed'],
+  ['disputed', 'Disputed'],
+  ['questions', 'Open'],
+  ['actions', 'Actions']
+] as const
+
+// What a follow-up's table reads of the meetings before it in its thread: each one's question,
+// decision and final whiteboard, the most recent first, within `max` characters.
+export function earlierContext(rounds: Round[], max = 4000): string {
+  const head =
+    '## Earlier in this thread\nThis question follows up on the meeting above it in the same Slack thread. Build on what it settled; reopen a point only if the new question changes it. Most recent first:'
+  const parts = rounds
+    .map((r, i) => {
+      const board = r.board
+        ? BOARD_NOTES.flatMap(([k, title]) => {
+            const notes = r.board?.[k] ?? []
+            return notes.length
+              ? [
+                  `${title}: ${notes
+                    .slice(0, 8)
+                    .map((n) => shorten(n.text, 200))
+                    .join('; ')}`
+                ]
+              : []
+          })
+        : []
+      return [
+        `### ${i ? `Follow-up ${i}` : 'The first meeting'}: ${shorten(r.question, 300)}`,
+        r.decision
+          ? `Decision:\n${clipLines(r.decision, 2500)}`
+          : `It ${r.state === 'failed' ? 'failed' : 'was stopped'} before a decision.`,
+        board.length ? `Final whiteboard:\n${clipLines(board.join('\n'), 1200)}` : ''
+      ]
+        .filter(Boolean)
+        .join('\n')
+    })
+    .reverse()
+  let out = head
+  for (const [i, p] of parts.entries()) {
+    const room = max - out.length - 2 - 40 // the "left out" line's room
+    if (room < 300) {
+      out += `\n\n(${parts.length - i} earlier meeting${parts.length - i > 1 ? 's' : ''} left out.)`
+      break
+    }
+    out += `\n\n${clipLines(p, room)}`
+  }
+  return out
+}
+
+// `t` cut to `max` characters, its lines kept
+const clipLines = (t: string, max: number): string =>
+  t.length > max ? `${t.slice(0, max - 1).trimEnd()}…` : t
+
+// A thread's record with a meeting that just ended in it (again: the same id replaced).
+export const addRound = (
+  had: Thread | undefined,
+  where: Omit<Thread, 'rounds'>,
+  r: Round
+): Thread => ({
+  ...where,
+  rounds: [...(had?.rounds ?? []).filter((x) => x.id !== r.id), r]
+})
+
+// The parts of a Slack file a follow-up needs to fetch it again
+const fileRef = (f: SlackFile): SlackFile =>
+  Object.fromEntries(
+    (['id', 'name', 'title', 'mimetype', 'size', 'url_private', 'url_private_download'] as const)
+      .filter((k) => f[k] != null)
+      .map((k) => [k, f[k]])
+  ) as SlackFile
 
 // `d` is one of `roots` or inside one
 const inside = (d: string, roots: string[]): boolean =>
@@ -882,7 +984,7 @@ function overviewBlocks(
       ? meetings.flatMap((m) => meetingBlocks(m, more.viewer))
       : [context('_None yet._')]),
     context(
-      "In a channel I'm in: `/consortium <question>`, or mention @Consortium (attach files to the mention). Reply in the thread to steer the meeting."
+      "In a channel I'm in: `/consortium <question>`, or mention @Consortium (attach files to the mention). Reply in the thread to steer the meeting; once it has ended, mention @Consortium there or press Ask a follow-up to continue it."
     ),
     { type: 'divider' },
     section(
@@ -1437,6 +1539,7 @@ export function repoOptions(
 // tab's New question too). `question`: what they typed; `repos`: what the repository select lists
 // (unset = no select), `repo` its first pick; `files`: the install reads files (else `install`,
 // the reinstall link); `note`: a line under the repository.
+// `follow`: Ask a follow-up's thread; it runs there when the channel stays the thread's.
 export function askModal(o: {
   channel?: string
   question?: string
@@ -1445,15 +1548,24 @@ export function askModal(o: {
   files: boolean
   install: string
   note?: string
+  follow?: string
 }): types.ModalView {
   const repos = o.repos && repoOptions(o.repos, o.repo)
   return {
     type: 'modal',
     callback_id: 'ask_modal',
-    title: plain('Ask the table'),
+    title: plain(o.follow ? 'Ask a follow-up' : 'Ask the table'),
     submit: plain('Start'),
     close: plain('Cancel'),
+    ...(o.follow && { private_metadata: JSON.stringify({ thread: o.follow, channel: o.channel }) }),
     blocks: [
+      ...(o.follow
+        ? [
+            context(
+              'The table continues in the same thread: it reads the question, decision and whiteboard of the meeting above, with the same repository and files.'
+            )
+          ]
+        : []),
       {
         type: 'input',
         block_id: 'question',
@@ -1462,7 +1574,9 @@ export function askModal(o: {
           type: 'plain_text_input',
           action_id: 'question',
           multiline: true,
-          placeholder: plain('What should the table decide?'),
+          placeholder: plain(
+            o.follow ? 'What should the table look at next?' : 'What should the table decide?'
+          ),
           ...(o.question && { initial_value: o.question.slice(0, 3000) })
         }
       },
@@ -1722,6 +1836,9 @@ export async function serveHosted(): Promise<App> {
       [row, ...rows.filter((x) => x.ts !== r.ts)].sort((a, b) => b.at - a.at).slice(0, RECENT)
     )
   }
+  // a thread's ended meetings, for its follow-ups
+  const threadOf = (team: string, ts: string): Promise<Thread | undefined> =>
+    store.get<Thread>('threads', `${team}:${ts}`)
   // the servers the Edit table offers each seat: the authorized ones
   const serversOf = async (team: string): Promise<{ id: string; name: string }[]> =>
     (await connsOf(team)).filter((c) => c.secret).map(({ id, name }) => ({ id, name }))
@@ -1862,10 +1979,17 @@ export async function serveHosted(): Promise<App> {
       const s = await load(team)
       const key = await liveKey(team, s)
       const asked = repoPrefix(question)
-      const files = x.files ?? []
+      // a follow-up: the thread's earlier meetings, their repository and files
+      const prior = x.thread ? await threadOf(team, x.thread) : undefined
+      if (x.thread && !prior) throw new Error(UNAVAILABLE)
+      const files = [...(prior?.files ?? []), ...(x.files ?? []).map(fileRef)].filter(
+        (f, i, all) => !f.id || all.findIndex((g) => g.id === f.id) === i
+      )
       if (files.length && !(await readsFiles(team))) throw new Error(reinstallNeeded(reinstall))
       const link = await linkOf(team)
-      const named = x.repo !== undefined ? x.repo : asked.repo // undefined: the channel's usual
+      // undefined: the channel's usual
+      const named =
+        x.repo !== undefined ? x.repo : asked.repo !== undefined ? asked.repo : prior?.repo
       let repo =
         named !== undefined ? named : link ? ((await lastRepos(team))[channel] ?? null) : null
       if (repo && !link)
@@ -1932,8 +2056,10 @@ export async function serveHosted(): Promise<App> {
             [channel]: named ?? undefined
           })
         const dir = teamDir(team)
+        const task = withImages(asked.text, got)
         const brief: Brief = {
-          ...settingsBrief(s, withImages(asked.text, got)),
+          ...settingsBrief(s, prior ? `${task}\n\n${earlierContext(prior.rounds)}` : task),
+          ...(prior && { maxTurns: followTurns(s) }),
           attachments: attachments.length ? attachments : undefined,
           projectPath
         }
@@ -1964,13 +2090,31 @@ export async function serveHosted(): Promise<App> {
           return id
         }
         const log = (r: MeetingLog): Promise<void> => logMeeting(team, r)
-        return { brief, run, dir, question: asked.text, attached, done, calls, log }
+        // ponytail: read, change, write like logMeeting; one meeting runs in a thread at a time
+        const record = async (thread: string, r: Round): Promise<void> => {
+          const id = `${team}:${thread}`
+          const had = await store.get<Thread>('threads', id)
+          await store.put('threads', id, addRound(had, { channel, repo, files }, r))
+        }
+        return {
+          brief,
+          run,
+          dir,
+          question: asked.text,
+          attached,
+          done,
+          calls,
+          log,
+          record,
+          ...(prior && { follow: prior.rounds.length }),
+          issues: !!linearOf(await connsOf(team))
+        }
       } catch (err) {
         done()
         throw err
       }
     },
-    ask: async ({ team, client, user, channel, view, question, files, thread }) => {
+    ask: async ({ team, client, user, channel, view, question, files, thread, follow }) => {
       const link = await linkOf(team)
       const pre = question === undefined ? undefined : repoPrefix(question)
       // a mention with no repository to pick, or one picked with repo:, starts at once
@@ -1991,11 +2135,13 @@ export async function serveHosted(): Promise<App> {
             "GitHub didn't answer with the repository list: run /consortium again to see it all."
         else if (pre?.repo && !names.includes(pre.repo)) note = unreadable(pre.repo, names)
       }
-      const repo = !link
-        ? null
-        : pre?.repo !== undefined
-          ? pre.repo
-          : preselect(question, repos ?? [], last)
+      const repo = follow
+        ? follow.repo
+        : !link
+          ? null
+          : pre?.repo !== undefined
+            ? pre.repo
+            : preselect(question, repos ?? [], last)
       if (view) {
         // the loading form, opened in time by the caller, becomes the real one (no deadline now)
         const fill = (files: boolean): Promise<unknown> =>
@@ -2008,7 +2154,8 @@ export async function serveHosted(): Promise<App> {
               repo,
               files,
               install: reinstall,
-              note
+              note,
+              ...(follow && { follow: follow.thread })
             })
           })
         try {
@@ -2052,6 +2199,7 @@ export async function serveHosted(): Promise<App> {
       })
       return true
     },
+    thread: (team, ts) => threadOf(team, ts),
     attach: async (team, client, files, question) => {
       if (!(await readsFiles(team))) throw new Error(reinstallNeeded(reinstall))
       const s = await load(team)
@@ -2069,7 +2217,8 @@ export async function serveHosted(): Promise<App> {
     forget: async (team) => {
       for (const kind of ['installation', 'settings', 'github', 'channel-repos', 'mcp', 'meetings'])
         await store.del(kind, team)
-      await store.drop('tool-calls', `${team}:`)
+      for (const kind of ['tool-calls', 'threads', 'linear-issues'])
+        await store.drop(kind, `${team}:`)
       rmSync(teamDir(team), { recursive: true, force: true })
     }
   }
@@ -2546,9 +2695,14 @@ export async function serveHosted(): Promise<App> {
       respond
         ? respond({ response_type: 'ephemeral', text })
         : client.chat.postMessage({ channel: user, text })
+    // Ask a follow-up: in its thread, unless they picked another channel
+    const follow = view.private_metadata
+      ? (JSON.parse(view.private_metadata) as { thread: string; channel: string })
+      : undefined
     await start(tenantOf(context), client, r.channel, user, r.question, say, {
       files: r.files,
-      repo: r.repo
+      repo: r.repo,
+      ...(follow?.channel === r.channel && { thread: follow.thread })
     })
   })
   app.action<BlockAction>('home_table', async ({ ack, body, client, context }) => {
@@ -2717,6 +2871,134 @@ export async function serveHosted(): Promise<App> {
       r = { connected: false, tools: 0, usable: 0, error: msg(err) }
     }
     await client.views.update({ view_id: view, view: testModal(c.name, c.id, r) })
+  }
+
+  // ---- a decision's actions as Linear issues ----
+  const LINEAR =
+    "Linear isn't connected with a tool that creates issues. An admin connects it in Consortium's Home tab → Tools."
+  app.action<BlockAction>('linear_issues', async ({ ack, body, action, client, context }) => {
+    await ack()
+    const team = tenantOf(context)
+    const user = body.user.id
+    const view = await loading(client, body.trigger_id, 'Drafting the issues…')
+    if (!view) return
+    const show = (v: types.ModalView): Promise<unknown> =>
+      client.views.update({ view_id: view, view: v })
+    const [thread, id] = verbOf((action as ButtonAction).value ?? '')
+    const no = await tenancy.refuse(team, user, client)
+    if (no) return void (await show(noticeView(no)))
+    const done = await store.get<IssuesRecord>('linear-issues', `${team}:${id}`)
+    if (done) return void (await show(resultModal(done)))
+    const r = await threadOf(team, thread)
+    const round = r?.rounds.find((x) => x.id === id)
+    if (!r || !round?.decision)
+      return void (await show(
+        noticeView("This decision wasn't kept, so its issues can't be drafted.")
+      ))
+    const c = linearOf(await connsOf(team))
+    if (!c) return void (await show(noticeView(LINEAR)))
+    try {
+      const s = await load(team)
+      const key = await liveKey(team, s)
+      const name = await client.users
+        .info({ user })
+        .then((u) => u.user?.profile?.real_name || u.user?.real_name || u.user?.name)
+        .catch(() => undefined)
+      const decision = decisionTitle(round.decision)
+      const foot = footer({ decision, link: round.link, by: name ?? `<@${user}>` })
+      const actions = [
+        ...nextActions(round.decision),
+        ...(round.board?.actions ?? []).map((n) => n.text)
+      ]
+      const [drafts, lists] = await Promise.all([
+        draftIssues({
+          key,
+          model: s.clerk,
+          question: round.question,
+          decision: round.decision,
+          actions
+        }),
+        credentials(team, c).then((sec) => linearLists({ url: c.url, headers: headersOf(sec) }))
+      ])
+      if (!drafts.length)
+        return void (await show(noticeView('The decision lists no actions to turn into issues.')))
+      if (!lists.teams.length)
+        return void (await show(
+          noticeView(
+            `Linear didn't list any team to put the issues in${lists.error ? `: ${mrk(lists.error)}` : '.'}`
+          )
+        ))
+      const meta = { thread, id, channel: r.channel, message: body.message?.ts ?? '' }
+      await show(
+        issuesModal({ drafts: drafts.map((d) => withFooter(d, foot)), ...lists, meta, decision })
+      )
+    } catch (err) {
+      await show(noticeView(`Couldn't draft the issues: ${mrk(msg(err))}`))
+    }
+  })
+  app.view('issues_modal', async ({ ack, body, view, client, context }) => {
+    const team = tenantOf(context)
+    const user = body.user.id
+    const meta = JSON.parse(view.private_metadata) as IssuesMeta
+    const r = readIssues(view.state.values as Values, meta.n)
+    if ('errors' in r) return void (await ack({ response_action: 'errors', errors: r.errors }))
+    const no = await tenancy.refuse(team, user, client)
+    if (no) return void (await ack({ response_action: 'errors', errors: { team: no } }))
+    const c = linearOf(await connsOf(team))
+    if (!c) return void (await ack({ response_action: 'errors', errors: { team: LINEAR } }))
+    const n = r.drafts.length
+    await ack({
+      response_action: 'update',
+      view: noticeView(`:hourglass_flowing_sand: Creating ${n} issue${n > 1 ? 's' : ''} in Linear…`)
+    })
+    const show = (v: types.ModalView): Promise<unknown> =>
+      client.views.update({ view_id: body.view.id, view: v })
+    let made: { rec: IssuesRecord; fresh: boolean }
+    try {
+      made = await once(store, `${team}:${meta.id}`, user, async () => {
+        const sec = await credentials(team, c)
+        return createIssues({ url: c.url, headers: headersOf(sec) }, r.drafts, r.team, r.project)
+      })
+    } catch (err) {
+      return void (await show(
+        noticeView(`Linear didn't connect, so nothing was created: ${mrk(msg(err))}`)
+      ))
+    }
+    await show(resultModal(made.rec))
+    if (!made.fresh) return // someone else's run already said so in the thread
+    const line = issuesLine(made.rec)
+    await client.chat
+      .postMessage({ channel: meta.channel, thread_ts: meta.thread, text: line })
+      .catch((err) => console.error('slack: issues not posted:', msg(err)))
+    await usedButton(client, meta, line).catch((err) =>
+      console.error('slack: the Linear button stays:', msg(err))
+    )
+  })
+  // The decision's Create Linear issues goes once used: what it made, in its place.
+  async function usedButton(client: Client, meta: IssuesMeta, line: string): Promise<void> {
+    if (!meta.message) return
+    const r = await client.conversations.replies({
+      channel: meta.channel,
+      ts: meta.thread,
+      oldest: meta.message,
+      inclusive: true,
+      limit: 5
+    })
+    const m = r.messages?.find((x) => x.ts === meta.message)
+    if (!m?.blocks) return
+    const blocks = (m.blocks as types.KnownBlock[]).flatMap((b): types.KnownBlock[] => {
+      if (b.type !== 'actions') return [b]
+      const elements = b.elements.filter(
+        (e) => !('action_id' in e) || e.action_id !== 'linear_issues'
+      )
+      return elements.length ? [{ ...b, elements }] : []
+    })
+    await client.chat.update({
+      channel: meta.channel,
+      ts: meta.message,
+      text: m.text ?? '',
+      blocks: [...blocks, context(line)]
+    })
   }
 
   // ---- personas ----

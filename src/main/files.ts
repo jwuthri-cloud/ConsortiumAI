@@ -95,7 +95,7 @@ type Chat = {
 }
 type Annotation = { type?: string; file?: { content?: { type?: string; text?: string }[] } }
 
-async function chat(key: string, body: object, ms: number): Promise<Chat> {
+export async function chat(key: string, body: object, ms: number): Promise<Chat> {
   const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },

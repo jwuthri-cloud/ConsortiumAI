@@ -192,7 +192,7 @@ const timeout = <T>(p: Promise<T>, ms: number, what: string): Promise<T> =>
   ])
 
 // A server, connected, and every tool it lists.
-async function connect(
+export async function connect(
   s: Pick<Open, 'url' | 'headers'>,
   fetchFn: FetchLike,
   ms: number

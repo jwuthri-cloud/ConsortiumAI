@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
-import { App, type BlockAction, type types } from '@slack/bolt'
+import { App, type BlockAction, type ButtonAction, type types } from '@slack/bolt'
 import * as debate from './debate'
 import { ENDED, SILENT, toBrief } from './api'
 import { killAll, type runMember } from './cli'
@@ -113,6 +113,8 @@ export type BoardView = {
   note?: string // mrkdwn under the footer: the decision's link, or why it failed
   canvas?: string // the whiteboard canvas's URL; without one the root carries the whole board
   attached?: string // mrkdwn: the repository and files the table reads, and what was left out
+  follow?: number // a follow-up: its number in the thread (1 for the first)
+  thread?: string // where an ended meeting's Ask a follow-up continues (hosted); unset: no button
 }
 
 const footer = (v: BoardView): string =>
@@ -130,6 +132,13 @@ export function boardBlocks(v: BoardView): Block[] {
       type: 'header',
       text: { type: 'plain_text', text: cut(oneLine(v.question), 150) }
     },
+    ...(v.follow
+      ? [
+          context(
+            `:leftwards_arrow_with_hook: Follow-up ${v.follow} · builds on what the table said above`
+          )
+        ]
+      : []),
     ...(v.attached ? [context(v.attached)] : [])
   ]
   const b = v.board
@@ -155,6 +164,9 @@ export function boardBlocks(v: BoardView): Block[] {
       button('conclude', 'Conclude'),
       button('stop', 'Stop', 'danger')
     )
+  // a decision's own message has the button; a meeting that ended without one, its board
+  if (v.thread && (v.state === 'stopped' || v.state === 'failed'))
+    elements.push({ ...button('follow_up', 'Ask a follow-up'), value: v.thread })
   if (elements.length) blocks.push({ type: 'actions', elements })
   return blocks
 }
@@ -242,7 +254,8 @@ type Live = {
   text: string
   activity: string
   model?: string // shown in the footer; the CLI may report the real one after the turn starts
-  final?: { body: string; foot: string; calls?: string } // calls: what its Tool calls button opens
+  // calls: what its Tool calls button opens; buttons: the decision's (Ask a follow-up, Linear)
+  final?: { body: string; foot: string; calls?: string; buttons?: types.Button[] }
 }
 
 function liveMessage(l: Live): { text: string; blocks: Block[] } {
@@ -253,18 +266,11 @@ function liveMessage(l: Live): { text: string; blocks: Block[] } {
   const blocks: Block[] = []
   if (body) blocks.push({ type: 'markdown', text: cut(body, BODY) })
   if (foot) blocks.push(context(foot))
-  if (l.final?.calls)
-    blocks.push({
-      type: 'actions',
-      elements: [
-        {
-          type: 'button',
-          action_id: 'tool_calls',
-          text: { type: 'plain_text', text: 'Tool calls' },
-          value: l.final.calls
-        }
-      ]
-    })
+  const elements: types.Button[] = [
+    ...(l.final?.calls ? [{ ...button('tool_calls', 'Tool calls'), value: l.final.calls }] : []),
+    ...(l.final?.buttons ?? [])
+  ]
+  if (elements.length) blocks.push({ type: 'actions', elements })
   return { text: cut(body || foot, 300), blocks }
 }
 
@@ -275,8 +281,10 @@ type Meeting = {
   team: string // the workspace it runs for; only that workspace's events reach it
   client: Client // that workspace's bot
   channel: string
-  ts: string // the root message, which is also the thread
-  link: string
+  ts: string // the thread: the root message, or the one a follow-up continues
+  board: string // the message with the board and the controls: the root, or a follow-up's header
+  link: string // its permalink
+  at: number
   labels: Record<string, string>
   personas: Record<string, PersonaId>
   models: Record<string, string | undefined> // member id → the model it runs, for display
@@ -290,6 +298,10 @@ type Meeting = {
   done?: () => void // once it has ended: what convene set up for it goes
   calls?: Convened['calls']
   log?: () => Promise<void>
+  record?: Convened['record']
+  recorded?: boolean
+  issues?: boolean
+  decision?: string // the chair's document, once written
 }
 
 function config(): SlackConfig {
@@ -356,17 +368,22 @@ export type Tenancy = {
     question?: string
     files?: SlackFile[]
     thread?: string
+    follow?: { thread: string; repo: string | null } // Ask a follow-up: the form on its thread
   }): Promise<boolean>
   // files posted in a meeting's thread, as text for the host's message (hosted); throws what to tell them
   attach?(team: string, client: Client, files: SlackFile[], question: string): Promise<string>
+  // A thread's ended meetings (hosted), what its follow-ups build on; undefined: none kept
+  thread?(team: string, ts: string): Promise<Thread | undefined>
 }
 // What came with the question: the meeting's id (picked before it starts), the files attached,
-// and the repository: a full name, null for none, unset for the channel's usual.
+// and the repository: a full name, null for none, unset for the channel's usual. `thread`: the
+// thread it follows up in.
 export type Extra = {
   id: string
   client: Client
   files?: SlackFile[]
   repo?: string | null
+  thread?: string
   say(text: string): Promise<unknown>
 }
 export type Convened = {
@@ -381,6 +398,9 @@ export type Convened = {
   calls?: (who: string, title: string) => Promise<string | undefined>
   // The meeting as it stands, once it starts and once it ends (hosted: the Home tab's Recent meetings)
   log?: (r: MeetingLog) => Promise<void>
+  follow?: number // a follow-up: its number in the thread
+  record?: (thread: string, r: Round) => Promise<void> // once it has ended, for its follow-ups
+  issues?: boolean // the decision gets Create Linear issues
 }
 // `user`: who asked. `link`: the root message's permalink. `cost`: as its footer says it.
 export type MeetingLog = {
@@ -392,6 +412,34 @@ export type MeetingLog = {
   state: BoardView['state']
   cost: string
 }
+
+// A meeting that ended, as its thread's follow-ups need it (hosted: store kind 'threads').
+export type Round = {
+  id: string // the meeting's
+  question: string
+  state: BoardView['state']
+  decision?: string // the chair's document, without its sources and appendix
+  board?: Pick<Whiteboard, 'recommendation' | (typeof NOTES)[number][0]>
+  link: string // its board message's permalink
+  note?: string // the decision's link (mrkdwn), or why it failed
+  cost: string
+  at: number // started
+  ended: number
+}
+// A thread's meetings: where, the repository and files they read, and each meeting, oldest first.
+export type Thread = {
+  channel: string
+  repo: string | null
+  files: SlackFile[]
+  rounds: Round[]
+}
+
+// The chair's document without what the engine appends (sources, votes, panel).
+export const decisionBody = (md: string): string =>
+  md.split(/\n## Sources\n|\n---\n+## Final votes/)[0].trim()
+
+export const UNAVAILABLE =
+  'This meeting ended before Consortium kept what a follow-up needs, so the earlier context isn’t available here.'
 
 // One workspace: slack.json, re-read on each use.
 const local = (run?: typeof runMember): Tenancy => ({
@@ -421,7 +469,7 @@ export type Start = (
   user: string,
   text: string,
   say: (text: string) => Promise<unknown>,
-  more?: Pick<Extra, 'files' | 'repo'>
+  more?: Pick<Extra, 'files' | 'repo' | 'thread'>
 ) => Promise<void>
 
 // Meetings in threads, for whichever workspaces `app` serves. Returns how to start one.
@@ -458,7 +506,7 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
   const rootUpdate = (m: Meeting): Promise<unknown> =>
     m.client.chat.update({
       channel: m.channel,
-      ts: m.ts,
+      ts: m.board,
       text: m.view.question,
       blocks: boardBlocks(m.view)
     })
@@ -607,7 +655,14 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
       case 'consortium': {
         const chair = [...m.live.keys()].findLast((k) => k.endsWith(':0'))
         const draft = chair && m.live.get(chair)
-        if (draft) draft.final = { body: e.markdown, foot: '' }
+        m.decision = e.markdown
+        const buttons: types.Button[] = [
+          ...(t.thread ? [{ ...button('follow_up', 'Ask a follow-up'), value: m.ts }] : []),
+          ...(m.issues
+            ? [{ ...button('linear_issues', 'Create Linear issues'), value: `${m.ts}:${m.id}` }]
+            : [])
+        ]
+        if (draft) draft.final = { body: e.markdown, foot: '', buttons }
         if (chair) keep(m, chair, 'chair', 'The decision')
         if (chair) renderTurn(m, chair, true)
         m.view.state = 'decided'
@@ -634,7 +689,57 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
       meetings.delete(slot(m.team, m.ts))
       m.done?.()
       void m.log?.()
+      q(m, () => finish(m)) // after the decision's link is in
     }
+  }
+
+  // What its follow-ups need, kept once it has ended (hosted)
+  const finish = async (m: Meeting): Promise<void> => {
+    if (!m.record || m.recorded) return
+    m.recorded = true
+    const b = m.view.board
+    await m
+      .record(m.ts, {
+        id: m.id,
+        question: m.view.question,
+        state: m.view.state,
+        ...(m.decision && { decision: decisionBody(m.decision) }),
+        ...(b && {
+          board: {
+            recommendation: b.recommendation,
+            ...Object.fromEntries(NOTES.map(([k]) => [k, b[k]]))
+          } as Round['board']
+        }),
+        link: m.link,
+        ...(m.view.note && { note: m.view.note }),
+        cost: fmtUsd(sumUsage(Object.values(m.view.usage ?? {}))),
+        at: m.at,
+        ended: Date.now()
+      })
+      .catch((e) => console.error('slack: meeting not kept for follow-ups:', slackError(e)))
+  }
+
+  // The thread's root says how many follow-ups it has, and links the latest.
+  const noteRoot = async (m: Meeting, n: number): Promise<void> => {
+    const root = (await m.client.conversations.replies({ channel: m.channel, ts: m.ts, limit: 1 }))
+      .messages?.[0]
+    if (!root?.blocks) return
+    const note: Block = {
+      type: 'context',
+      block_id: 'follow_ups',
+      elements: [
+        {
+          type: 'mrkdwn',
+          text: `:leftwards_arrow_with_hook: ${n} follow-up${n > 1 ? 's' : ''} in the thread${m.link ? ` · <${m.link}|the latest>` : ''}`
+        }
+      ]
+    }
+    await m.client.chat.update({
+      channel: m.channel,
+      ts: m.ts,
+      text: root.text ?? m.view.question,
+      blocks: [...(root.blocks as Block[]).filter((b) => b.block_id !== 'follow_ups'), note]
+    })
   }
 
   // The live whiteboard as a canvas the channel can read. Without canvases (a plan without them,
@@ -702,6 +807,10 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
       ))
     const question = unmention(text)
     if (!question) return void (await say('Usage: `/consortium [preset:] <question>`'))
+    if (more.thread && meetings.has(slot(team, more.thread)))
+      return void (await say(
+        'A meeting is already running in this thread: reply there to steer it.'
+      ))
     starting.set(team, (starting.get(team) ?? 0) + 1) // counted before the first await, so starts at once can't pass the limit
     try {
       const id = randomUUID()
@@ -718,7 +827,9 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
         client,
         channel,
         ts: '',
+        board: '',
         link: '',
+        at: Date.now(),
         labels: makeLabels(brief.members),
         personas: Object.fromEntries(brief.members.map((x) => [x.id, x.persona])),
         models: Object.fromEntries(brief.members.map((x) => [x.id, memberModel(x)])),
@@ -728,22 +839,29 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
           turn: 0,
           maxTurns: brief.maxTurns,
           state: 'running',
-          attached: c.attached
+          attached: c.attached,
+          ...(c.follow && { follow: c.follow })
         },
         live: new Map(),
         chain: Promise.resolve(),
         timers: new Map(),
         done: c.done,
-        calls: c.calls
+        calls: c.calls,
+        record: c.record,
+        issues: c.issues
       }
       try {
-        const root = await client.chat.postMessage({
+        // a follow-up's board goes in its thread, under a header of its own
+        const posted = await client.chat.postMessage({
           channel,
+          ...(more.thread && { thread_ts: more.thread }),
           text: m.view.question,
           blocks: boardBlocks(m.view)
         })
-        m.ts = root.ts!
-        m.link = (await client.chat.getPermalink({ channel, message_ts: m.ts })).permalink ?? ''
+        m.board = posted.ts!
+        m.ts = more.thread ?? m.board
+        if (t.thread) m.view.thread = m.ts
+        m.link = (await client.chat.getPermalink({ channel, message_ts: m.board })).permalink ?? ''
       } catch (e) {
         c.done?.()
         return void (await say(
@@ -756,7 +874,7 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
         log &&
         (() =>
           log({
-            ts: m.ts,
+            ts: m.board,
             channel,
             user,
             question: m.view.question,
@@ -765,6 +883,7 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
             cost: fmtUsd(sumUsage(Object.values(m.view.usage ?? {})))
           }).catch((e) => console.error('slack: meeting not logged:', slackError(e))))
       void m.log?.()
+      if (c.follow) q(m, () => noteRoot(m, c.follow!))
       q(m, () => whiteboard(m))
       debate.runDebate(brief, (e) => send(m, e), m.id, undefined, run, SILENT, dir)
     } finally {
@@ -815,16 +934,125 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
     await start(team, client, channel, user, command.text, say)
   })
 
+  // A question as a mention asks it: the tenancy's picker first, when there is one.
+  const fresh = async (
+    team: string,
+    client: Client,
+    channel: string,
+    user: string,
+    text: string,
+    say: (text: string) => Promise<unknown>,
+    files?: SlackFile[],
+    thread?: string
+  ): Promise<void> => {
+    const question = unmention(text)
+    const o = { team, client, user, channel, thread }
+    if (question && (await asked({ ...o, question, files }, say))) return
+    await start(team, client, channel, user, text, say, { files })
+  }
+  // A thread's ended meetings, when they were in this channel
+  const earlier = async (
+    team: string,
+    channel: string,
+    ts: string
+  ): Promise<Thread | undefined> => {
+    const r = await t.thread?.(team, ts)
+    return r?.channel === channel ? r : undefined
+  }
+  // the thread's root is this bot's: a meeting's, from before follow-ups were kept
+  const ours = async (
+    client: Client,
+    channel: string,
+    ts: string,
+    bot?: string
+  ): Promise<boolean> =>
+    !!bot &&
+    (await client.conversations
+      .replies({ channel, ts, limit: 1 })
+      .then((r) => r.messages?.[0]?.bot_id === bot)
+      .catch(() => false))
+
   app.event('app_mention', async ({ event, client, context }) => {
     const team = tenantOf(context)
     // a mention inside a running meeting's thread is a steer: the message listener has it
     if (!event.user || (event.thread_ts && meetings.has(slot(team, event.thread_ts)))) return
     const say = ephemeral(client, event.channel, event.user, event.thread_ts)
-    const question = unmention(event.text)
-    const o = { team, client, user: event.user, channel: event.channel, thread: event.thread_ts }
-    if (question && (await asked({ ...o, question, files: event.files }, say))) return
-    await start(team, client, event.channel, event.user, event.text, say, { files: event.files })
+    const thread = event.thread_ts
+    // in an ended meeting's thread: a follow-up, there
+    if (thread && t.thread) {
+      if (await earlier(team, event.channel, thread))
+        return start(team, client, event.channel, event.user, event.text, say, {
+          files: event.files,
+          thread
+        })
+      const question = unmention(event.text)
+      if (question && (await ours(client, event.channel, thread, context.botId)))
+        return void (await client.chat.postEphemeral({
+          channel: event.channel,
+          user: event.user,
+          thread_ts: thread,
+          text: UNAVAILABLE,
+          blocks: [
+            {
+              type: 'section',
+              text: {
+                type: 'mrkdwn',
+                text: `${UNAVAILABLE} Start fresh, and the table takes your question as a new meeting in the channel.`
+              }
+            },
+            {
+              type: 'actions',
+              elements: [{ ...button('fresh_start', 'Start fresh'), value: cut(question, 2000) }]
+            }
+          ]
+        }))
+    }
+    await fresh(team, client, event.channel, event.user, event.text, say, event.files, thread)
   })
+
+  // the offer above: the question as a new meeting
+  app.action<BlockAction>(
+    'fresh_start',
+    async ({ ack, body, action, client, context, respond }) => {
+      await ack()
+      const channel = body.channel?.id
+      if (!channel) return
+      await respond({ delete_original: true }).catch(() => {})
+      const thread = body.container?.thread_ts as string | undefined
+      const say = ephemeral(client, channel, body.user.id, thread)
+      const text = (action as ButtonAction).value ?? ''
+      await fresh(tenantOf(context), client, channel, body.user.id, text, say, undefined, thread)
+    }
+  )
+
+  // Ask a follow-up: the form on the thread's channel and repository
+  if (t.thread && t.ask)
+    app.action<BlockAction>('follow_up', async ({ ack, body, action, client, context }) => {
+      await ack()
+      const team = tenantOf(context)
+      const user = body.user.id
+      const thread = (action as ButtonAction).value ?? ''
+      const view = await openLoading(client, body.trigger_id)
+      if (!view) return
+      const say = (text: string): Promise<unknown> =>
+        client.views.update({ view_id: view, view: noticeView(text) })
+      const no = await t.refuse(team, user, client)
+      if (no) return void (await say(no))
+      if (meetings.has(slot(team, thread)))
+        return void (await say(
+          'A meeting is already running in this thread: reply there to steer it.'
+        ))
+      const r = await earlier(team, body.channel?.id ?? '', thread)
+      if (!r) return void (await say(`${UNAVAILABLE} Ask in a new meeting instead.`))
+      await t.ask!({
+        team,
+        client,
+        user,
+        channel: r.channel,
+        view,
+        follow: { thread, repo: r.repo }
+      })
+    })
 
   app.message(async ({ message, client, context }) => {
     // a file posted in the thread comes as file_share
@@ -832,7 +1060,9 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
     if (('bot_id' in message && message.bot_id) || !message.thread_ts) return
     const team = tenantOf(context)
     const m = meetings.get(slot(team, message.thread_ts))
-    if (!m) return
+    if (!m) return hint(team, client, message, context.botUserId)
+    // from before it started: the mention that asked a follow-up, say, is no steer
+    if (Number(message.ts) * 1000 < m.at) return
     const say = ephemeral(client, m.channel, message.user, m.ts)
     const no = await t.refuse(team, message.user, client)
     if (no) return void (await say(no))
@@ -852,6 +1082,30 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
     }
   })
 
+  // A plain reply in an ended meeting's thread starts nothing: how to continue it, once a person.
+  // ponytail: who was told is in memory; after a restart they're told once more
+  const told = new Set<string>()
+  async function hint(
+    team: string,
+    client: Client,
+    message: { channel: string; user?: string; thread_ts?: string; text?: string },
+    botUser?: string
+  ): Promise<void> {
+    const { channel, user, thread_ts: thread } = message
+    if (!t.thread || !user || !thread) return
+    if (botUser && message.text?.includes(`<@${botUser}>`)) return // a mention: app_mention has it
+    const k = `${team}:${thread}:${user}`
+    if (told.has(k) || !(await earlier(team, channel, thread))) return
+    if (told.size > 10_000) told.clear()
+    told.add(k)
+    await ephemeral(
+      client,
+      channel,
+      user,
+      thread
+    )('Mention @Consortium or press Ask a follow-up to continue.')
+  }
+
   // a link button: Slack opens the canvas, the bot only acknowledges the click
   app.action('whiteboard', async ({ ack }) => ack())
 
@@ -863,7 +1117,9 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
       const say = ephemeral(client, body.channel?.id ?? '', body.user.id)
       const no = await t.refuse(team, body.user.id, client)
       if (no) return void (await say(no))
-      const m = body.message?.ts ? meetings.get(slot(team, body.message.ts)) : undefined
+      // a follow-up's controls are on its header, in the thread
+      const ts = body.message?.thread_ts ?? body.message?.ts
+      const m = ts ? meetings.get(slot(team, ts)) : undefined
       if (!m) return void (await say('This meeting is no longer running.'))
       try {
         if (action.action_id === 'pause') {
@@ -900,7 +1156,7 @@ export function bridge(app: App, t: Tenancy): { start: Start } {
       all.map((m) => {
         m.view.state = 'stopped'
         m.view.note = '_The Slack bridge shut down._'
-        return Promise.all([rootUpdate(m), canvasUpdate(m), m.log?.()]).catch(() => {})
+        return Promise.all([rootUpdate(m), canvasUpdate(m), m.log?.(), finish(m)]).catch(() => {})
       })
     )
     await app.stop()
